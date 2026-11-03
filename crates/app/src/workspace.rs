@@ -28,6 +28,7 @@ use crate::{
     actions::*,
     editor_view::{EditorEvent, EditorView, FormatKind},
     file_tree::{self, TreeEntry},
+    git_panel::{self, GitPanel, GitPanelEvent},
     outline::{self, OutlineItem},
     image_view::{ImageView, ImageViewEvent, include_snippet, is_image, relative_path},
     pdf_view::{PdfView, PdfViewEvent, ZOOM_STEP},
@@ -78,6 +79,13 @@ enum Divider {
     FilePanel,
     Preview,
     Outline,
+}
+
+/// What the left panel shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LeftPanel {
+    Files,
+    Git,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -158,6 +166,9 @@ pub struct Workspace {
     outline: Vec<OutlineItem>,
     outline_version: (usize, u64),
     show_file_panel: bool,
+    left_panel: LeftPanel,
+    git_panel: Entity<GitPanel>,
+    _git_subscription: Subscription,
     show_preview: bool,
     show_logs: bool,
     show_outline: bool,
@@ -247,6 +258,16 @@ impl Workspace {
         let key_subscription = cx.intercept_keystrokes(move |event, window, cx| {
             key_handle.update(cx, |this, cx| this.intercept_key(event, window, cx)).ok();
         });
+        let workspace_handle = cx.entity().downgrade();
+        let git_panel = cx.new(|cx| GitPanel::new(workspace_handle, cx));
+        let git_subscription = cx.subscribe_in(&git_panel, window, |this, _, event, window, cx| match event {
+            GitPanelEvent::OpenFile(path) => this.open_file(path.clone(), window, cx),
+            GitPanelEvent::PickBranch => this.open_picker(PickerKind::Branches, window, cx),
+            GitPanelEvent::Changed(branch) => {
+                this.git_branch = branch.clone().or_else(|| this.root.as_deref().and_then(git_branch));
+                this.refresh_from_disk(cx);
+            }
+        });
         let settings_path = settings::default_path();
         let settings = settings_path.as_deref().map(Settings::load).unwrap_or_default();
         let mut workspace = Self {
@@ -258,6 +279,9 @@ impl Workspace {
             outline: Vec::new(),
             outline_version: (usize::MAX, 0),
             show_file_panel: true,
+            left_panel: LeftPanel::Files,
+            git_panel,
+            _git_subscription: git_subscription,
             show_preview: true,
             show_logs: false,
             show_outline: true,
@@ -330,6 +354,7 @@ impl Workspace {
         self.start_watching(&root, cx);
         self.git_branch = git_branch(&root);
         self.root = Some(root.clone());
+        self.git_panel.update(cx, |panel, cx| panel.set_root(Some(root.clone()), cx));
         self.config = match Config::load(&root) {
             Ok(config) => config,
             Err(error) => {
@@ -361,11 +386,7 @@ impl Workspace {
         let (sender, receiver) = mpsc::channel::<()>();
         let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
             // Build output would otherwise wake the tree on every compile.
-            let relevant = event.is_ok_and(|event| {
-                event.paths.iter().any(|path| {
-                    !path.components().any(|part| part.as_os_str() == ".build")
-                })
-            });
+            let relevant = event.is_ok_and(|event| event.paths.iter().any(|path| git_panel::is_watched_path(path)));
             if relevant {
                 sender.send(()).ok();
             }
@@ -408,6 +429,7 @@ impl Workspace {
         for document in &self.documents {
             document.view.update(cx, |view, cx| view.reload_from_disk(cx));
         }
+        self.git_panel.update(cx, |panel, cx| panel.refresh(cx));
         cx.notify();
     }
 
@@ -564,7 +586,7 @@ impl Workspace {
     }
 
     /// The compilers read files, so every open document is saved first.
-    fn save_all(&mut self, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn save_all(&mut self, cx: &mut Context<Self>) -> bool {
         for index in 0..self.documents.len() {
             let view = self.documents[index].view.clone();
             if let Err(error) = view.update(cx, |view, cx| view.save(cx)) {
@@ -952,6 +974,10 @@ impl Workspace {
         if self.pdf.read(cx).is_focused(window) || self.image_preview.is_some() {
             return;
         }
+        // The commit message is a text field with its own keys.
+        if self.git_panel.read(cx).contains_focus(window, cx) {
+            return;
+        }
         let view = self.active_view();
         if self.tree_focus.is_focused(window) || view.is_none() {
             cx.stop_propagation();
@@ -1076,6 +1102,7 @@ impl Workspace {
 
     fn focus_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show_file_panel = true;
+        self.left_panel = LeftPanel::Files;
         let active = self.active_view().and_then(|view| view.read(cx).path.clone());
         if let Some(index) = active.and_then(|path| self.entries.iter().position(|entry| entry.path == path)) {
             self.tree_cursor = index;
@@ -1170,6 +1197,10 @@ impl Workspace {
         };
         let scan_root = root.clone();
         let language = self.active_language(cx);
+        let repository = self.git_panel.read(cx).repository();
+        if kind == PickerKind::Branches && repository.is_none() {
+            return;
+        }
         self.picker = Some(Picker {
             kind,
             query: String::new(),
@@ -1185,12 +1216,15 @@ impl Workspace {
         self.picker_files_task = Some(cx.spawn(async move |this, cx| {
             let (files, entries) = cx
                 .background_spawn(async move {
+                    if let Some(repository) = repository.filter(|_| kind == PickerKind::Branches) {
+                        return (Vec::new(), picker::branch_items(repository.branches().unwrap_or_default()));
+                    }
                     let files = file_tree::scan(&scan_root, &HashSet::new())
                         .into_iter()
                         .filter(|entry| !entry.is_dir)
                         .map(|entry| entry.path)
                         .filter(|path| match kind {
-                            PickerKind::Files | PickerKind::Text => true,
+                            PickerKind::Files | PickerKind::Text | PickerKind::Branches => true,
                             PickerKind::Figures => language.is_some_and(|language| snippets::is_figure_file(language, path)),
                             PickerKind::Citations => path.extension().is_some_and(|extension| extension == "bib"),
                         })
@@ -1231,6 +1265,10 @@ impl Workspace {
             }
             PickerKind::Citations => {
                 picker.items = picker::match_entries(&picker.entries, &picker.query);
+                picker.selected = 0;
+            }
+            PickerKind::Branches => {
+                picker.items = picker::match_branches(&picker.entries, &picker.query);
                 picker.selected = 0;
             }
             PickerKind::Text => {
@@ -1281,6 +1319,17 @@ impl Workspace {
         match kind {
             PickerKind::Files | PickerKind::Text => {}
             PickerKind::Figures => return self.insert_figure(&item.path, cx),
+            PickerKind::Branches => {
+                if self.save_all(cx) {
+                    let create = item.detail.as_deref() == Some(picker::CREATE_BRANCH);
+                    self.git_panel.update(cx, |panel, cx| {
+                        panel.run(cx, move |repository| {
+                            if create { repository.create_branch(&item.label) } else { repository.switch(&item.label) }
+                        });
+                    });
+                }
+                return;
+            }
             PickerKind::Citations => {
                 if let Some(language) = self.active_language(cx) {
                     self.insert_snippet(&snippets::citation(language, &item.label), false, cx);
@@ -1660,7 +1709,25 @@ impl Workspace {
     }
 
     fn render_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let files_on = self.show_file_panel;
+        let rail_button = |id: &'static str, icon: &'static str, panel: LeftPanel, cx: &mut Context<Self>| {
+            let on = self.show_file_panel && self.left_panel == panel;
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(32.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .when(on, |style| style.bg(theme::color(theme::GREEN_DARK)))
+                .hover(|style| style.bg(theme::color(theme::DIVIDER)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.show_file_panel = !(this.show_file_panel && this.left_panel == panel);
+                    this.left_panel = panel;
+                    cx.notify();
+                }))
+                .child(Self::icon(icon, 18., theme::UI_TEXT))
+        };
         div()
             .flex()
             .flex_none()
@@ -1673,23 +1740,13 @@ impl Workspace {
             .border_r_1()
             .border_color(theme::color(theme::PANEL))
             .child(
-                div().flex().flex_col().items_center().child(
-                    div()
-                        .id("rail-files")
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .size(px(32.))
-                        .rounded(px(4.))
-                        .cursor_pointer()
-                        .when(files_on, |style| style.bg(theme::color(theme::GREEN_DARK)))
-                        .hover(|style| style.bg(theme::color(theme::DIVIDER)))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.show_file_panel = !this.show_file_panel;
-                            cx.notify();
-                        }))
-                        .child(Self::icon("file", 18., theme::UI_TEXT)),
-                ),
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(rail_button("rail-files", "file", LeftPanel::Files, cx))
+                    .child(rail_button("rail-git", "git-branch", LeftPanel::Git, cx)),
             )
             .child(
                 div()
@@ -3016,11 +3073,13 @@ impl Workspace {
             PickerKind::Text => "Find text",
             PickerKind::Figures => "Insert figure",
             PickerKind::Citations => "Insert citation",
+            PickerKind::Branches => "Switch branch",
         };
         let empty = match (picker.kind, picker.query.is_empty()) {
             (PickerKind::Text, true) => "Type to search the project.",
             (PickerKind::Figures, true) => "No images in this project.",
             (PickerKind::Citations, true) => "No .bib entries in this project.",
+            (PickerKind::Branches, true) => "Type a name to create a branch.",
             _ => "No results.",
         };
         div()
@@ -3210,6 +3269,9 @@ impl Render for Workspace {
         let dragging = self.dragging;
         let show_preview = self.show_preview;
         let show_file_panel = self.show_file_panel;
+        // Git runs only while its panel shows.
+        let git_visible = show_file_panel && self.left_panel == LeftPanel::Git;
+        self.git_panel.update(cx, |panel, cx| panel.set_visible(git_visible, cx));
         div()
             .id("workspace")
             .relative()
@@ -3275,8 +3337,17 @@ impl Render for Workspace {
                     .min_h_0()
                     .child(self.render_rail(cx))
                     .when(show_file_panel, |element| {
+                        let panel = match self.left_panel {
+                            LeftPanel::Files => self.render_file_panel(window, cx).into_any_element(),
+                            LeftPanel::Git => div()
+                                .flex_none()
+                                .w(self.file_panel_width)
+                                .h_full()
+                                .child(self.git_panel.clone())
+                                .into_any_element(),
+                        };
                         element
-                            .child(self.render_file_panel(window, cx))
+                            .child(panel)
                             .child(self.divider_vertical("file-divider", Divider::FilePanel, cx))
                     })
                     .child(self.render_editor_pane(cx))

@@ -20,6 +20,7 @@ use crate::{
 };
 
 const GUTTER_WIDTH: f32 = 55.0;
+const PLAIN_GUTTER_WIDTH: f32 = 6.0;
 const LINE_NUMBER_RIGHT: f32 = 40.0;
 const TEXT_RIGHT_PADDING: f32 = 8.0;
 /// `scrolloff=8` from the Neovim config.
@@ -96,6 +97,8 @@ pub struct EditorView {
     reparse_needed: bool,
     vim: Option<Vim>,
     smooth_cursor: bool,
+    /// A text field without line numbers, such as the commit message.
+    plain: bool,
     smear: Option<Smear>,
     /// Where the cursor was last painted, in document coordinates.
     last_cursor: Option<(f32, f32)>,
@@ -129,11 +132,27 @@ impl EditorView {
             reparse_needed: false,
             vim: None,
             smooth_cursor: true,
+            plain: false,
             smear: None,
             last_cursor: None,
         };
         view.schedule_parse(cx);
         view
+    }
+
+    pub fn set_plain(&mut self) {
+        self.plain = true;
+    }
+
+    fn gutter_width(&self) -> Pixels {
+        px(if self.plain { PLAIN_GUTTER_WIDTH } else { GUTTER_WIDTH })
+    }
+
+    /// Empties a text field.
+    pub fn clear(&mut self, cx: &mut Context<Self>) {
+        self.state.reload("");
+        self.schedule_parse(cx);
+        cx.notify();
     }
 
     pub fn title(&self) -> String {
@@ -479,7 +498,7 @@ impl EditorView {
         if row >= self.rows.count() {
             return self.state.buffer().len();
         }
-        let x = (position.x - bounds.left() - px(GUTTER_WIDTH)).max(px(0.));
+        let x = (position.x - bounds.left() - self.gutter_width()).max(px(0.));
         self.offset_at(row, x, window)
     }
 
@@ -924,7 +943,7 @@ impl EntityInputHandler for EditorView {
         let (row, x) = self.row_and_x(offset, window);
         let y = Self::line_height() * row as f32 - self.scroll_y;
         Some(Bounds::new(
-            point(element_bounds.left() + px(GUTTER_WIDTH) + x, element_bounds.top() + y),
+            point(element_bounds.left() + self.gutter_width() + x, element_bounds.top() + y),
             size(px(2.), Self::line_height()),
         ))
     }
@@ -1018,6 +1037,7 @@ impl Element for EditorElement {
         cx: &mut App,
     ) {
         let focus_handle = self.view.read(cx).focus_handle.clone();
+        let gutter = self.view.read(cx).gutter_width();
         window.handle_input(
             &focus_handle,
             ElementInputHandler::new(bounds, self.view.clone()),
@@ -1066,7 +1086,7 @@ impl Element for EditorElement {
                 }
                 row.text
                     .paint(
-                        point(bounds.left() + px(GUTTER_WIDTH), row.y),
+                        point(bounds.left() + gutter, row.y),
                         line_height,
                         TextAlign::Left,
                         None,
@@ -1110,7 +1130,7 @@ impl EditorView {
     fn prepaint_rows(&mut self, bounds: Bounds<Pixels>, window: &mut Window) -> EditorPrepaint {
         self.bounds = Some(bounds);
         let line_height = Self::line_height();
-        let text_width = (bounds.size.width - px(GUTTER_WIDTH + TEXT_RIGHT_PADDING)).max(px(40.));
+        let text_width = (bounds.size.width - self.gutter_width() - px(TEXT_RIGHT_PADDING)).max(px(40.));
         self.sync_rows(text_width, window);
 
         if std::mem::take(&mut self.autoscroll) {
@@ -1177,7 +1197,7 @@ impl EditorView {
         let mut squiggles = Vec::new();
         let mut marked = Vec::new();
         let mut cached_line: Option<(usize, String, Vec<Option<HighlightKind>>)> = None;
-        let text_left = bounds.left() + px(GUTTER_WIDTH);
+        let text_left = bounds.left() + self.gutter_width();
 
         for row in first_row..last_row {
             let (line, segment) = self.rows.locate(row);
@@ -1191,7 +1211,7 @@ impl EditorView {
             let shaped = self.shape_styled(&text[range.clone()], &kinds[range.clone()], window);
             let y = bounds.top() + line_height * row as f32 - self.scroll_y;
 
-            let number = (segment == 0).then(|| {
+            let number = (segment == 0 && !self.plain).then(|| {
                 // `relativenumber` with `number`, as in the Neovim config.
                 let shown = match cursor_line {
                     Some(cursor_line) if cursor_line != line => cursor_line.abs_diff(line),
@@ -1300,7 +1320,7 @@ impl EditorView {
             rows.push(PaintedRow {
                 y,
                 number,
-                active: active_lines.contains(&line),
+                active: !self.plain && active_lines.contains(&line),
                 text: shaped,
             });
         }

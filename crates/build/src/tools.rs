@@ -26,6 +26,6 @@ pub fn find_tool(name: &str) -> Option<PathBuf> {
 }
 
 /// `PATH` for child processes, so that for example Pandoc finds Typst.
-pub(crate) fn child_path() -> OsString {
+pub fn child_path() -> OsString {
     std::env::join_paths(search_path()).unwrap_or_default()
 }

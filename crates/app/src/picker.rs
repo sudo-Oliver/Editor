@@ -14,6 +14,8 @@ use gpui::Task;
 
 const MAX_RESULTS: usize = 200;
 const MAX_SEARCHED_FILE_BYTES: u64 = 4 << 20;
+/// Marks the picker item that creates a branch.
+pub const CREATE_BRANCH: &str = "Create branch";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PickerKind {
@@ -23,6 +25,8 @@ pub enum PickerKind {
     Figures,
     /// `.bib` entries for a citation at the cursor.
     Citations,
+    /// Branches to switch to, or a new one by the name typed.
+    Branches,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,7 +46,7 @@ pub struct Picker {
     pub selected: usize,
     pub root: PathBuf,
     pub files: Arc<Vec<PathBuf>>,
-    /// The citations to choose from.
+    /// The citations or branches to choose from.
     pub entries: Arc<Vec<PickerItem>>,
     /// Set to stop the running text search when the query changes.
     pub cancel: Arc<AtomicBool>,
@@ -103,6 +107,26 @@ fn parse_bib(text: &str) -> Vec<(String, Option<String>)> {
         }
     }
     entries
+}
+
+/// The branches as picker items.
+pub fn branch_items(branches: Vec<String>) -> Vec<PickerItem> {
+    branches.into_iter().map(|label| PickerItem { path: PathBuf::new(), label, position: None, detail: None }).collect()
+}
+
+/// Branches that match `query`, then the offer to create one by that name.
+pub fn match_branches(branches: &[PickerItem], query: &str) -> Vec<PickerItem> {
+    let query = query.trim();
+    let mut items = match_entries(branches, query);
+    if !query.is_empty() && !branches.iter().any(|item| item.label == query) {
+        items.push(PickerItem {
+            path: PathBuf::new(),
+            label: query.to_string(),
+            position: None,
+            detail: Some(CREATE_BRANCH.to_string()),
+        });
+    }
+    items
 }
 
 /// Entries that match `query` in the label or detail, best first.
@@ -250,5 +274,16 @@ mod tests {
         let citations = [item("knuth", "Art"), item("greenwade", "Network")];
         assert_eq!(match_entries(&citations, "network")[0].label, "greenwade");
         assert_eq!(match_entries(&citations, "kn")[0].label, "knuth");
+    }
+
+    #[test]
+    fn branches_offer_creation_only_for_new_names() {
+        let branches = branch_items(vec!["main".to_string(), "chapter".to_string()]);
+        assert_eq!(match_branches(&branches, "").len(), 2);
+        let exact = match_branches(&branches, "main");
+        assert_eq!((exact.len(), exact[0].detail.as_deref()), (1, None));
+        let new = match_branches(&branches, "ma");
+        assert_eq!(new[0].label, "main");
+        assert_eq!((new[1].label.as_str(), new[1].detail.as_deref()), ("ma", Some(CREATE_BRANCH)));
     }
 }
