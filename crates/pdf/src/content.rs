@@ -15,14 +15,57 @@ impl Rect {
     pub fn contains(&self, x: f32, y: f32) -> bool {
         x >= self.left && x <= self.right && y >= self.top && y <= self.bottom
     }
+}
 
-    /// PDF coordinates start at the bottom left of the page.
-    fn from_pdf(rect: &PdfRect, page_height: f32) -> Self {
-        Self {
-            left: rect.left().value,
-            top: page_height - rect.top().value,
-            right: rect.right().value,
-            bottom: page_height - rect.bottom().value,
+/// Maps PDF coordinates to the page as it appears on screen. PDF coordinates start
+/// at the bottom left of the media box and ignore the rotation of the page, which
+/// pdflscape uses for landscape pages.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PageFrame {
+    left: f32,
+    bottom: f32,
+    width: f32,
+    height: f32,
+    rotation: PdfPageRenderRotation,
+}
+
+impl PageFrame {
+    pub(crate) fn of(page: &PdfPage) -> Result<Self, PdfiumError> {
+        let visible = page.boundaries().bounding()?.bounds;
+        Ok(Self {
+            left: visible.left().value,
+            bottom: visible.bottom().value,
+            width: visible.width().value,
+            height: visible.height().value,
+            rotation: page.rotation()?,
+        })
+    }
+
+    fn point(&self, x: f32, y: f32) -> (f32, f32) {
+        let (x, y) = (x - self.left, y - self.bottom);
+        match self.rotation {
+            PdfPageRenderRotation::None => (x, self.height - y),
+            PdfPageRenderRotation::Degrees90 => (y, x),
+            PdfPageRenderRotation::Degrees180 => (self.width - x, y),
+            PdfPageRenderRotation::Degrees270 => (self.height - y, self.width - x),
+        }
+    }
+
+    fn rect(&self, rect: &PdfRect) -> Rect {
+        let (x1, y1) = self.point(rect.left().value, rect.bottom().value);
+        let (x2, y2) = self.point(rect.right().value, rect.top().value);
+        Rect { left: x1.min(x2), top: y1.min(y2), right: x1.max(x2), bottom: y1.max(y2) }
+    }
+
+    /// The height on screen of a link target, if the PDF sets the coordinate that gives it.
+    fn target_y(&self, x: Option<f32>, y: Option<f32>) -> Option<f32> {
+        match self.rotation {
+            PdfPageRenderRotation::None | PdfPageRenderRotation::Degrees180 => {
+                y.map(|y| self.point(self.left, y).1)
+            }
+            PdfPageRenderRotation::Degrees90 | PdfPageRenderRotation::Degrees270 => {
+                x.map(|x| self.point(x, self.bottom).1)
+            }
         }
     }
 }
@@ -52,15 +95,14 @@ pub struct PageContent {
     pub links: Box<[PageLink]>,
 }
 
-/// `heights` holds the height of every page, because link targets can be on any page.
-pub(crate) fn extract(page: &PdfPage, heights: &[f32]) -> Result<PageContent, PdfiumError> {
-    let height = page.height().value;
+/// `frames` holds every page, because link targets can be on any page.
+pub(crate) fn extract(page: &PdfPage, frame: &PageFrame, frames: &[PageFrame]) -> Result<PageContent, PdfiumError> {
     let text = page.text()?;
     let chars: Box<[PageChar]> = text
         .chars()
         .iter()
         .filter_map(|character| {
-            let rect = character.loose_bounds().map_or(Rect::default(), |rect| Rect::from_pdf(&rect, height));
+            let rect = character.loose_bounds().map_or(Rect::default(), |rect| frame.rect(&rect));
             Some(PageChar { ch: character.unicode_char()?, rect })
         })
         .collect();
@@ -69,36 +111,37 @@ pub(crate) fn extract(page: &PdfPage, heights: &[f32]) -> Result<PageContent, Pd
         .iter()
         .filter_map(|link| {
             Some(PageLink {
-                rect: Rect::from_pdf(&link.rect().ok()?, height),
-                target: link_target(&link, heights)?,
+                rect: frame.rect(&link.rect().ok()?),
+                target: link_target(&link, frames)?,
             })
         })
         .collect();
     Ok(PageContent { chars, links })
 }
 
-fn link_target(link: &PdfLink, heights: &[f32]) -> Option<LinkTarget> {
+fn link_target(link: &PdfLink, frames: &[PageFrame]) -> Option<LinkTarget> {
     if let Some(destination) = link.destination() {
-        return page_target(&destination, heights);
+        return page_target(&destination, frames);
     }
     match link.action()? {
-        PdfAction::LocalDestination(action) => page_target(&action.destination().ok()?, heights),
+        PdfAction::LocalDestination(action) => page_target(&action.destination().ok()?, frames),
         PdfAction::Uri(action) => Some(LinkTarget::Uri(action.uri().ok()?)),
         _ => None,
     }
 }
 
-fn page_target(destination: &PdfDestination, heights: &[f32]) -> Option<LinkTarget> {
+fn page_target(destination: &PdfDestination, frames: &[PageFrame]) -> Option<LinkTarget> {
     let page = usize::from(destination.page_index().ok()?);
-    let height = *heights.get(page)?;
-    let y = match destination.view_settings().ok()? {
-        PdfDestinationViewSettings::SpecificCoordinatesAndZoom(_, y, _) => y,
-        PdfDestinationViewSettings::FitPageHorizontallyToWindow(y) => y,
-        PdfDestinationViewSettings::FitPageToRectangle(rect) => Some(rect.top()),
-        _ => None,
+    let frame = frames.get(page)?;
+    let (x, y) = match destination.view_settings().ok()? {
+        PdfDestinationViewSettings::SpecificCoordinatesAndZoom(x, y, _) => (x, y),
+        PdfDestinationViewSettings::FitPageHorizontallyToWindow(y) => (None, y),
+        PdfDestinationViewSettings::FitPageVerticallyToWindow(x) => (x, None),
+        PdfDestinationViewSettings::FitPageToRectangle(rect) => (Some(rect.left()), Some(rect.top())),
+        _ => (None, None),
     };
     Some(LinkTarget::Page {
         page,
-        y: y.map(|y| height - y.value),
+        y: frame.target_y(x.map(|x| x.value), y.map(|y| y.value)),
     })
 }
