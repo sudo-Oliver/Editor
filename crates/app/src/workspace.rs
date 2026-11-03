@@ -2293,7 +2293,7 @@ impl Workspace {
             mode: view.and_then(EditorView::vim_mode).unwrap_or(Mode::Normal),
             pending,
             file: view.map(EditorView::title),
-            file_color: status_bar::file_color(
+            file_icon: status_bar::file_icon(
                 view.and_then(|view| view.path.as_deref()?.extension()?.to_str()),
             ),
             dirty: view.is_some_and(|view| view.state.is_dirty()),
