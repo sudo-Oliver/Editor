@@ -1,0 +1,25 @@
+[package]
+name = "app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "editor"
+path = "src/main.rs"
+
+[dependencies]
+build = { path = "../build" }
+editor_core = { path = "../editor_core" }
+pdf = { path = "../pdf" }
+synctex = { path = "../synctex" }
+image = { version = "0.25", default-features = false }
+gpui.workspace = true
+gpui_platform.workspace = true
+ignore = "0.4"
+notify = "8"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+
+[dev-dependencies]
+tempfile = "3"
