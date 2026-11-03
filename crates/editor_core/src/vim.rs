@@ -245,6 +245,19 @@ impl Vim {
         }
     }
 
+    /// Starts inserting after a snippet from outside the keyboard. Stays out of
+    /// `.`, which could not replay it.
+    pub fn enter_insert(&mut self, state: &EditorState) {
+        if self.mode == Mode::Insert {
+            return;
+        }
+        self.reset_pending();
+        self.command = None;
+        self.discard_recording = true;
+        self.undo_checkpoint.get_or_insert(state.undo_checkpoint());
+        self.mode = Mode::Insert;
+    }
+
     /// Takes over a mouse selection, and keeps a click off the line end.
     pub fn after_mouse(&mut self, state: &mut EditorState) {
         match self.mode {
@@ -312,11 +325,16 @@ impl Vim {
                 let head = state.selections().primary().head;
                 let (_, column) = buffer.offset_to_point(head);
                 let target = if column == 0 { head } else { buffer.previous_boundary(head) };
+                state.end_snippet();
                 set_cursor(state, target);
                 self.mode = Mode::Normal;
             }
             Key::Enter => state.newline(),
-            Key::Tab => state.indent(),
+            Key::Tab => {
+                if !state.next_snippet_slot() {
+                    state.indent();
+                }
+            }
             Key::Backspace => state.backspace(),
             Key::Delete => state.delete_forward(),
             Key::Char(ch) => state.type_text(ch.encode_utf8(&mut [0; 4])),
@@ -1648,6 +1666,31 @@ mod tests {
         let mut state = EditorState::new(&text.replacen('|', "", 1), Language::Plain);
         state.set_selections(vec![Selection::cursor(cursor)]);
         Fixture { vim: Vim::default(), state, clipboard: None, effects: Vec::new() }
+    }
+
+    #[test]
+    fn snippet_from_outside_starts_insert_and_stays_out_of_repeat() {
+        let mut fixture = fixture("|x");
+        fixture.keys("ia<esc>");
+        fixture.vim.enter_insert(&fixture.state);
+        fixture.state.insert_snippet("{${}}{${}}", false);
+        assert_eq!(fixture.vim.mode(), Mode::Insert);
+        fixture.state.type_text("p");
+        fixture.vim.record_insert(Key::Char('p'));
+        fixture.keys("<esc>");
+        assert_eq!(fixture.vim.mode(), Mode::Normal);
+        assert!(!fixture.state.next_snippet_slot());
+        fixture.keys("0.");
+        assert_eq!(fixture.state.buffer().to_string(), "a{p}{}ax");
+    }
+
+    #[test]
+    fn tab_in_insert_mode_walks_the_snippet() {
+        let mut fixture = fixture("|");
+        fixture.vim.enter_insert(&fixture.state);
+        fixture.state.insert_snippet("{${}}[${}]", false);
+        fixture.keys("<tab>");
+        assert_eq!(fixture.state.selections().primary().head, "{}[".len());
     }
 
     impl Fixture {

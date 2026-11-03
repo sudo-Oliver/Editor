@@ -13,6 +13,7 @@ use std::{
 use build::{BuildEvent, BuildManager, BuildOutcome, BuildRequest, Config, Diagnostic, Engine, Severity, Trigger, find_main};
 use editor_core::{
     Language, Mark, MarkSeverity,
+    snippet::Snippet,
     vim::{self, Effect, Key, Leader, Mode},
 };
 use gpui::{
@@ -34,6 +35,7 @@ use crate::{
     problems::{self, Problem},
     settings::{self, Settings},
     shortcuts,
+    snippets,
     status_bar::{self, StatusInfo},
     theme,
 };
@@ -43,6 +45,9 @@ const RAIL_WIDTH: f32 = 40.0;
 const DIVIDER_WIDTH: f32 = 7.0;
 const TAB_BAR_HEIGHT: f32 = 36.0;
 const TOOLBAR_HEIGHT: f32 = 32.0;
+const SYMBOL_CELL: f32 = 32.0;
+const SYMBOL_COLUMNS: f32 = 11.0;
+const TABLE_GRID: usize = 8;
 const PREVIEW_TOOLBAR_HEIGHT: f32 = 32.0;
 const MIN_PANE_WIDTH: f32 = 160.0;
 const OUTLINE_INSET: f32 = 8.0;
@@ -85,6 +90,8 @@ enum Menu {
     Help,
     Layout,
     Compile,
+    Symbols,
+    Table,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -161,6 +168,11 @@ pub struct Workspace {
     open_menu: Option<Menu>,
     /// Where the open menu appears, below the button that opened it.
     menu_origin: Point<Pixels>,
+    symbol_group: usize,
+    /// What the hovered palette entry inserts.
+    symbol_hover: Option<&'static str>,
+    /// The hovered size of the table grid, as rows and columns.
+    table_hover: (usize, usize),
     /// Held by the backdrop of an open menu, so that keys do not reach the editor.
     menu_focus: FocusHandle,
     status: Option<SharedString>,
@@ -255,6 +267,9 @@ impl Workspace {
             dragging: None,
             open_menu: None,
             menu_origin: point(px(0.), px(0.)),
+            symbol_group: 0,
+            symbol_hover: None,
+            table_hover: (1, 1),
             menu_focus: cx.focus_handle(),
             status: None,
             pdf,
@@ -1154,6 +1169,7 @@ impl Workspace {
             return;
         };
         let scan_root = root.clone();
+        let language = self.active_language(cx);
         self.picker = Some(Picker {
             kind,
             query: String::new(),
@@ -1161,23 +1177,32 @@ impl Workspace {
             selected: 0,
             root,
             files: Arc::new(Vec::new()),
+            entries: Arc::new(Vec::new()),
             cancel: Arc::new(AtomicBool::new(false)),
             task: None,
         });
         window.focus(&self.picker_focus, cx);
         self.picker_files_task = Some(cx.spawn(async move |this, cx| {
-            let files = cx
+            let (files, entries) = cx
                 .background_spawn(async move {
-                    file_tree::scan(&scan_root, &HashSet::new())
+                    let files = file_tree::scan(&scan_root, &HashSet::new())
                         .into_iter()
                         .filter(|entry| !entry.is_dir)
                         .map(|entry| entry.path)
-                        .collect::<Vec<_>>()
+                        .filter(|path| match kind {
+                            PickerKind::Files | PickerKind::Text => true,
+                            PickerKind::Figures => language.is_some_and(|language| snippets::is_figure_file(language, path)),
+                            PickerKind::Citations => path.extension().is_some_and(|extension| extension == "bib"),
+                        })
+                        .collect::<Vec<_>>();
+                    let entries = if kind == PickerKind::Citations { picker::read_citations(&files) } else { Vec::new() };
+                    (files, entries)
                 })
                 .await;
             this.update(cx, |this, cx| {
                 if let Some(picker) = &mut this.picker {
                     picker.files = Arc::new(files);
+                    picker.entries = Arc::new(entries);
                 }
                 this.refresh_picker(cx);
             })
@@ -1200,8 +1225,12 @@ impl Workspace {
             return;
         };
         match picker.kind {
-            PickerKind::Files => {
+            PickerKind::Files | PickerKind::Figures => {
                 picker.items = picker::match_files(&picker.files, &picker.root, &picker.query);
+                picker.selected = 0;
+            }
+            PickerKind::Citations => {
+                picker.items = picker::match_entries(&picker.entries, &picker.query);
                 picker.selected = 0;
             }
             PickerKind::Text => {
@@ -1245,14 +1274,52 @@ impl Workspace {
     }
 
     fn accept_picker(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(item) = self.picker.as_ref().and_then(|picker| picker.items.get(index).cloned()) else {
+        let Some((kind, item)) = self.picker.as_ref().and_then(|picker| Some((picker.kind, picker.items.get(index).cloned()?))) else {
             return;
         };
         self.close_picker(window, cx);
+        match kind {
+            PickerKind::Files | PickerKind::Text => {}
+            PickerKind::Figures => return self.insert_figure(&item.path, cx),
+            PickerKind::Citations => {
+                if let Some(language) = self.active_language(cx) {
+                    self.insert_snippet(&snippets::citation(language, &item.label), false, cx);
+                }
+                return;
+            }
+        }
         self.open_file(item.path, window, cx);
         if let (Some((line, column)), Some(view)) = (item.position, self.active_view()) {
             view.update(cx, |view, cx| view.go_to_line(line, column, window, cx));
         }
+    }
+
+    fn insert_figure(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let Some(language) = self.active_language(cx) else {
+            return;
+        };
+        let active = self.active_view().and_then(|view| view.read(cx).path.clone());
+        // Typst looks next to the current file, LaTeX next to the main file.
+        let main = match language {
+            Language::Typst => active,
+            _ => self.root.as_deref().and_then(|root| find_main(root, &self.config, active.as_deref())),
+        };
+        let directory = main.as_deref().and_then(Path::parent).or(self.root.as_deref());
+        let relative = directory.map_or_else(|| path.display().to_string(), |directory| relative_path(directory, path));
+        self.insert_snippet(&snippets::figure(language, &relative), false, cx);
+    }
+
+    fn insert_snippet(&mut self, template: &str, math: bool, cx: &mut Context<Self>) {
+        self.with_active(cx, |view, cx| view.insert_snippet(template, math, cx));
+        cx.notify();
+    }
+
+    /// The language of the document that toolbar snippets go into.
+    fn active_language(&self, cx: &App) -> Option<Language> {
+        if self.image_preview.is_some() {
+            return None;
+        }
+        self.active_view().map(|view| view.read(cx).state.language())
     }
 
     fn picker_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) {
@@ -1294,6 +1361,8 @@ impl Workspace {
             self.close_menu(window, cx);
         } else {
             self.open_menu = Some(menu);
+            self.symbol_hover = None;
+            self.table_hover = (1, 1);
             self.menu_origin = point(position.x - px(12.), px(bottom));
             window.focus(&self.menu_focus, cx);
             cx.notify();
@@ -1403,6 +1472,7 @@ impl Workspace {
                     this.with_active(cx, |view, cx| view.format(FormatKind::Italic, cx))
                 }),
             ],
+            Menu::Symbols | Menu::Table => Vec::new(),
             Menu::Help => vec![entry("Keyboard shortcuts", "", |this, window, cx| {
                 this.open_dialog(Dialog::Shortcuts, window, cx);
             })],
@@ -1925,8 +1995,158 @@ impl Workspace {
             .child(child)
     }
 
+    /// A toolbar button that opens a popup below the toolbar.
+    fn popup_button(
+        &self,
+        id: &'static str,
+        icon: &'static str,
+        menu: Menu,
+        cx: &mut Context<Self>,
+        popup: impl FnOnce(&Self, &mut Context<Self>) -> AnyElement,
+    ) -> impl IntoElement {
+        let open = self.open_menu == Some(menu);
+        let element = open.then(|| popup(self, cx));
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(26.))
+            .rounded(px(4.))
+            .cursor_pointer()
+            .when(open, |style| style.bg(theme::color(theme::DIVIDER)))
+            .hover(|style| style.bg(theme::color(theme::DIVIDER)))
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                let bottom = TOP_BAR_HEIGHT + TAB_BAR_HEIGHT + TOOLBAR_HEIGHT;
+                this.toggle_menu(menu, event.position(), bottom, window, cx);
+            }))
+            .child(Self::icon(icon, 16., theme::UI_TEXT))
+            .children(element)
+    }
+
+    fn render_popup(&self, id: &'static str, content: impl IntoElement) -> AnyElement {
+        deferred(
+            anchored().anchor(Anchor::TopLeft).position(self.menu_origin).child(
+                div()
+                    .id(id)
+                    .occlude()
+                    .p(px(8.))
+                    .rounded(px(4.))
+                    .bg(theme::color(theme::PANEL))
+                    .border_1()
+                    .border_color(theme::color(theme::DIVIDER))
+                    .shadow_lg()
+                    .child(content),
+            ),
+        )
+        .into_any_element()
+    }
+
+    fn render_symbol_palette(&self, language: Language, cx: &mut Context<Self>) -> AnyElement {
+        let group = &snippets::GROUPS[self.symbol_group];
+        let tabs = snippets::GROUPS.iter().enumerate().map(|(index, tab)| {
+            div()
+                .id(("symbol-group", index))
+                .px(px(8.))
+                .py(px(3.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .when(index == self.symbol_group, |style| style.bg(theme::color(theme::GREEN_DARK)))
+                .when(index != self.symbol_group, |style| style.hover(|style| style.bg(theme::color(theme::DIVIDER))))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.symbol_group = index;
+                    this.symbol_hover = None;
+                    cx.notify();
+                }))
+                .child(tab.name)
+        });
+        let cells = group.symbols.iter().enumerate().map(|(index, symbol)| {
+            let template = symbol.template(language);
+            div()
+                .id(("symbol", index))
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(SYMBOL_CELL))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .font_family(theme::CODE_FONT)
+                .hover(|style| style.bg(theme::color(theme::DIVIDER)))
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    if *hovered {
+                        this.symbol_hover = Some(template);
+                    } else if this.symbol_hover == Some(template) {
+                        this.symbol_hover = None;
+                    }
+                    cx.notify();
+                }))
+                // The palette stays open, so that several symbols can follow.
+                .on_click(cx.listener(move |this, _, _, cx| this.insert_snippet(template, true, cx)))
+                .child(symbol.label)
+        });
+        let preview = self.symbol_hover.map_or_else(String::new, |template| Snippet::parse(template, "").text.replace('\n', " "));
+        self.render_popup(
+            "symbol-palette",
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .w(px(SYMBOL_CELL * SYMBOL_COLUMNS))
+                .child(div().flex().flex_wrap().children(tabs))
+                .child(div().flex().flex_wrap().children(cells))
+                .child(
+                    div()
+                        .h(px(18.))
+                        .truncate()
+                        .font_family(theme::CODE_FONT)
+                        .text_size(px(theme::CODE_FONT_SIZE))
+                        .text_color(theme::color(theme::UI_MUTED))
+                        .child(preview),
+                ),
+        )
+    }
+
+    fn render_table_grid(&self, language: Language, cx: &mut Context<Self>) -> AnyElement {
+        let (hover_rows, hover_columns) = self.table_hover;
+        let rows = (1..=TABLE_GRID).map(|row| {
+            div().flex().gap(px(2.)).children((1..=TABLE_GRID).map(|column| {
+                let selected = row <= hover_rows && column <= hover_columns;
+                div()
+                    .id(("table-cell", (row - 1) * TABLE_GRID + column - 1))
+                    .size(px(18.))
+                    .rounded(px(2.))
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(theme::color(theme::DIVIDER))
+                    .when(selected, |style| style.bg(theme::color(theme::GREEN_DARK)))
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        if *hovered && this.table_hover != (row, column) {
+                            this.table_hover = (row, column);
+                            cx.notify();
+                        }
+                    }))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.close_menu(window, cx);
+                        this.insert_snippet(&snippets::table(language, row, column), false, cx);
+                    }))
+            }))
+        });
+        self.render_popup(
+            "table-grid",
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .children(rows)
+                .child(div().pt(px(4.)).text_color(theme::color(theme::UI_MUTED)).child(format!("{hover_rows} × {hover_columns}"))),
+        )
+    }
+
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let separator = || div().w(px(1.)).h(px(18.)).mx(px(4.)).bg(theme::color(theme::DIVIDER));
+        let language = self.active_language(cx);
+        let markup = matches!(language, Some(Language::Latex | Language::Typst));
+        let formats = matches!(language, Some(Language::Latex | Language::Typst | Language::Markdown));
         div()
             .flex()
             .flex_none()
@@ -1940,32 +2160,55 @@ impl Workspace {
             .child(self.icon_button("redo", "redo", cx, |this, _, cx| {
                 this.with_active(cx, |view, cx| view.redo_edit(cx));
             }))
-            .child(separator())
-            .child(self.format_button(
-                "bold",
-                FormatKind::Bold,
-                cx,
-                div().font_weight(FontWeight::BOLD).child("B"),
-            ))
-            .child(self.format_button(
-                "italic",
-                FormatKind::Italic,
-                cx,
-                div().italic().child("I"),
-            ))
-            .child(separator())
-            .child(self.format_button(
-                "math",
-                FormatKind::Math,
-                cx,
-                Self::icon("math", 16., theme::UI_TEXT),
-            ))
-            .child(self.format_button(
-                "link",
-                FormatKind::Link,
-                cx,
-                Self::icon("link", 16., theme::UI_TEXT),
-            ))
+            .when(formats, |element| {
+                element
+                    .child(separator())
+                    .child(self.format_button(
+                        "bold",
+                        FormatKind::Bold,
+                        cx,
+                        div().font_weight(FontWeight::BOLD).child("B"),
+                    ))
+                    .child(self.format_button(
+                        "italic",
+                        FormatKind::Italic,
+                        cx,
+                        div().italic().child("I"),
+                    ))
+                    .child(separator())
+            })
+            .when(markup, |element| {
+                element.child(self.format_button(
+                    "math",
+                    FormatKind::Math,
+                    cx,
+                    Self::icon("math", 16., theme::UI_TEXT),
+                ))
+            })
+            .when(formats, |element| {
+                element.child(self.format_button(
+                    "link",
+                    FormatKind::Link,
+                    cx,
+                    Self::icon("link", 16., theme::UI_TEXT),
+                ))
+            })
+            .when_some(language.filter(|_| markup), |element, language| {
+                element
+                    .child(separator())
+                    .child(self.popup_button("symbols", "sigma", Menu::Symbols, cx, move |this, cx| {
+                        this.render_symbol_palette(language, cx)
+                    }))
+                    .child(self.popup_button("table", "table", Menu::Table, cx, move |this, cx| {
+                        this.render_table_grid(language, cx)
+                    }))
+                    .child(self.icon_button("figure", "image", cx, |this, window, cx| {
+                        this.open_picker(PickerKind::Figures, window, cx);
+                    }))
+                    .child(self.icon_button("citation", "quote", cx, |this, window, cx| {
+                        this.open_picker(PickerKind::Citations, window, cx);
+                    }))
+            })
     }
 
     fn render_editor_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2771,11 +3014,14 @@ impl Workspace {
         let title = match picker.kind {
             PickerKind::Files => "Find file",
             PickerKind::Text => "Find text",
+            PickerKind::Figures => "Insert figure",
+            PickerKind::Citations => "Insert citation",
         };
-        let empty = if picker.query.is_empty() && picker.kind == PickerKind::Text {
-            "Type to search the project."
-        } else {
-            "No results."
+        let empty = match (picker.kind, picker.query.is_empty()) {
+            (PickerKind::Text, true) => "Type to search the project.",
+            (PickerKind::Figures, true) => "No images in this project.",
+            (PickerKind::Citations, true) => "No .bib entries in this project.",
+            _ => "No results.",
         };
         div()
             .id("picker-backdrop")

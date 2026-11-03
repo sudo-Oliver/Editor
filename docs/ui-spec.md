@@ -54,6 +54,12 @@ latency was not measured.
 The dialog here uses the app's dark colors and lists only settings that work. Choices stay
 visible as segments instead of a combobox, so that one click changes them.
 
+## Editor toolbar
+
+The toolbar follows the file type. LaTeX and Typst show undo, redo, bold, italic, math, link,
+the symbol palette, the table grid, figure and citation. Markdown keeps undo, redo, bold,
+italic and link. Other files and the image preview keep undo and redo.
+
 ## Vim status bar
 
 The status bar exists only in Vim mode. It follows the NvChad statusline with

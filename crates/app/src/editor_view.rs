@@ -272,6 +272,9 @@ impl EditorView {
     pub fn format(&mut self, kind: FormatKind, cx: &mut Context<Self>) {
         use FormatKind::*;
         let language = self.state.language();
+        if matches!(kind, Math) && self.state.in_math(self.state.selections().primary().start()) {
+            return;
+        }
         let (prefix, suffix) = match (language, kind) {
             (Language::Latex, Bold) => ("\\textbf{", "}"),
             (Language::Latex, Italic) => ("\\textit{", "}"),
@@ -286,6 +289,15 @@ impl EditorView {
             (Language::Plain, _) => return,
         };
         self.state.wrap_selections(prefix, suffix);
+        self.changed(cx);
+    }
+
+    /// Inserts a toolbar snippet. With `math`, it stays inside a formula.
+    pub fn insert_snippet(&mut self, template: &str, math: bool, cx: &mut Context<Self>) {
+        if let Some(vim) = &mut self.vim {
+            vim.enter_insert(&self.state);
+        }
+        self.state.insert_snippet(template, math);
         self.changed(cx);
     }
 
@@ -706,6 +718,7 @@ impl Render for EditorView {
             .on_action(cx.listener(|this, _: &AddCursorAbove, window, cx| this.add_cursor_vertical(-1, window, cx)))
             .on_action(cx.listener(|this, _: &AddCursorBelow, window, cx| this.add_cursor_vertical(1, window, cx)))
             .on_action(cx.listener(|this, _: &CollapseSelections, _, cx| {
+                this.state.end_snippet();
                 let head = this.state.selections().primary().head;
                 this.state.set_selections(vec![Selection::cursor(head)]);
                 this.selection_changed(cx);
@@ -743,6 +756,9 @@ impl Render for EditorView {
                 this.changed(cx);
             }))
             .on_action(cx.listener(|this, _: &Indent, _, cx| {
+                if this.state.next_snippet_slot() {
+                    return this.selection_changed(cx);
+                }
                 this.state.indent();
                 this.changed(cx);
             }))

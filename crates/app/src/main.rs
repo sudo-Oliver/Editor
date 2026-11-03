@@ -11,6 +11,7 @@ mod problems;
 mod settings;
 mod shortcuts;
 mod smear;
+mod snippets;
 mod status_bar;
 mod theme;
 mod workspace;

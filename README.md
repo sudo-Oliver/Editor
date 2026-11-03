@@ -62,6 +62,18 @@ These work for every engine:
 
 Clicking a PNG, JPEG, WebP or SVG in the file tree shows it in place of the editor, with its resolution and file size. Copy include puts the matching code for the engine on the clipboard, for example `\includegraphics{images/photo.png}` or `#image("images/photo.png")`. Export saves a copy elsewhere. Cmd+W or selecting a tab closes the image.
 
+## Toolbar
+
+The buttons insert code in the language of the open file, LaTeX or Typst.
+
+- The symbol palette holds templates, Greek letters, operators, relations and arrows. Outside a formula, a symbol gets `$` around it. The palette stays open until you press `Esc` or click elsewhere.
+- The table button inserts a table of the size you pick in the grid.
+- The figure button lists the project's images, and the citation button lists the entries of its `.bib` files.
+
+After an insert, `Tab` moves to the next empty field. `Esc` or moving the cursor away ends this. In Vim mode, a button click switches to Insert mode.
+
+Some LaTeX output needs a package in the preamble, which the editor does not add: `graphicx` for figures, `svg` for SVG figures and `amsmath` for matrices and cases.
+
 ## Settings
 
 The gear at the bottom left opens the settings, the question mark above it lists the keyboard shortcuts. Cmd+, (macOS) or Ctrl+, (Linux) also opens the settings. They are stored in `~/.config/editor/settings.toml`, or under `XDG_CONFIG_HOME` if it is set. Project settings stay in `.editor.toml`.
