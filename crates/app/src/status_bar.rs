@@ -13,7 +13,7 @@ pub struct StatusInfo {
     pub mode: Mode,
     pub pending: String,
     pub file: Option<String>,
-    pub file_color: u32,
+    pub file_icon: (&'static str, u32),
     pub dirty: bool,
     pub branch: Option<String>,
     pub errors: usize,
@@ -86,7 +86,7 @@ fn segment(background: u32, color: u32) -> gpui::Div {
 pub fn render(info: StatusInfo) -> impl IntoElement {
     let color = mode_color(info.mode);
     let file_label = info.file.map(|name| if info.dirty { format!("{name} [+]") } else { name });
-    let file_color = info.file_color;
+    let (file_icon, file_color) = info.file_icon;
     let position = format!("{}/{}", info.line, info.column);
     div()
         .flex()
@@ -119,7 +119,7 @@ pub fn render(info: StatusInfo) -> impl IntoElement {
                     element
                         .child(
                             svg()
-                                .path("icons/file.svg")
+                                .path(file_icon)
                                 .size(px(13.))
                                 .flex_none()
                                 .text_color(theme::color(file_color)),
@@ -187,13 +187,37 @@ pub fn render(info: StatusInfo) -> impl IntoElement {
         })
 }
 
-/// The icon colors of `nvim-web-devicons`.
-pub fn file_color(extension: Option<&str>) -> u32 {
+/// The icons and colors of `nvim-web-devicons`, with the fallback of the NvChad statusline.
+pub fn file_icon(extension: Option<&str>) -> (&'static str, u32) {
     match extension {
-        Some("tex" | "latex") => 0x3d6117,
-        Some("typ") => 0x0dbcc0,
-        Some("md" | "markdown") => 0xdddddd,
-        Some("bib") => 0xcbcb41,
-        _ => theme::ST_TEXT,
+        Some("tex") => ("icons/file-tex.svg", 0x3d6117),
+        Some("typ") => ("icons/file-typ.svg", 0x0dbcc0),
+        Some("md") => ("icons/file-md.svg", 0xdddddd),
+        Some("markdown") => ("icons/file-markdown.svg", 0xdddddd),
+        Some("bib") => ("icons/file-bib.svg", 0xcbcb41),
+        Some("toml") => ("icons/file-toml.svg", 0x9c4221),
+        Some("txt") => ("icons/file-txt.svg", 0x89e051),
+        _ => ("icons/file-default.svg", theme::ST_TEXT),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::AssetSource;
+
+    use super::*;
+    use crate::assets::Assets;
+
+    #[test]
+    fn every_file_icon_is_bundled() {
+        for extension in ["tex", "typ", "md", "markdown", "bib", "toml", "txt", "unknown"] {
+            let (path, _) = file_icon(Some(extension));
+            assert!(Assets.load(path).unwrap().is_some(), "{path}");
+        }
+    }
+
+    #[test]
+    fn unknown_files_get_the_fallback() {
+        assert_eq!(file_icon(None).0, "icons/file-default.svg");
     }
 }

@@ -60,6 +60,9 @@ The status bar exists only in Vim mode. It follows the NvChad statusline with
 `theme = "default"` in the tokyodark colors of base46. The rest of the app keeps the colors
 above. The separators are drawn as paths, so no Nerd Font is needed.
 
+The Vim, position and file type icons are glyphs from Nerd Fonts, stored as SVG files. The
+mapping from file type to icon and color follows `nvim-web-devicons`.
+
 | Element | Color |
 | --- | --- |
 | Normal | `#648ce1` |

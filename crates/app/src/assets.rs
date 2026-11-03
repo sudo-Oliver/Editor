@@ -12,7 +12,8 @@ macro_rules! icons {
 
 icons!(
     "arrow-left", "arrow-right", "book", "chevron-down", "chevron-left", "chevron-right",
-    "chevron-up", "close", "contrast", "dots", "download", "file", "file-plus", "folder",
+    "chevron-up", "close", "contrast", "dots", "download", "file", "file-bib", "file-default",
+    "file-markdown", "file-md", "file-plus", "file-tex", "file-toml", "file-txt", "file-typ", "folder",
     "folder-plus", "help", "image", "layout", "link", "log", "logo", "math", "minus",
     "outline", "plus", "position", "redo", "refresh", "settings", "undo", "vim",
 );
