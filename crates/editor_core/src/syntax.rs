@@ -84,16 +84,122 @@ fn kind_for_capture(name: &str) -> Option<HighlightKind> {
     Some(kind)
 }
 
+/// A document heading as written in the source, markup included.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Heading {
+    pub level: usize,
+    pub title: String,
+    pub line: usize,
+}
+
+/// Finds headings in the parse tree of one grammar.
+#[derive(Clone, Copy)]
+struct HeadingRules {
+    /// Returns the level of a heading node and the bytes of its title.
+    find: fn(Node) -> Option<(usize, Range<usize>)>,
+    /// Nodes that cannot hold a real heading, which also saves walking them.
+    skip: &'static [&'static str],
+}
+
+const LATEX_HEADINGS: HeadingRules = HeadingRules {
+    find: latex_heading,
+    skip: &[
+        "text",
+        "inline_formula",
+        "displayed_equation",
+        "math_environment",
+        "new_command_definition",
+        "old_command_definition",
+        "environment_definition",
+    ],
+};
+const TYPST_HEADINGS: HeadingRules = HeadingRules {
+    find: typst_heading,
+    skip: &["text", "math", "raw_blck", "heading"],
+};
+const MARKDOWN_HEADINGS: HeadingRules = HeadingRules {
+    find: markdown_heading,
+    skip: &["atx_heading", "setext_heading", "paragraph", "fenced_code_block", "indented_code_block"],
+};
+
+fn latex_heading(node: Node) -> Option<(usize, Range<usize>)> {
+    let level = match node.kind() {
+        "part" => 0,
+        "chapter" => 1,
+        "section" => 2,
+        "subsection" => 3,
+        "subsubsection" => 4,
+        _ => return None,
+    };
+    Some((level, node.child_by_field_name("text")?.byte_range()))
+}
+
+fn typst_heading(node: Node) -> Option<(usize, Range<usize>)> {
+    if node.kind() != "heading" {
+        return None;
+    }
+    let marker = node.child(0)?;
+    Some((marker.byte_range().len(), marker.end_byte()..node.end_byte()))
+}
+
+fn markdown_heading(node: Node) -> Option<(usize, Range<usize>)> {
+    match node.kind() {
+        "atx_heading" => {
+            let level = node.child(0)?.kind().strip_prefix("atx_h")?.strip_suffix("_marker")?.parse().ok()?;
+            Some((level, node.child(1)?.byte_range()))
+        }
+        "setext_heading" => {
+            let level = match node.child(1)?.kind() {
+                "setext_h1_underline" => 1,
+                _ => 2,
+            };
+            Some((level, node.child(0)?.byte_range()))
+        }
+        _ => None,
+    }
+}
+
+/// Walks with one cursor instead of recursing, because deeply nested groups in a
+/// document must not overflow the stack of the parse thread.
+fn collect_headings(rules: HeadingRules, tree: &Tree, rope: &Rope) -> Vec<Heading> {
+    let mut headings = Vec::new();
+    let mut cursor = tree.walk();
+    loop {
+        let node = cursor.node();
+        if let Some((level, title)) = (rules.find)(node) {
+            headings.push(Heading {
+                level,
+                title: rope.byte_slice(title).to_string(),
+                line: rope.byte_to_line(node.start_byte()),
+            });
+        }
+        if !rules.skip.contains(&node.kind()) && cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return headings;
+            }
+        }
+    }
+}
+
 struct LanguageConfig {
     language: TsLanguage,
     query: Query,
     kinds: Vec<Option<HighlightKind>>,
+    headings: Option<HeadingRules>,
     /// Second grammar that parses the ranges of `inline` nodes in Markdown.
     inline: Option<Box<LanguageConfig>>,
 }
 
 impl LanguageConfig {
-    fn new(language: TsLanguage, source: &str, inline: Option<Box<LanguageConfig>>) -> Self {
+    fn new(
+        language: TsLanguage,
+        source: &str,
+        headings: Option<HeadingRules>,
+        inline: Option<Box<LanguageConfig>>,
+    ) -> Self {
         let query = Query::new(&language, source).expect("bundled highlight query is valid");
         let kinds = query
             .capture_names()
@@ -104,6 +210,7 @@ impl LanguageConfig {
             language,
             query,
             kinds,
+            headings,
             inline,
         }
     }
@@ -117,6 +224,7 @@ impl LanguageConfig {
                 Self::new(
                     codebook_tree_sitter_latex::LANGUAGE.into(),
                     include_str!("../queries/latex.scm"),
+                    Some(LATEX_HEADINGS),
                     None,
                 )
             })),
@@ -124,6 +232,7 @@ impl LanguageConfig {
                 Self::new(
                     codebook_tree_sitter_typst::LANGUAGE.into(),
                     include_str!("../queries/typst.scm"),
+                    Some(TYPST_HEADINGS),
                     None,
                 )
             })),
@@ -131,9 +240,11 @@ impl LanguageConfig {
                 Self::new(
                     tree_sitter_md::LANGUAGE.into(),
                     tree_sitter_md::HIGHLIGHT_QUERY_BLOCK,
+                    Some(MARKDOWN_HEADINGS),
                     Some(Box::new(Self::new(
                         tree_sitter_md::INLINE_LANGUAGE.into(),
                         tree_sitter_md::HIGHLIGHT_QUERY_INLINE,
+                        None,
                         None,
                     ))),
                 )
@@ -149,6 +260,8 @@ pub struct Syntax {
     config: Option<&'static LanguageConfig>,
     tree: Option<Tree>,
     inline_tree: Option<Tree>,
+    headings: Vec<Heading>,
+    applied_results: u64,
     applied_version: u64,
 }
 
@@ -163,6 +276,7 @@ pub struct ParseJob {
 pub struct ParseResult {
     tree: Option<Tree>,
     inline_tree: Option<Tree>,
+    headings: Vec<Heading>,
     version: u64,
 }
 
@@ -172,6 +286,8 @@ impl Syntax {
             config: LanguageConfig::get(language),
             tree: None,
             inline_tree: None,
+            headings: Vec::new(),
+            applied_results: 0,
             applied_version: 0,
         }
     }
@@ -203,6 +319,8 @@ impl Syntax {
         self.applied_version = result.version;
         self.tree = result.tree;
         self.inline_tree = result.inline_tree;
+        self.headings = result.headings;
+        self.applied_results += 1;
         for edit in edits_since {
             self.edit(edit);
         }
@@ -211,6 +329,16 @@ impl Syntax {
 
     pub fn has_tree(&self) -> bool {
         self.tree.is_some()
+    }
+
+    /// Headings of the last finished parse, so they can lag behind the latest edit.
+    pub fn headings(&self) -> &[Heading] {
+        &self.headings
+    }
+
+    /// Counts finished parses, which tells when `headings` may have changed.
+    pub fn applied_results(&self) -> u64 {
+        self.applied_results
     }
 
     /// Returns spans that touch `range`, in document order of their matches.
@@ -282,9 +410,15 @@ impl ParseJob {
             _ => None,
         };
 
+        let headings = match (self.config.headings, &tree) {
+            (Some(rules), Some(tree)) => collect_headings(rules, tree, &self.rope),
+            _ => Vec::new(),
+        };
+
         ParseResult {
             tree,
             inline_tree,
+            headings,
             version: self.version,
         }
     }
@@ -392,6 +526,57 @@ mod tests {
     #[test]
     fn plain_text_has_no_parser() {
         assert!(Syntax::new(Language::Plain).parse_job(&Rope::new(), 1).is_none());
+    }
+
+    fn headings_of(language: Language, text: &str) -> Vec<(usize, String, usize)> {
+        let rope = Rope::from_str(text);
+        let mut syntax = Syntax::new(language);
+        let result = syntax.parse_job(&rope, 1).unwrap().run();
+        assert!(syntax.apply(result, &[]));
+        syntax.headings().iter().map(|heading| (heading.level, heading.title.clone(), heading.line)).collect()
+    }
+
+    #[test]
+    fn latex_headings_come_from_the_tree() {
+        let text = "\\section[short]{Long\ntitle}\n% \\section{comment}\n\\subsection*{B}\n\\begin{verbatim}\n\\section{raw}\n\\end{verbatim}\n\\newcommand{\\foo}{\\section{macro}}\n\\chapter{C} \\section{D}\n";
+        assert_eq!(
+            headings_of(Language::Latex, text),
+            vec![
+                (2, "{Long\ntitle}".into(), 0),
+                (3, "{B}".into(), 3),
+                (1, "{C}".into(), 8),
+                (2, "{D}".into(), 8),
+            ]
+        );
+    }
+
+    #[test]
+    fn typst_headings_come_from_the_tree() {
+        let text = "= *1.* Eins <a>\ntext\n=== Drei\n```\n= raw\n```\n";
+        assert_eq!(
+            headings_of(Language::Typst, text),
+            vec![(1, " *1.* Eins <a>".into(), 0), (3, " Drei".into(), 2)]
+        );
+    }
+
+    #[test]
+    fn markdown_headings_come_from_the_tree() {
+        let text = "# One\n\n```\n# code\n```\n\nTwo\n===\n\nThree\n---\n\n### Four\n";
+        assert_eq!(
+            headings_of(Language::Markdown, text),
+            vec![
+                (1, "One".into(), 0),
+                (1, "Two\n".into(), 6),
+                (2, "Three\n".into(), 9),
+                (3, "Four".into(), 12),
+            ]
+        );
+    }
+
+    #[test]
+    fn deep_nesting_does_not_overflow_the_stack() {
+        let text = format!("\\section{{A}}\n{}{}", "{".repeat(50_000), "}".repeat(50_000));
+        assert_eq!(headings_of(Language::Latex, &text)[0].1, "{A}");
     }
 
     #[test]

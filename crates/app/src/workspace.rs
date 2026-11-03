@@ -45,6 +45,9 @@ const TAB_BAR_HEIGHT: f32 = 36.0;
 const TOOLBAR_HEIGHT: f32 = 32.0;
 const PREVIEW_TOOLBAR_HEIGHT: f32 = 32.0;
 const MIN_PANE_WIDTH: f32 = 160.0;
+const OUTLINE_INSET: f32 = 8.0;
+const OUTLINE_INDENT: f32 = 16.0;
+const OUTLINE_CHEVRON: f32 = 16.0;
 const FOLLOW_DEBOUNCE: Duration = Duration::from_millis(150);
 /// Oldest output is dropped beyond this size.
 const MAX_LOG_BYTES: usize = 2 << 20;
@@ -422,7 +425,6 @@ impl Workspace {
         });
         let subscription = cx.subscribe(&view, |this, _, event, cx| match event {
             EditorEvent::Edited => {
-                this.outline_version = (usize::MAX, 0);
                 this.schedule_type_build(cx);
                 cx.notify();
             }
@@ -1321,9 +1323,13 @@ impl Workspace {
             return;
         };
         let state = &view.read(cx).state;
-        let key = (self.active.unwrap_or(usize::MAX), state.version());
+        let key = (self.active.unwrap_or(usize::MAX), state.syntax().applied_results());
         if key != self.outline_version {
-            self.outline = outline::outline(state.buffer(), state.language());
+            let mut items = outline::outline(state.syntax().headings(), state.language());
+            if key.0 == self.outline_version.0 {
+                outline::carry_collapsed(&self.outline, &mut items);
+            }
+            self.outline = items;
             self.outline_version = key;
         }
     }
@@ -1706,20 +1712,21 @@ impl Workspace {
     }
 
     fn render_outline(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let min_level = self.outline.iter().map(|item| item.level).min().unwrap_or(0);
         div()
             .id("outline")
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
-            .children(self.outline.iter().enumerate().map(|(index, item)| {
+            .children(outline::visible(&self.outline).map(|(index, item)| {
                 let line = item.line;
                 div()
                     .id(index)
+                    .relative()
                     .flex()
                     .items_center()
+                    .gap(px(4.))
                     .h(px(32.))
-                    .pl(px(14. + (item.level - min_level) as f32 * 24.))
+                    .pl(px(OUTLINE_INSET + item.depth as f32 * OUTLINE_INDENT))
                     .pr(px(8.))
                     .cursor_pointer()
                     .hover(|style| style.bg(theme::color(theme::PANEL)))
@@ -1728,6 +1735,38 @@ impl Workspace {
                             view.update(cx, |view, cx| view.go_to_line(line, 0, window, cx));
                         }
                     }))
+                    // Rows touch, so the guides of neighbours join into one line.
+                    .children((0..item.depth).map(|depth| {
+                        div()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .left(px(OUTLINE_INSET + OUTLINE_CHEVRON / 2. + depth as f32 * OUTLINE_INDENT))
+                            .w(px(1.))
+                            .bg(theme::color(theme::DIVIDER))
+                    }))
+                    .child(
+                        div()
+                            .id(("outline-toggle", index))
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .size(px(OUTLINE_CHEVRON))
+                            .when(item.has_children, |toggle| {
+                                toggle
+                                    .child(Self::icon(
+                                        if item.collapsed { "chevron-right" } else { "chevron-down" },
+                                        12.,
+                                        theme::UI_TEXT,
+                                    ))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.outline[index].collapsed ^= true;
+                                        cx.notify();
+                                    }))
+                            }),
+                    )
                     .child(div().truncate().child(item.title.clone()))
             }))
     }

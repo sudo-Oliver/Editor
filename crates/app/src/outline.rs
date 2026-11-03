@@ -1,77 +1,86 @@
-use editor_core::{Buffer, Language};
+use std::collections::HashMap;
+
+use editor_core::{Heading, Language};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutlineItem {
     pub level: usize,
     pub title: String,
     pub line: usize,
+    /// Number of open parents, which differs from `level` when a level is skipped.
+    pub depth: usize,
+    pub has_children: bool,
+    pub collapsed: bool,
 }
 
-const LATEX_LEVELS: &[(&str, usize)] = &[
-    ("\\part", 0),
-    ("\\chapter", 1),
-    ("\\section", 2),
-    ("\\subsection", 3),
-    ("\\subsubsection", 4),
-];
-
-/// Lists document headings. Lines are scanned on their own, so a heading that
-/// spans several lines keeps only its first line.
-pub fn outline(buffer: &Buffer, language: Language) -> Vec<OutlineItem> {
-    let mut items = Vec::new();
-    for line in 0..buffer.line_count() {
-        let text = buffer.line_text(line);
-        let trimmed = text.trim_start();
-        let heading = match language {
-            Language::Latex => latex_heading(trimmed),
-            Language::Typst => marker_heading(trimmed, '='),
-            Language::Markdown => marker_heading(trimmed, '#'),
-            Language::Plain => None,
+/// Turns parsed headings into a tree, stored flat in document order.
+pub fn outline(headings: &[Heading], language: Language) -> Vec<OutlineItem> {
+    let mut items: Vec<OutlineItem> = Vec::new();
+    let mut parents: Vec<usize> = Vec::new();
+    for heading in headings {
+        let title = match language {
+            Language::Latex => clean_latex(&heading.title),
+            _ => clean_markup(&heading.title, language),
         };
-        if let Some((level, title)) = heading {
-            let title = match language {
-                Language::Latex => clean_latex(&title),
-                _ => clean_markup(&title, language),
-            };
-            items.push(OutlineItem { level, title, line });
+        // A heading stays out while its title is still being typed.
+        if title.is_empty() {
+            continue;
         }
+        while parents.last().is_some_and(|&parent| items[parent].level >= heading.level) {
+            parents.pop();
+        }
+        if let Some(&parent) = parents.last() {
+            items[parent].has_children = true;
+        }
+        parents.push(items.len());
+        items.push(OutlineItem {
+            level: heading.level,
+            title,
+            line: heading.line,
+            depth: parents.len() - 1,
+            has_children: false,
+            collapsed: false,
+        });
     }
     items
 }
 
-fn latex_heading(line: &str) -> Option<(usize, String)> {
-    for (command, level) in LATEX_LEVELS {
-        let Some(rest) = line.strip_prefix(command) else {
-            continue;
-        };
-        let rest = rest.strip_prefix('*').unwrap_or(rest);
-        let rest = rest.strip_prefix('{')?;
-        let mut depth = 1;
-        for (index, ch) in rest.char_indices() {
-            match ch {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some((*level, rest[..index].to_string()));
-                    }
-                }
-                _ => {}
-            }
+/// Lists the items that no collapsed parent hides, with their index.
+pub fn visible(items: &[OutlineItem]) -> impl Iterator<Item = (usize, &OutlineItem)> {
+    let mut hidden_below = None;
+    items.iter().enumerate().filter(move |(_, item)| {
+        if hidden_below.is_some_and(|depth| item.depth > depth) {
+            return false;
         }
-        return Some((*level, rest.to_string()));
-    }
-    None
+        hidden_below = item.collapsed.then_some(item.depth);
+        true
+    })
 }
 
-fn marker_heading(line: &str, marker: char) -> Option<(usize, String)> {
-    let level = line.chars().take_while(|ch| *ch == marker).count();
-    if level == 0 {
-        return None;
+/// Keeps headings collapsed across edits. Line numbers move, so a heading is known
+/// by its level, title and how many identical headings come before it.
+pub fn carry_collapsed(old: &[OutlineItem], new: &mut [OutlineItem]) {
+    fn keys(items: &[OutlineItem]) -> impl Iterator<Item = (usize, &str, usize)> {
+        let mut seen: HashMap<(usize, &str), usize> = HashMap::new();
+        items.iter().map(move |item| {
+            let count = seen.entry((item.level, &item.title)).or_default();
+            *count += 1;
+            (item.level, item.title.as_str(), *count)
+        })
     }
-    let title = line[level..].strip_prefix(' ')?;
-    Some((level, title.trim().to_string()))
+    if !old.iter().any(|item| item.collapsed) {
+        return;
+    }
+    let collapsed: std::collections::HashSet<_> =
+        keys(old).zip(old).filter(|(_, item)| item.collapsed).map(|(key, _)| key).collect();
+    let flags: Vec<bool> = keys(new).map(|key| collapsed.contains(&key)).collect();
+    for (item, flag) in new.iter_mut().zip(flags) {
+        item.collapsed = flag && item.has_children;
+    }
 }
+
+/// Commands whose argument is not part of the visible title.
+const LATEX_HIDDEN_ARGUMENT: &[&str] = &["label", "index", "footnote", "cite", "ref"];
 
 /// Keeps the text of `\\emph{x}`, and the name of `\\LaTeX` or `\\alpha`.
 fn clean_latex(title: &str) -> String {
@@ -92,17 +101,43 @@ fn clean_latex(title: &str) -> String {
                 } else {
                     // `\\LaTeX{}` is a name, but `\\emph{x}` only wraps its argument.
                     let mut ahead = chars.clone();
-                    if ahead.next() != Some('{') || ahead.next() == Some('}') {
+                    let has_argument = ahead.next() == Some('{') && ahead.next() != Some('}');
+                    if !has_argument {
                         result.push_str(&name);
+                    } else if LATEX_HIDDEN_ARGUMENT.contains(&name.as_str()) {
+                        skip_group(&mut chars);
                     }
                 }
             }
             '{' | '}' | '$' => {}
+            '%' => {
+                chars.by_ref().find(|ch| *ch == '\n');
+            }
             '~' => result.push(' '),
             other => result.push(other),
         }
     }
-    result.trim().to_string()
+    join_lines(&result)
+}
+
+/// Skips one `{...}` group, which the iterator must be at the start of.
+fn skip_group(chars: &mut std::iter::Peekable<std::str::Chars>) {
+    let mut depth = 0;
+    for ch in chars {
+        match ch {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 {
+            return;
+        }
+    }
+}
+
+/// A title can span lines in the source, but has one line in the outline.
+fn join_lines(title: &str) -> String {
+    title.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Removes Typst and Markdown emphasis, labels and link targets. The text
@@ -148,32 +183,65 @@ fn clean_markup(title: &str, language: Language) -> String {
             _ => result.push(ch),
         }
     }
-    result.trim().to_string()
+    join_lines(&result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn heading(level: usize, title: &str, line: usize) -> Heading {
+        Heading { level, title: title.into(), line }
+    }
+
+    fn shape(items: &[OutlineItem]) -> Vec<(&str, usize, bool)> {
+        items.iter().map(|item| (item.title.as_str(), item.depth, item.has_children)).collect()
+    }
+
+    fn titles<'a>(items: impl Iterator<Item = (usize, &'a OutlineItem)>) -> Vec<&'a str> {
+        items.map(|(_, item)| item.title.as_str()).collect()
+    }
+
     #[test]
-    fn finds_latex_headings() {
-        let buffer = Buffer::new("\\section{A \\emph{b}}\ntext\n  \\subsection*{C}\n\\sectionx{no}\n");
-        let items = outline(&buffer, Language::Latex);
+    fn levels_become_a_tree() {
+        let headings = [
+            heading(2, "{A \\emph{b}}", 0),
+            heading(4, "{Skips a level}", 1),
+            heading(3, "{C}", 2),
+            heading(2, "{D}", 3),
+            heading(1, "{E}", 4),
+        ];
         assert_eq!(
-            items,
-            vec![
-                OutlineItem { level: 2, title: "A b".into(), line: 0 },
-                OutlineItem { level: 3, title: "C".into(), line: 2 },
-            ]
+            shape(&outline(&headings, Language::Latex)),
+            vec![("A b", 0, true), ("Skips a level", 1, false), ("C", 1, false), ("D", 0, false), ("E", 0, false)]
         );
     }
 
     #[test]
-    fn finds_marker_headings() {
-        let typst = Buffer::new("= One\n== Two\n=no\n");
-        assert_eq!(outline(&typst, Language::Typst).len(), 2);
-        let markdown = Buffer::new("# One\n#tag\n### Three\n");
-        assert_eq!(outline(&markdown, Language::Markdown)[1].level, 3);
+    fn empty_titles_stay_out() {
+        assert!(outline(&[heading(1, " ", 0)], Language::Typst).is_empty());
+    }
+
+    #[test]
+    fn collapsing_hides_only_the_subtree() {
+        let headings = [heading(1, "A", 0), heading(2, "B", 1), heading(3, "C", 2), heading(1, "D", 3)];
+        let mut items = outline(&headings, Language::Typst);
+        assert_eq!(titles(visible(&items)), ["A", "B", "C", "D"]);
+        items[1].collapsed = true;
+        assert_eq!(titles(visible(&items)), ["A", "B", "D"]);
+        items[0].collapsed = true;
+        assert_eq!(titles(visible(&items)), ["A", "D"]);
+    }
+
+    #[test]
+    fn collapsed_headings_survive_edits() {
+        let before = [heading(1, "Same", 0), heading(2, "x", 1), heading(1, "Same", 2), heading(2, "y", 3)];
+        let mut old = outline(&before, Language::Typst);
+        old[2].collapsed = true;
+        let after = [heading(1, "New", 0), heading(1, "Same", 5), heading(2, "x", 6), heading(1, "Same", 9), heading(2, "y", 10)];
+        let mut new = outline(&after, Language::Typst);
+        carry_collapsed(&old, &mut new);
+        assert_eq!(new.iter().map(|item| item.collapsed).collect::<Vec<_>>(), [false, false, false, true, false]);
     }
 
     #[test]
@@ -183,5 +251,6 @@ mod tests {
         assert_eq!(clean_markup("_kurz_ $x_1 * y$ snake_case <sec:a>", Language::Typst), "kurz x_1 * y snake_case");
         assert_eq!(clean_markup("**Bold** [Pandoc](https://pandoc.org) `raw` ##", Language::Markdown), "Bold Pandoc raw");
         assert_eq!(clean_latex("The \\LaTeX{} \\textbf{way} of $\\alpha$~\\& more"), "The LaTeX way of alpha & more");
+        assert_eq!(clean_latex("{Intro\\label{sec:a}\\footnote{a {b} c} \\& 100\\% % note\n  more}"), "Intro & 100% more");
     }
 }
