@@ -88,7 +88,7 @@ Git runs only while the panel is open, never when a folder opens. Hooks and filt
 
 ## Add-ons
 
-An add-on is a program in its own folder, with an `addon.toml` that names it and the permissions it wants. Settings, Add-ons installs one from a folder and turns it on. It then gets a button in the left rail, and its program starts when you first open that panel. Without an add-on turned on, nothing runs.
+An add-on is a program in its own folder, with an `addon.toml` that names it and the permissions it wants. The Add-ons button in the left rail lists what is installed. There you install an add-on from a folder, turn it on or off and remove it. An add-on that is on gets its own button in the rail, and its program starts when you first open that panel. Without an add-on turned on, nothing runs.
 
 Add-ons have no sandbox. They run with your user rights, so install only those you trust. The permissions limit what they can ask the editor for, not what the program can do by itself. Through the editor, they reach only files inside the project and never `.git`.
 

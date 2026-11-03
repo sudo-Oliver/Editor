@@ -68,8 +68,9 @@ changes; the commit message and button; history with one lane per branch.
 
 ## Add-on panels
 
-An add-on that is turned on gets a rail button below Git, and its panel takes the place of the
-file tree. The add-on sends a tree of nodes, so its panel uses the colors and controls of the app.
+The Add-ons rail button below Git lists installed add-ons with On, Off, Remove and Install from
+folder. An add-on that is turned on gets a rail button of its own below that, with its own icon, and
+its panel takes the place of the file tree. The add-on sends a tree of nodes, so its panel uses the colors and controls of the app.
 
 ## Vim status bar
 
