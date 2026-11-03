@@ -7,4 +7,4 @@ pub mod syntax;
 pub use buffer::Buffer;
 pub use selection::{Selection, SelectionSet};
 pub use state::{EditorState, LineChange, Mark, MarkSeverity, Motion};
-pub use syntax::{HighlightKind, HighlightSpan, Language, ParseJob, ParseResult, Syntax};
+pub use syntax::{Heading, HighlightKind, HighlightSpan, Language, ParseJob, ParseResult, Syntax};
