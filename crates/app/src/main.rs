@@ -3,6 +3,7 @@ mod assets;
 mod editor_view;
 mod file_tree;
 mod outline;
+mod pdf_text;
 mod pdf_view;
 mod picker;
 mod problems;

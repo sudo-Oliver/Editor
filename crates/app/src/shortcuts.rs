@@ -43,7 +43,12 @@ pub fn sections(vim_mode: bool) -> Vec<Section> {
         },
         Section {
             title: "PDF",
-            rows: vec![(modified("Click"), "Jump from the PDF to the source")],
+            rows: vec![
+                (modified("Click"), "Jump from the PDF to the source"),
+                (modified("C"), "Copy the selected PDF text"),
+                (modified("["), "Back after following a link"),
+                (modified("]"), "Forward again"),
+            ],
         },
     ];
     if vim_mode {

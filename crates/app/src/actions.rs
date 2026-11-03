@@ -61,11 +61,14 @@ actions!(
         CloseMenu,
         OpenSettings,
         Quit,
+        PdfBack,
+        PdfForward,
     ]
 );
 
 pub fn bind_keys(cx: &mut App) {
     let editor = Some("Editor");
+    let pdf = Some("PdfView");
     cx.bind_keys([
         // The backdrop of an open menu holds the focus, so this does not reach the editor.
         KeyBinding::new("escape", CloseMenu, None),
@@ -108,6 +111,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-v", Paste, editor),
         KeyBinding::new("secondary-b", Bold, editor),
         KeyBinding::new("secondary-i", Italic, editor),
+        KeyBinding::new("secondary-c", Copy, pdf),
+        KeyBinding::new("secondary-[", PdfBack, pdf),
+        KeyBinding::new("secondary-]", PdfForward, pdf),
+        KeyBinding::new("alt-left", PdfBack, pdf),
+        KeyBinding::new("alt-right", PdfForward, pdf),
         KeyBinding::new("secondary-s", Save, None),
         KeyBinding::new("secondary-enter", Recompile, None),
         KeyBinding::new("secondary-o", OpenFolder, None),

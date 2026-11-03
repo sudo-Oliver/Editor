@@ -1,18 +1,23 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use gpui::{
-    Bounds, Context, Corners, EventEmitter, MouseButton, MouseDownEvent, Pixels, Render, RenderImage,
-    ScrollEvent, Task, Window, canvas, div, fill, point, prelude::*, px, rgba, size,
+    Bounds, ClipboardItem, Context, Corners, EventEmitter, FocusHandle, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, NavigationDirection, Pixels, Render, RenderImage, ScrollEvent, Task, Window, canvas, div, fill,
+    point, prelude::*, px, rgba, size,
 };
-use pdf::{PageRequest, PdfEvent, PdfWorker};
+use pdf::{LinkTarget, PageContent, PageRequest, PdfEvent, PdfWorker, Rect};
 use synctex::PdfLocation;
 
-use crate::theme;
+use crate::{
+    actions,
+    pdf_text::{self, Selection, TextPoint},
+    theme,
+};
 
 const PAGE_GAP: f32 = 12.0;
 const SIDE_MARGIN: f32 = 21.0;
@@ -25,6 +30,15 @@ const KEEP_PAGES: usize = 2;
 /// Zooming scales the existing texture. A sharp render follows after this pause.
 const ZOOM_SETTLE: Duration = Duration::from_millis(150);
 const HIGHLIGHT_TIME: Duration = Duration::from_millis(1500);
+const SCROLL_TIME: Duration = Duration::from_millis(180);
+/// A press that moves less than this is a click.
+const DRAG_DISTANCE: f32 = 3.0;
+const MAX_HISTORY: usize = 100;
+/// Space above the target of a link.
+const LINK_MARGIN: f32 = 16.0;
+const LINK_FLASH_HEIGHT: f32 = 14.0;
+const SELECTION_COLOR: u32 = 0x4a9cd466;
+const LINK_HOVER_COLOR: u32 = 0x4a9cd426;
 
 pub enum PdfViewEvent {
     /// A secondary click at a position in PDF points on a zero-based page.
@@ -40,7 +54,57 @@ struct PageImage {
 
 struct PaintList {
     pages: Vec<(Bounds<Pixels>, Option<Arc<RenderImage>>)>,
+    selection: Vec<Bounds<Pixels>>,
+    hovered_link: Option<Bounds<Pixels>>,
     highlight: Option<Bounds<Pixels>>,
+}
+
+#[derive(Clone, Copy)]
+enum Placement {
+    /// A third down the viewport.
+    Third,
+    /// Centered, unless it already is near the middle, so that moving the cursor
+    /// through a paragraph leaves the page at rest.
+    Center,
+    /// This many pixels below the top of the viewport.
+    Top(f32),
+}
+
+#[derive(Clone, Copy)]
+struct ScrollRequest {
+    page: usize,
+    y: f32,
+    placement: Placement,
+}
+
+#[derive(Clone, Copy)]
+struct ScrollAnimation {
+    from: f32,
+    to: f32,
+    start: Instant,
+}
+
+/// A position in PDF points on a zero-based page. It stays valid when the zoom changes.
+#[derive(Clone, Copy)]
+struct PagePoint {
+    page: usize,
+    x: f32,
+    y: f32,
+    inside: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Press {
+    position: gpui::Point<Pixels>,
+    point: PagePoint,
+    link: Option<usize>,
+    moved: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ViewPosition {
+    page: usize,
+    y: f32,
 }
 
 pub struct PdfView {
@@ -57,12 +121,24 @@ pub struct PdfView {
     invert: bool,
     scroll: gpui::Point<Pixels>,
     bounds: Option<Bounds<Pixels>>,
-    pending_location: Option<PdfLocation>,
+    pending_scroll: Option<ScrollRequest>,
+    scroll_animation: Option<ScrollAnimation>,
     highlight: Option<PdfLocation>,
     highlight_task: Option<Task<()>>,
     error: Option<String>,
     load_task: Option<Task<()>>,
     _events_task: Option<Task<()>>,
+    /// Text and links of the pages that the pointer reached.
+    content: HashMap<usize, PageContent>,
+    requested_content: HashSet<usize>,
+    selection: Option<Selection>,
+    selection_rects: HashMap<usize, Box<[Rect]>>,
+    press: Option<Press>,
+    /// Page and index of the link under the pointer.
+    hovered_link: Option<(usize, usize)>,
+    back: Vec<ViewPosition>,
+    forward: Vec<ViewPosition>,
+    focus: FocusHandle,
 }
 
 impl EventEmitter<PdfViewEvent> for PdfView {}
@@ -83,12 +159,22 @@ impl PdfView {
             invert: false,
             scroll: point(px(0.), px(0.)),
             bounds: None,
-            pending_location: None,
+            pending_scroll: None,
+            scroll_animation: None,
             highlight: None,
             highlight_task: None,
             error: None,
             load_task: None,
             _events_task: None,
+            content: HashMap::new(),
+            requested_content: HashSet::new(),
+            selection: None,
+            selection_rects: HashMap::new(),
+            press: None,
+            hovered_link: None,
+            back: Vec::new(),
+            forward: Vec::new(),
+            focus: cx.focus_handle(),
         };
         match PdfWorker::spawn(&library_directory()) {
             Ok((worker, mut events)) => {
@@ -136,6 +222,9 @@ impl PdfView {
         self.pages.clear();
         self.last_requested.clear();
         self.pending_drop.extend(self.images.drain().map(|(_, image)| image.image));
+        self.forget_content();
+        self.back.clear();
+        self.forward.clear();
         cx.notify();
     }
 
@@ -168,6 +257,7 @@ impl PdfView {
 
     pub fn go_to_page(&mut self, page: usize, cx: &mut Context<Self>) {
         if page < self.pages.len() {
+            self.scroll_animation = None;
             self.scroll.y = px(self.page_top(page) - PAGE_GAP);
             cx.notify();
         }
@@ -194,7 +284,17 @@ impl PdfView {
 
     /// Scrolls to a location and flashes it.
     pub fn reveal(&mut self, location: PdfLocation, cx: &mut Context<Self>) {
-        self.pending_location = Some(location);
+        self.pending_scroll = Some(ScrollRequest { page: location.page, y: location.y, placement: Placement::Third });
+        self.flash(location, cx);
+    }
+
+    /// Keeps a location in view while the cursor moves, without flashing it.
+    pub fn follow(&mut self, location: PdfLocation, cx: &mut Context<Self>) {
+        self.pending_scroll = Some(ScrollRequest { page: location.page, y: location.y, placement: Placement::Center });
+        cx.notify();
+    }
+
+    fn flash(&mut self, location: PdfLocation, cx: &mut Context<Self>) {
         self.highlight = Some(location);
         self.highlight_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(HIGHLIGHT_TIME).await;
@@ -207,6 +307,15 @@ impl PdfView {
         cx.notify();
     }
 
+    fn forget_content(&mut self) {
+        self.content.clear();
+        self.requested_content.clear();
+        self.selection = None;
+        self.selection_rects.clear();
+        self.press = None;
+        self.hovered_link = None;
+    }
+
     fn handle_event(&mut self, event: PdfEvent, cx: &mut Context<Self>) {
         match event {
             PdfEvent::Loaded { generation, pages } => {
@@ -214,6 +323,7 @@ impl PdfView {
                     self.pages = pages;
                     self.error = None;
                     self.last_requested.clear();
+                    self.forget_content();
                     let count = self.pages.len();
                     self.images.retain(|page, image| {
                         let keep = *page < count;
@@ -238,6 +348,11 @@ impl PdfView {
                     self.pending_drop.push(old.image);
                 }
                 cx.notify();
+            }
+            PdfEvent::PageContent { generation, page, content } => {
+                if generation == self.generation {
+                    self.content.insert(page, content);
+                }
             }
             PdfEvent::Failed { generation, message } => {
                 if generation == self.generation {
@@ -273,6 +388,7 @@ impl PdfView {
     fn zoom_around(&mut self, factor: f32, anchor: gpui::Point<Pixels>, cx: &mut Context<Self>) {
         let zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
         let ratio = zoom / self.zoom;
+        self.scroll_animation = None;
         self.scroll.x = (self.scroll.x + anchor.x) * ratio - anchor.x;
         self.scroll.y = (self.scroll.y + anchor.y) * ratio - anchor.y;
         self.zoom = zoom;
@@ -302,32 +418,229 @@ impl PdfView {
             self.zoom_around((f32::from(delta.y) * 0.01).exp(), anchor, cx);
             return;
         }
+        self.scroll_animation = None;
         self.scroll.x -= delta.x;
         self.scroll.y -= delta.y;
         cx.notify();
     }
 
-    fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if !event.modifiers.secondary() {
-            return;
+    /// The page at a height in the content. A gap belongs to the page above it.
+    fn page_near(&self, content_y: f32) -> Option<(usize, f32)> {
+        let mut top = PAGE_GAP;
+        for (page, (_, height)) in self.pages.iter().enumerate() {
+            let next = top + height * self.zoom + PAGE_GAP;
+            if content_y < next {
+                return Some((page, top));
+            }
+            top = next;
         }
-        let Some(bounds) = self.bounds else {
+        let last = self.pages.len().checked_sub(1)?;
+        Some((last, top - self.pages[last].1 * self.zoom - PAGE_GAP))
+    }
+
+    fn page_point(&self, position: gpui::Point<Pixels>) -> Option<PagePoint> {
+        let bounds = self.bounds?;
+        let content_x = f32::from(position.x - bounds.left() + self.scroll.x);
+        let content_y = f32::from(position.y - bounds.top() + self.scroll.y);
+        let (page, top) = self.page_near(content_y)?;
+        let x = (content_x - self.page_left(page, bounds.size.width)) / self.zoom;
+        let y = (content_y - top) / self.zoom;
+        let (width, height) = self.pages[page];
+        let inside = x >= 0.0 && x <= width && y >= 0.0 && y <= height;
+        Some(PagePoint { page, x, y, inside })
+    }
+
+    fn request_content(&mut self, page: usize) {
+        if self.requested_content.insert(page)
+            && let Some(worker) = &self.worker
+        {
+            worker.content(self.generation, page);
+        }
+    }
+
+    fn link_at(&self, point: &PagePoint) -> Option<usize> {
+        let links = &self.content.get(&point.page)?.links;
+        links.iter().position(|link| link.rect.contains(point.x, point.y))
+    }
+
+    fn text_point(&self, point: &PagePoint) -> Option<TextPoint> {
+        let chars = &self.content.get(&point.page)?.chars;
+        let index = pdf_text::char_at(chars, point.x, point.y)?;
+        Some(TextPoint { page: point.page, index })
+    }
+
+    fn set_selection(&mut self, selection: Option<Selection>, cx: &mut Context<Self>) {
+        if self.selection != selection {
+            self.selection = selection;
+            self.selection_rects.clear();
+            cx.notify();
+        }
+    }
+
+    fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus, cx);
+        let Some(point) = self.page_point(event.position) else {
             return;
         };
-        let x = event.position.x - bounds.left() + self.scroll.x;
-        let y = event.position.y - bounds.top() + self.scroll.y;
-        for page in 0..self.pages.len() {
-            let top = self.page_top(page);
-            let left = self.page_left(page, bounds.size.width);
-            let (width, height) = self.pages[page];
-            let inside_x = f32::from(x) >= left && f32::from(x) <= left + width * self.zoom;
-            if inside_x && f32::from(y) >= top && f32::from(y) <= top + height * self.zoom {
-                cx.emit(PdfViewEvent::BackwardSearch {
-                    page,
-                    x: (f32::from(x) - left) / self.zoom,
-                    y: (f32::from(y) - top) / self.zoom,
-                });
+        if event.modifiers.secondary() {
+            if point.inside {
+                cx.emit(PdfViewEvent::BackwardSearch { page: point.page, x: point.x, y: point.y });
+            }
+            return;
+        }
+        self.request_content(point.page);
+        let link = if point.inside { self.link_at(&point) } else { None };
+        self.press = Some(Press { position: event.position, point, link, moved: false });
+        self.set_selection(None, cx);
+    }
+
+    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(point) = self.page_point(event.position) else {
+            return;
+        };
+        if event.pressed_button == Some(MouseButton::Left) {
+            self.drag(event.position, point, cx);
+            return;
+        }
+        self.press = None;
+        if point.inside {
+            self.request_content(point.page);
+        }
+        let link = if point.inside { self.link_at(&point) } else { None };
+        let hovered = link.map(|link| (point.page, link));
+        if self.hovered_link != hovered {
+            self.hovered_link = hovered;
+            cx.notify();
+        }
+    }
+
+    fn drag(&mut self, position: gpui::Point<Pixels>, point: PagePoint, cx: &mut Context<Self>) {
+        let Some(press) = self.press.as_mut() else {
+            return;
+        };
+        if !press.moved {
+            let distance = position - press.position;
+            if f32::from(distance.x).hypot(f32::from(distance.y)) < DRAG_DISTANCE {
                 return;
+            }
+            press.moved = true;
+        }
+        let press = *press;
+        self.request_content(point.page);
+        // The content of the first page can still be on its way. The next move tries again.
+        let anchor = self.selection.map(|selection| selection.anchor).or_else(|| self.text_point(&press.point));
+        if let (Some(anchor), Some(head)) = (anchor, self.text_point(&point)) {
+            self.set_selection(Some(Selection { anchor, head }), cx);
+        }
+    }
+
+    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(press) = self.press.take() else {
+            return;
+        };
+        if press.moved {
+            return;
+        }
+        let target = press.link.and_then(|link| {
+            Some(self.content.get(&press.point.page)?.links.get(link)?.target.clone())
+        });
+        if let Some(target) = target {
+            self.open_link(target, cx);
+        }
+    }
+
+    fn open_link(&mut self, target: LinkTarget, cx: &mut Context<Self>) {
+        match target {
+            LinkTarget::Page { page, y } if page < self.pages.len() => {
+                if let Some(position) = self.view_position() {
+                    self.forward.clear();
+                    push_position(&mut self.back, position);
+                }
+                let placement = Placement::Top(if y.is_some() { LINK_MARGIN } else { PAGE_GAP });
+                self.pending_scroll = Some(ScrollRequest { page, y: y.unwrap_or(0.0), placement });
+                match y {
+                    Some(y) => {
+                        let width = self.pages[page].0;
+                        let location = PdfLocation { page, x: 0.0, y, width, height: LINK_FLASH_HEIGHT };
+                        self.flash(location, cx);
+                    }
+                    None => cx.notify(),
+                }
+            }
+            LinkTarget::Page { .. } => {}
+            LinkTarget::Uri(uri) if pdf_text::is_openable_uri(&uri) => cx.open_url(&uri),
+            LinkTarget::Uri(uri) => cx.emit(PdfViewEvent::Failed(format!("Not opening the link {uri}"))),
+        }
+    }
+
+    fn view_position(&self) -> Option<ViewPosition> {
+        let content_y = f32::from(self.scroll.y);
+        let (page, top) = self.page_near(content_y)?;
+        Some(ViewPosition { page, y: (content_y - top) / self.zoom })
+    }
+
+    fn go_back(&mut self, cx: &mut Context<Self>) {
+        if let Some(position) = self.back.pop() {
+            self.restore_position(position, true, cx);
+        }
+    }
+
+    fn go_forward(&mut self, cx: &mut Context<Self>) {
+        if let Some(position) = self.forward.pop() {
+            self.restore_position(position, false, cx);
+        }
+    }
+
+    fn restore_position(&mut self, position: ViewPosition, going_back: bool, cx: &mut Context<Self>) {
+        if let Some(current) = self.view_position() {
+            push_position(if going_back { &mut self.forward } else { &mut self.back }, current);
+        }
+        // A rebuild can make the document shorter.
+        if let Some(last) = self.pages.len().checked_sub(1) {
+            let page = position.page.min(last);
+            self.pending_scroll = Some(ScrollRequest { page, y: position.y, placement: Placement::Top(0.0) });
+            cx.notify();
+        }
+    }
+
+    fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        if let Some(selection) = &self.selection {
+            let text = pdf_text::selected_text(selection, |page| self.content.get(&page));
+            if !text.is_empty() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+        }
+    }
+
+    /// Starts the requested scroll and moves on with the running one.
+    fn advance_scroll(&mut self, viewport: gpui::Size<Pixels>, window: &mut Window) {
+        if let Some(request) = self.pending_scroll.take()
+            && request.page < self.pages.len()
+        {
+            let target = self.page_top(request.page) + request.y * self.zoom;
+            let height = f32::from(viewport.height);
+            let current = f32::from(self.scroll.y);
+            let to = match request.placement {
+                Placement::Third => Some(target - height / 3.0),
+                Placement::Center => {
+                    let in_middle = target >= current + height * 0.25 && target <= current + height * 0.75;
+                    (!in_middle).then_some(target - height / 2.0)
+                }
+                Placement::Top(margin) => Some(target - margin),
+            };
+            if let Some(to) = to {
+                let to = to.clamp(0.0, (self.content_size().1 - height).max(0.0));
+                self.scroll_animation = Some(ScrollAnimation { from: current, to, start: Instant::now() });
+            }
+        }
+        if let Some(animation) = self.scroll_animation {
+            let progress = (animation.start.elapsed().as_secs_f32() / SCROLL_TIME.as_secs_f32()).min(1.0);
+            let eased = 1.0 - (1.0 - progress).powi(3);
+            self.scroll.y = px(animation.from + (animation.to - animation.from) * eased);
+            if progress < 1.0 {
+                window.request_animation_frame();
+            } else {
+                self.scroll_animation = None;
             }
         }
     }
@@ -338,29 +651,32 @@ impl PdfView {
             window.drop_image(image).ok();
         }
         if self.pages.is_empty() {
-            return PaintList { pages: Vec::new(), highlight: None };
+            return PaintList { pages: Vec::new(), selection: Vec::new(), hovered_link: None, highlight: None };
         }
         if self.fit_width {
             let widest = self.pages.iter().map(|(width, _)| *width).fold(1.0, f32::max);
             self.zoom = ((f32::from(bounds.size.width) - SIDE_MARGIN * 2.0) / widest).clamp(MIN_ZOOM, MAX_ZOOM);
         }
-        if let Some(location) = self.pending_location.take()
-            && location.page < self.pages.len()
-        {
-            self.scroll.y = px(self.page_top(location.page) + location.y * self.zoom - f32::from(bounds.size.height) / 3.0);
-        }
+        self.advance_scroll(bounds.size, window);
         self.clamp_scroll(bounds.size);
 
         let view_top = f32::from(self.scroll.y);
         let view_bottom = view_top + f32::from(bounds.size.height);
         let mut visible = Vec::new();
         let mut paint = Vec::new();
+        let mut selection_bounds = Vec::new();
+        let mut hovered_link = None;
         let mut highlight = None;
+        let mut next_top = PAGE_GAP;
         for page in 0..self.pages.len() {
-            let top = self.page_top(page);
+            let top = next_top;
             let (width, height) = self.pages[page];
             let (width, height) = (width * self.zoom, height * self.zoom);
-            if top + height < view_top || top > view_bottom {
+            next_top = top + height + PAGE_GAP;
+            if top > view_bottom {
+                break;
+            }
+            if top + height < view_top {
                 continue;
             }
             visible.push(page);
@@ -372,6 +688,20 @@ impl PdfView {
                 Bounds::new(origin, size(px(width), px(height))),
                 self.images.get(&page).map(|image| image.image.clone()),
             ));
+            if let Some(selection) = &self.selection
+                && let Some(content) = self.content.get(&page)
+            {
+                let rects = self.selection_rects.entry(page).or_insert_with(|| {
+                    selection
+                        .range_on(page, content.chars.len())
+                        .map_or_else(Box::default, |range| pdf_text::selection_rects(&content.chars, range))
+                });
+                selection_bounds.extend(rects.iter().map(|rect| rect_bounds(rect, origin, self.zoom)));
+            }
+            if let Some((_, link)) = self.hovered_link.filter(|(link_page, _)| *link_page == page) {
+                let rect = self.content.get(&page).and_then(|content| content.links.get(link));
+                hovered_link = rect.map(|link| rect_bounds(&link.rect, origin, self.zoom));
+            }
             if let Some(location) = self.highlight.filter(|location| location.page == page) {
                 let left = location.x * self.zoom;
                 highlight = Some(Bounds::new(
@@ -394,8 +724,13 @@ impl PdfView {
                 self.pending_drop.push(image.image);
             }
         }
+        // An open selection needs the text of its pages for copying.
+        if self.selection.is_none() && self.press.is_none() {
+            self.content.retain(|page, _| *page + KEEP_PAGES >= first && *page <= last + KEEP_PAGES);
+            self.requested_content.retain(|page| *page + KEEP_PAGES >= first && *page <= last + KEEP_PAGES);
+        }
         self.request_pages(first, last, window.scale_factor());
-        PaintList { pages: paint, highlight }
+        PaintList { pages: paint, selection: selection_bounds, hovered_link, highlight }
     }
 
     /// Asks for visible pages first, then their neighbors, at the current resolution.
@@ -428,6 +763,20 @@ impl PdfView {
     }
 }
 
+fn push_position(positions: &mut Vec<ViewPosition>, position: ViewPosition) {
+    if positions.len() == MAX_HISTORY {
+        positions.remove(0);
+    }
+    positions.push(position);
+}
+
+fn rect_bounds(rect: &Rect, origin: gpui::Point<Pixels>, zoom: f32) -> Bounds<Pixels> {
+    Bounds::new(
+        point(origin.x + px(rect.left * zoom), origin.y + px(rect.top * zoom)),
+        size(px((rect.right - rect.left) * zoom), px((rect.bottom - rect.top) * zoom)),
+    )
+}
+
 fn library_directory() -> PathBuf {
     if let Some(directory) = std::env::var_os("EDITOR_PDFIUM_DIR") {
         return directory.into();
@@ -456,13 +805,33 @@ impl Render for PdfView {
             self.pages.is_empty().then(|| "No PDF yet. Press Recompile.".to_string())
         });
         let view = cx.entity();
+        let has_pages = !self.pages.is_empty();
+        let over_link = self.hovered_link.is_some();
         div()
             .id("pdf")
             .relative()
             .size_full()
             .overflow_hidden()
+            .track_focus(&self.focus)
+            .key_context("PdfView")
+            .when(has_pages && !over_link, |element| element.cursor_text())
+            .when(over_link, |element| element.cursor_pointer())
+            .on_action(cx.listener(|this, _: &actions::Copy, _, cx| this.copy_selection(cx)))
+            .on_action(cx.listener(|this, _: &actions::PdfBack, _, cx| this.go_back(cx)))
+            .on_action(cx.listener(|this, _: &actions::PdfForward, _, cx| this.go_forward(cx)))
             .on_scroll(cx.listener(Self::on_scroll))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, _| this.press = None))
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Back),
+                cx.listener(|this, _, _, cx| this.go_back(cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Forward),
+                cx.listener(|this, _, _, cx| this.go_forward(cx)),
+            )
             .child(
                 canvas(
                     move |bounds, window, cx| view.update(cx, |view, _| view.prepare_paint(bounds, window)),
@@ -477,6 +846,12 @@ impl Render for PdfView {
                                     }
                                     None => window.paint_quad(fill(page, theme::color(0xffffff))),
                                 }
+                            }
+                            for rect in list.selection {
+                                window.paint_quad(fill(rect, rgba(SELECTION_COLOR)));
+                            }
+                            if let Some(rect) = list.hovered_link {
+                                window.paint_quad(fill(rect, rgba(LINK_HOVER_COLOR)));
                             }
                             if let Some(highlight) = list.highlight {
                                 window.paint_quad(fill(highlight, rgba(0xf5bb7766)));
