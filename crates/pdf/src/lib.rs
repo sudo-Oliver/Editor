@@ -173,7 +173,9 @@ fn render_page(
 ) {
     let config = PdfRenderConfig::new()
         .set_target_width(request.width_px as Pixels)
-        .set_format(PdfBitmapFormat::BGRA);
+        .set_format(PdfBitmapFormat::BGRA)
+        // pdfium-render turns this on by default, which swaps red and blue.
+        .set_reverse_byte_order(false);
     let page = u16::try_from(request.page)
         .map_err(|_| PdfiumError::PageIndexOutOfBounds)
         .and_then(|index| document.pages().get(index));
