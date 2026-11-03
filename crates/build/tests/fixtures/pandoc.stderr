@@ -1,0 +1,6 @@
+[WARNING] Div at in.md line 5 column 1 unclosed at in.md line 8 column 1, closing implicitly.
+Error parsing YAML metadata at "three.md" (line 1, column 1):
+three.md:2:6: unterminated flow sequence
+  |
+2 | bad: [
+  |      ^
