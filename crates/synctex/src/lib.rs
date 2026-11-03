@@ -50,6 +50,9 @@ pub struct SourceLocation {
 pub struct SyncTex {
     inputs: HashMap<u32, PathBuf>,
     nodes: Vec<Node>,
+    /// Leaf records by tag and line, then file order. Auto-follow looks up a line
+    /// on the UI thread, and a long document has millions of records.
+    leaves: Vec<u32>,
 }
 
 impl SyncTex {
@@ -100,6 +103,13 @@ impl SyncTex {
                 synctex.nodes.push(node);
             }
         }
+        // Boxes span whole paragraphs and pages, so only leaf records locate a line.
+        synctex.leaves = (0..synctex.nodes.len() as u32).filter(|index| !synctex.nodes[*index as usize].is_box).collect();
+        // A stable sort keeps the file order within a line.
+        synctex.leaves.sort_by_key(|index| {
+            let node = &synctex.nodes[*index as usize];
+            (node.tag, node.line)
+        });
         synctex
     }
 
@@ -115,18 +125,18 @@ impl SyncTex {
     /// as a blank one, uses the next line of the file that has output.
     pub fn forward(&self, file: &Path, line: usize) -> Option<PdfLocation> {
         let tag = self.tag_of(file)?;
-        // Boxes span whole paragraphs and pages, so only leaf records locate a line.
-        let in_file = || self.nodes.iter().filter(|node| node.tag == tag && !node.is_box);
-        let target = in_file()
-            .map(|node| node.line)
-            .filter(|candidate| *candidate >= line)
-            .min()
-            .or_else(|| in_file().map(|node| node.line).max())?;
-        let first = in_file().find(|node| node.line == target)?;
+        let node = |index: &u32| &self.nodes[*index as usize];
+        let start = self.leaves.partition_point(|index| node(index).tag < tag);
+        let end = self.leaves.partition_point(|index| node(index).tag <= tag);
+        let in_file = &self.leaves[start..end];
+        let next = in_file.partition_point(|index| node(index).line < line);
+        let target = in_file.get(next).or(in_file.last()).map(|index| node(index).line)?;
+        let first_of_line = in_file.partition_point(|index| node(index).line < target);
+        let past_line = in_file.partition_point(|index| node(index).line <= target);
+        let records = in_file[first_of_line..past_line].iter().map(node);
+        let first = node(&in_file[first_of_line]);
         // Union of the records of this line that share the first record's row.
-        let same_row = in_file().filter(|node| {
-            node.line == target && node.page == first.page && (node.y - first.y).abs() < 1.0
-        });
+        let same_row = records.filter(|node| node.page == first.page && (node.y - first.y).abs() < 1.0);
         let (mut left, mut right) = (f32::MAX, f32::MIN);
         let mut height = 0f32;
         for node in same_row {
@@ -245,6 +255,36 @@ mod tests {
     fn forward_uses_next_line_with_output() {
         let synctex = SyncTex::parse(SAMPLE);
         assert_eq!(synctex.forward(Path::new("/p/main.tex"), 5).unwrap().page, 1);
+    }
+
+    #[test]
+    fn forward_past_the_end_uses_the_last_line_of_that_file() {
+        let synctex = SyncTex::parse(SAMPLE);
+        assert_eq!(synctex.forward(Path::new("/p/main.tex"), 100).unwrap().page, 1);
+        assert_eq!(synctex.forward(Path::new("/p/sub/part.tex"), 100).unwrap().page, 0);
+    }
+
+    #[test]
+    fn forward_joins_the_records_of_a_row_in_file_order() {
+        let text = "Input:1:/a.tex\nContent:\n{1\nx1,2:100,700\nx1,3:50,700\nx1,2:300,700\nx1,2:200,9000000\n}1\n";
+        let location = SyncTex::parse(text).forward(Path::new("/a.tex"), 2).unwrap();
+        assert!((location.x - 100.0 / SP_PER_POINT).abs() < 0.01);
+        assert_eq!(location.width, MIN_WIDTH);
+    }
+
+    #[test]
+    #[ignore = "prints a timing, run with --ignored --nocapture --release"]
+    fn forward_timing_on_a_long_document() {
+        let mut text = String::from("Input:1:/a.tex\nContent:\n{1\n");
+        for record in 0..2_000_000 {
+            text.push_str(&format!("x1,{}:{},{}\n", record / 20, record, record));
+        }
+        let synctex = SyncTex::parse(&text);
+        let start = std::time::Instant::now();
+        for line in 0..1000 {
+            assert!(synctex.forward(Path::new("/a.tex"), line * 90).is_some());
+        }
+        println!("forward: {:?} per lookup", start.elapsed() / 1000);
     }
 
     #[test]
