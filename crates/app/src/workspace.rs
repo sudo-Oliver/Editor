@@ -2422,7 +2422,7 @@ impl Workspace {
         vec![
             Self::setting_row(
                 "Compile",
-                "Applies until the app closes. Set `trigger` in `.editor.toml` to keep it.",
+                "Applies until the app closes. Set trigger in .editor.toml to keep it.",
                 self.segmented(
                     "compile-trigger",
                     vec![
@@ -2435,7 +2435,7 @@ impl Workspace {
             .into_any_element(),
             Self::setting_row(
                 "LaTeX compiler",
-                "Applies until the app closes. Set `engine` in `.editor.toml` to keep it.",
+                "Applies until the app closes. Set engine in .editor.toml to keep it.",
                 self.segmented(
                     "compile-engine",
                     vec![
