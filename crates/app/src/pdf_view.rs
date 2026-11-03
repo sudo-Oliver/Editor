@@ -228,6 +228,10 @@ impl PdfView {
         cx.notify();
     }
 
+    pub fn is_focused(&self, window: &Window) -> bool {
+        self.focus.is_focused(window)
+    }
+
     pub fn has_document(&self) -> bool {
         !self.pages.is_empty()
     }
