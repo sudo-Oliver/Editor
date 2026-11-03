@@ -11,7 +11,7 @@ macro_rules! icons {
 }
 
 icons!(
-    "arrow-left", "arrow-right", "book", "chevron-down", "chevron-left", "chevron-right",
+    "addon", "arrow-left", "arrow-right", "book", "chevron-down", "chevron-left", "chevron-right",
     "chevron-up", "close", "contrast", "dots", "download", "file", "file-bib", "file-default",
     "file-markdown", "file-md", "file-plus", "file-tex", "file-toml", "file-txt", "file-typ", "folder",
     "folder-plus", "git-branch", "help", "image", "layout", "link", "log", "logo", "math", "minus",
@@ -22,6 +22,10 @@ pub struct Assets;
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        // The icon of an add-on, which is the only absolute path asked for.
+        if path.starts_with('/') {
+            return Ok(std::fs::read(path).ok().map(Cow::Owned));
+        }
         Ok(ICONS
             .iter()
             .find(|(name, _)| *name == path)

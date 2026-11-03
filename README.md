@@ -86,6 +86,14 @@ The branch button in the left rail shows the Git panel in place of the file tree
 
 Git runs only while the panel is open, never when a folder opens. Hooks and filters in a repository run as they would in a terminal, so open this panel only for repositories you trust. Build output in `.build` stays out of the lists. Changes appear on their own, but the panel does not fetch: pull or push to talk to a remote.
 
+## Add-ons
+
+An add-on is a program in its own folder, with an `addon.toml` that names it and the permissions it wants. Settings, Add-ons installs one from a folder and turns it on. It then gets a button in the left rail, and its program starts when you first open that panel. Without an add-on turned on, nothing runs.
+
+Add-ons have no sandbox. They run with your user rights, so install only those you trust. The permissions limit what they can ask the editor for, not what the program can do by itself. Through the editor, they reach only files inside the project and never `.git`.
+
+The crate `addon_api` describes the protocol: one JSON message per line over stdin and stdout, with the panel sent as a tree of nodes that the editor draws.
+
 ## Settings
 
 The gear at the bottom left opens the settings, the question mark above it lists the keyboard shortcuts. Cmd+, (macOS) or Ctrl+, (Linux) also opens the settings. They are stored in `~/.config/editor/settings.toml`, or under `XDG_CONFIG_HOME` if it is set. Project settings stay in `.editor.toml`.
@@ -110,6 +118,7 @@ Not included: LSP keys, git hunks, macros, named registers, marks and custom key
 | `app` | Window, panels, editor view, PDF view |
 | `editor_core` | Rope buffer, multicursor, undo, Tree-sitter highlighting |
 | `build` | Compiler runner, log parsers, project settings |
+| `addon_api` | The messages between the editor and an add-on |
 | `git` | Status, staging, commits, branches and history through the `git` program |
 | `pdf` | PDFium worker thread |
 | `synctex` | SyncTeX parser and lookups |
