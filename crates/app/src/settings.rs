@@ -1,0 +1,82 @@
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+/// Settings of the user, unlike `.editor.toml`, which belongs to one project.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(default)]
+pub struct Settings {
+    pub vim_mode: bool,
+    pub smooth_cursor: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            vim_mode: false,
+            smooth_cursor: true,
+        }
+    }
+}
+
+impl Settings {
+    /// A missing or broken file means the defaults, so that the app always starts.
+    pub fn load(path: &Path) -> Self {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| toml::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let text = toml::to_string(self).map_err(std::io::Error::other)?;
+        std::fs::write(path, text)
+    }
+}
+
+pub fn default_path() -> Option<PathBuf> {
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+    Some(config.join("editor").join("settings.toml"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vim_mode_is_off_without_a_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = Settings::load(&directory.path().join("settings.toml"));
+        assert!(!settings.vim_mode);
+    }
+
+    #[test]
+    fn vim_mode_is_off_with_a_broken_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        std::fs::write(&path, "vim_mode = maybe").unwrap();
+        assert!(!Settings::load(&path).vim_mode);
+    }
+
+    #[test]
+    fn settings_survive_a_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("nested").join("settings.toml");
+        let settings = Settings { vim_mode: true, smooth_cursor: false };
+        settings.save(&path).unwrap();
+        assert_eq!(Settings::load(&path), settings);
+    }
+
+    #[test]
+    fn a_partial_file_keeps_the_other_defaults() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        std::fs::write(&path, "vim_mode = true").unwrap();
+        assert_eq!(Settings::load(&path), Settings { vim_mode: true, smooth_cursor: true });
+    }
+}
