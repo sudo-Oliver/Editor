@@ -1,0 +1,28 @@
+% Sample project with several source files.
+\documentclass[11pt,a4paper]{article}
+\usepackage[english]{babel}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath}
+\usepackage{graphicx}
+
+\title{A Local Editor Sample}
+\author{Editor Example}
+
+\begin{document}
+\maketitle
+
+\section{Introduction}
+This document exercises \textbf{syntax highlighting}, the outline and SyncTeX.
+Inline math such as $a^2 + b^2 = c^2$ is highlighted too.
+
+\subsection{Motivation}
+\input{sections/details}
+
+\section{Results}
+\begin{equation}
+  \int_0^1 x^2 \, dx = \frac{1}{3}
+\end{equation}
+
+\input{sections/long}
+
+\end{document}
