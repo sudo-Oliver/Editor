@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     rc::Rc,
     sync::{
@@ -11,6 +11,7 @@ use std::{
 };
 
 use build::{BuildEvent, BuildManager, BuildOutcome, BuildRequest, Config, Diagnostic, Engine, Severity, Trigger, find_main};
+use addon_api::{ActiveFile, DiagnosticInfo, Reply, Request, SearchHit};
 use editor_core::{
     Language, Mark, MarkSeverity,
     snippet::Snippet,
@@ -26,6 +27,8 @@ use synctex::SyncTex;
 
 use crate::{
     actions::*,
+    addon_panel::{AddonPanel, AddonPanelEvent},
+    addons::{self, Installed},
     editor_view::{EditorEvent, EditorView, FormatKind},
     file_tree::{self, TreeEntry},
     git_panel::{self, GitPanel, GitPanelEvent},
@@ -86,6 +89,8 @@ enum Divider {
 enum LeftPanel {
     Files,
     Git,
+    /// An index into `addon_panels`.
+    Addon(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -106,6 +111,7 @@ enum Menu {
 enum SettingsPage {
     Editor,
     Compiler,
+    Addons,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -152,6 +158,19 @@ struct OpenDocument {
     _observer: Subscription,
 }
 
+/// The panel of an add-on that is turned on.
+struct AddonEntry {
+    panel: Entity<AddonPanel>,
+    _subscription: Subscription,
+}
+
+/// What a discard of add-on edits has to take back.
+#[derive(Default)]
+struct TrackedEdits {
+    originals: HashMap<PathBuf, String>,
+    created: Vec<PathBuf>,
+}
+
 struct ImagePreview {
     view: Entity<ImageView>,
     _subscription: Subscription,
@@ -169,6 +188,11 @@ pub struct Workspace {
     left_panel: LeftPanel,
     git_panel: Entity<GitPanel>,
     _git_subscription: Subscription,
+    installed_addons: Vec<Installed>,
+    addon_panels: Vec<AddonEntry>,
+    tracked_edits: HashMap<String, TrackedEdits>,
+    /// Add-on requests that wait for the running build to end.
+    compile_waiters: Vec<(Entity<AddonPanel>, u64)>,
     show_preview: bool,
     show_logs: bool,
     show_outline: bool,
@@ -282,6 +306,10 @@ impl Workspace {
             left_panel: LeftPanel::Files,
             git_panel,
             _git_subscription: git_subscription,
+            installed_addons: Vec::new(),
+            addon_panels: Vec::new(),
+            tracked_edits: HashMap::new(),
+            compile_waiters: Vec::new(),
             show_preview: true,
             show_logs: false,
             show_outline: true,
@@ -340,6 +368,7 @@ impl Workspace {
             _watcher: None,
             _watch_task: None,
         };
+        workspace.reload_addons(cx);
         if let Some(root) = root {
             workspace.open_root(root, window, cx);
         }
@@ -355,6 +384,10 @@ impl Workspace {
         self.git_branch = git_branch(&root);
         self.root = Some(root.clone());
         self.git_panel.update(cx, |panel, cx| panel.set_root(Some(root.clone()), cx));
+        self.tracked_edits.clear();
+        for entry in &self.addon_panels {
+            entry.panel.update(cx, |panel, cx| panel.set_root(Some(root.clone()), cx));
+        }
         self.config = match Config::load(&root) {
             Ok(config) => config,
             Err(error) => {
@@ -454,9 +487,16 @@ impl Workspace {
                 return;
             }
         };
+        self.add_document(path, &text, cx);
+        self.activate(self.documents.len() - 1, window, cx);
+        self.apply_marks(cx);
+    }
+
+    /// Opens a tab without switching to it.
+    fn add_document(&mut self, path: PathBuf, text: &str, cx: &mut Context<Self>) {
         let settings = self.settings;
         let view = cx.new(|cx| {
-            let mut view = EditorView::new(&text, Some(path), cx);
+            let mut view = EditorView::new(text, Some(path), cx);
             view.set_vim_mode(settings.vim_mode, settings.smooth_cursor, cx);
             view
         });
@@ -477,8 +517,6 @@ impl Workspace {
             _subscription: subscription,
             _observer: observer,
         });
-        self.activate(self.documents.len() - 1, window, cx);
-        self.apply_marks(cx);
     }
 
     fn open_image(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
@@ -585,6 +623,300 @@ impl Workspace {
         .detach();
     }
 
+    // Add-ons
+
+    /// Reads the add-on folder and keeps panels only for what is turned on.
+    fn reload_addons(&mut self, cx: &mut Context<Self>) {
+        let Some(directory) = addons::default_directory() else {
+            return;
+        };
+        let (installed, errors) = addons::load_all(&directory);
+        if let Some(error) = errors.into_iter().next() {
+            self.set_status(error, cx);
+        }
+        let shown = match self.left_panel {
+            LeftPanel::Addon(index) => self.addon_panels.get(index).map(|entry| entry.panel.read(cx).add_on.manifest.id.clone()),
+            _ => None,
+        };
+        let mut old = std::mem::take(&mut self.addon_panels);
+        for add_on in installed.iter().filter(|add_on| add_on.enabled) {
+            let kept = old.iter().position(|entry| entry.panel.read(cx).add_on == *add_on);
+            let entry = match kept {
+                Some(index) => old.remove(index),
+                None => self.new_addon_entry(add_on.clone(), cx),
+            };
+            self.addon_panels.push(entry);
+        }
+        if matches!(self.left_panel, LeftPanel::Addon(_)) {
+            let index = self.addon_panels.iter().position(|entry| Some(&entry.panel.read(cx).add_on.manifest.id) == shown.as_ref());
+            self.left_panel = index.map_or(LeftPanel::Files, LeftPanel::Addon);
+        }
+        self.installed_addons = installed;
+        cx.notify();
+    }
+
+    fn new_addon_entry(&self, add_on: Installed, cx: &mut Context<Self>) -> AddonEntry {
+        let root = self.root.clone();
+        let panel = cx.new(|_| AddonPanel::new(add_on, root));
+        let subscription = cx.subscribe(&panel, |this, panel, event, cx| {
+            let AddonPanelEvent::Request { id, request } = event;
+            this.handle_addon_request(panel, *id, request.clone(), cx);
+        });
+        AddonEntry { panel, _subscription: subscription }
+    }
+
+    fn set_addon_enabled(&mut self, add_on: &Installed, enabled: bool, cx: &mut Context<Self>) {
+        if let Err(error) = addons::set_enabled(add_on, enabled) {
+            self.set_status(format!("Cannot change {}: {error}", add_on.manifest.name), cx);
+        }
+        self.reload_addons(cx);
+    }
+
+    fn remove_addon(&mut self, add_on: &Installed, cx: &mut Context<Self>) {
+        if let Err(error) = addons::remove(add_on) {
+            self.set_status(format!("Cannot remove {}: {error}", add_on.manifest.name), cx);
+        }
+        self.reload_addons(cx);
+    }
+
+    fn prompt_install_addon(&mut self, cx: &mut Context<Self>) {
+        let Some(directory) = addons::default_directory() else {
+            return self.set_status("The add-on folder is unknown, because HOME is not set.", cx);
+        };
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Install".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else {
+                return;
+            };
+            let Some(source) = paths.into_iter().next() else {
+                return;
+            };
+            let result = cx.background_spawn(async move { addons::install_from(&source, &directory) }).await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(manifest) => this.set_status(format!("Installed {}. Turn it on to use it.", manifest.name), cx),
+                    Err(error) => this.set_status(error, cx),
+                }
+                this.reload_addons(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn addon_file(&self, relative: &str) -> Result<PathBuf, String> {
+        let root = self.root.as_deref().ok_or("No project is open.")?;
+        addons::resolve_path(root, relative)
+    }
+
+    fn document_at(&self, path: &Path, cx: &App) -> Option<usize> {
+        let wanted = path.canonicalize().ok();
+        self.documents.iter().position(|document| {
+            let open = document.view.read(cx).path.as_deref();
+            open == Some(path) || (wanted.is_some() && open.and_then(|open| open.canonicalize().ok()) == wanted)
+        })
+    }
+
+    fn relative_to_project(&self, path: &Path) -> String {
+        let root = self.root.as_deref().and_then(|root| root.canonicalize().ok());
+        let real = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        root.and_then(|root| real.strip_prefix(root).ok().map(|inner| inner.display().to_string()))
+            .unwrap_or_else(|| path.display().to_string())
+    }
+
+    fn diagnostic_infos(&self) -> Vec<DiagnosticInfo> {
+        self.diagnostics
+            .iter()
+            .map(|diagnostic| DiagnosticInfo {
+                path: diagnostic.file.as_deref().map(|file| self.relative_to_project(file)),
+                line: diagnostic.line,
+                error: diagnostic.severity == Severity::Error,
+                message: diagnostic.message.clone(),
+            })
+            .collect()
+    }
+
+    fn reply_to_compile_waiters(&mut self, result: impl Fn() -> Result<Reply, String>, cx: &mut Context<Self>) {
+        for (panel, id) in std::mem::take(&mut self.compile_waiters) {
+            panel.update(cx, |panel, _| panel.reply(id, result()));
+        }
+    }
+
+    fn handle_addon_request(&mut self, panel: Entity<AddonPanel>, id: u64, request: Request, cx: &mut Context<Self>) {
+        let add_on = panel.read(cx).add_on.manifest.id.clone();
+        let result = match request {
+            Request::ListFiles | Request::Search { .. } => return self.answer_from_project_scan(panel, id, request, cx),
+            Request::GetSecret { key } => {
+                return self.answer_in_background(panel, id, cx, move || {
+                    addons::get_secret(&add_on, &key).map(|value| Reply::Secret { value })
+                });
+            }
+            Request::SetSecret { key, value } => {
+                return self.answer_in_background(panel, id, cx, move || {
+                    addons::set_secret(&add_on, &key, &value).map(|()| Reply::Done)
+                });
+            }
+            Request::Compile => {
+                self.recompile(cx);
+                if self.building {
+                    self.compile_waiters.push((panel, id));
+                    return;
+                }
+                let reason = self.status.as_ref().map_or_else(|| "The build did not start.".to_string(), ToString::to_string);
+                Err(reason)
+            }
+            Request::ReadFile { path } => self.addon_read(&path, cx).map(|text| Reply::Text { text }),
+            Request::Diagnostics => Ok(Reply::Diagnostics { diagnostics: self.diagnostic_infos() }),
+            Request::ActiveFile => Ok(Reply::Active { file: self.active_file_info(cx) }),
+            Request::EditFile { path, old, new } => self.addon_edit(&add_on, &path, &old, &new, cx).map(|()| Reply::Done),
+            Request::CreateFile { path, text } => self.addon_create(&add_on, &path, &text, cx).map(|()| Reply::Done),
+            Request::BeginEdits => {
+                self.tracked_edits.insert(add_on, TrackedEdits::default());
+                Ok(Reply::Done)
+            }
+            Request::DiscardEdits => {
+                self.discard_addon_edits(&add_on, cx);
+                Ok(Reply::Done)
+            }
+        };
+        panel.update(cx, |panel, _| panel.reply(id, result));
+    }
+
+    fn answer_in_background(
+        &self,
+        panel: Entity<AddonPanel>,
+        id: u64,
+        cx: &mut Context<Self>,
+        work: impl FnOnce() -> Result<Reply, String> + Send + 'static,
+    ) {
+        cx.spawn(async move |_, cx| {
+            let result = cx.background_spawn(async move { work() }).await;
+            panel.update(cx, |panel, _| panel.reply(id, result));
+        })
+        .detach();
+    }
+
+    fn answer_from_project_scan(&self, panel: Entity<AddonPanel>, id: u64, request: Request, cx: &mut Context<Self>) {
+        let root = self.root.clone();
+        self.answer_in_background(panel, id, cx, move || {
+            let root = root.ok_or("No project is open.")?;
+            let files: Vec<PathBuf> = file_tree::scan(&root, &HashSet::new())
+                .into_iter()
+                .filter(|entry| !entry.is_dir)
+                .map(|entry| entry.path)
+                .collect();
+            match request {
+                Request::Search { query } => {
+                    let hits = picker::search_text(&files, &root, &query, &AtomicBool::new(false))
+                        .into_iter()
+                        .map(|item| SearchHit {
+                            path: item.label,
+                            line: item.position.map_or(1, |(line, _)| line + 1),
+                            text: item.detail.unwrap_or_default(),
+                        })
+                        .collect();
+                    Ok(Reply::Hits { hits })
+                }
+                _ => Ok(Reply::Files { files: files.iter().map(|file| picker::relative_label(file, &root)).collect() }),
+            }
+        });
+    }
+
+    fn addon_read(&self, relative: &str, cx: &App) -> Result<String, String> {
+        let path = self.addon_file(relative)?;
+        match self.document_at(&path, cx) {
+            Some(index) => Ok(self.documents[index].view.read(cx).state.buffer().to_string()),
+            None => addons::read_file_limited(&path),
+        }
+    }
+
+    fn active_file_info(&self, cx: &App) -> Option<ActiveFile> {
+        let view = self.active_view()?;
+        let view = view.read(cx);
+        let path = view.path.as_deref()?;
+        let selection = view.state.selections().primary().range();
+        Some(ActiveFile {
+            path: self.relative_to_project(path),
+            line: view.cursor_position().0,
+            selection: view.state.buffer().slice(selection),
+        })
+    }
+
+    fn addon_edit(&mut self, add_on: &str, relative: &str, old: &str, new: &str, cx: &mut Context<Self>) -> Result<(), String> {
+        let path = self.addon_file(relative)?;
+        let index = match self.document_at(&path, cx) {
+            Some(index) => index,
+            None => {
+                let text = addons::read_file_limited(&path)?;
+                self.add_document(path.clone(), &text, cx);
+                self.documents.len() - 1
+            }
+        };
+        if self.active.is_none() {
+            self.active = Some(index);
+        }
+        let view = self.documents[index].view.clone();
+        let text = view.read(cx).state.buffer().to_string();
+        let range = addons::find_unique(&text, old)?;
+        self.tracked_edits.entry(add_on.to_string()).or_default().originals.entry(path).or_insert(text);
+        view.update(cx, |view, cx| view.edit_from_outside(range, new, cx));
+        cx.notify();
+        Ok(())
+    }
+
+    fn addon_create(&mut self, add_on: &str, relative: &str, text: &str, cx: &mut Context<Self>) -> Result<(), String> {
+        let path = self.addon_file(relative)?;
+        if path.exists() {
+            return Err(format!("{relative} already exists."));
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| format!("Cannot create {relative}: {error}"))?;
+        }
+        std::fs::write(&path, "").map_err(|error| format!("Cannot create {relative}: {error}"))?;
+        self.tracked_edits.entry(add_on.to_string()).or_default().created.push(path.clone());
+        self.add_document(path, "", cx);
+        let index = self.documents.len() - 1;
+        if self.active.is_none() {
+            self.active = Some(index);
+        }
+        self.documents[index].view.update(cx, |view, cx| view.edit_from_outside(0..0, text, cx));
+        self.refresh_from_disk(cx);
+        Ok(())
+    }
+
+    /// Puts back the text from before the first edit, as one step that undo can
+    /// reverse. Edits by the user in those files since then go with it.
+    fn discard_addon_edits(&mut self, add_on: &str, cx: &mut Context<Self>) {
+        let Some(tracked) = self.tracked_edits.remove(add_on) else {
+            return;
+        };
+        for (path, original) in tracked.originals {
+            if let Some(index) = self.document_at(&path, cx) {
+                self.documents[index].view.update(cx, |view, cx| {
+                    let length = view.state.buffer().len();
+                    view.edit_from_outside(0..length, &original, cx);
+                });
+            }
+        }
+        for path in tracked.created {
+            if let Some(index) = self.document_at(&path, cx) {
+                self.documents.remove(index);
+                self.active = match self.active {
+                    Some(active) if active == index => self.documents.len().checked_sub(1),
+                    Some(active) if active > index => Some(active - 1),
+                    other => other,
+                };
+            }
+            std::fs::remove_file(&path).ok();
+        }
+        self.refresh_from_disk(cx);
+    }
+
     /// The compilers read files, so every open document is saved first.
     pub(crate) fn save_all(&mut self, cx: &mut Context<Self>) -> bool {
         for index in 0..self.documents.len() {
@@ -682,6 +1014,7 @@ impl Workspace {
                 self.building = false;
                 self.clean_next_build = true;
                 self.set_status("Build stopped.", cx);
+                self.reply_to_compile_waiters(|| Err("The build was stopped.".to_string()), cx);
             }
             BuildEvent::Finished(outcome) => self.finish_build(outcome, cx),
         }
@@ -704,6 +1037,8 @@ impl Workspace {
         self.error_cursor = None;
         self.error_card_dismissed = false;
         self.apply_marks(cx);
+        let (success, diagnostics) = (outcome.success, self.diagnostic_infos());
+        self.reply_to_compile_waiters(|| Ok(Reply::Compiled { success, diagnostics: diagnostics.clone() }), cx);
         let same_document = self.pdf_main == self.last_main;
         self.preview_state = match (outcome.pdf, outcome.last_good_pdf) {
             (Some(pdf), _) => {
@@ -975,7 +1310,9 @@ impl Workspace {
             return;
         }
         // The commit message is a text field with its own keys.
-        if self.git_panel.read(cx).contains_focus(window, cx) {
+        if self.git_panel.read(cx).contains_focus(window, cx)
+            || self.addon_panels.iter().any(|entry| entry.panel.read(cx).contains_focus(window, cx))
+        {
             return;
         }
         let view = self.active_view();
@@ -1746,7 +2083,29 @@ impl Workspace {
                     .items_center()
                     .gap(px(6.))
                     .child(rail_button("rail-files", "file", LeftPanel::Files, cx))
-                    .child(rail_button("rail-git", "git-branch", LeftPanel::Git, cx)),
+                    .child(rail_button("rail-git", "git-branch", LeftPanel::Git, cx))
+                    .children(self.addon_panels.iter().enumerate().map(|(index, entry)| {
+                        let panel = LeftPanel::Addon(index);
+                        let on = self.show_file_panel && self.left_panel == panel;
+                        let icon = entry.panel.read(cx).add_on.icon();
+                        let path: SharedString = icon.map_or_else(|| "icons/addon.svg".to_string(), |icon| icon.display().to_string()).into();
+                        div()
+                            .id(("rail-addon", index))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(32.))
+                            .rounded(px(4.))
+                            .cursor_pointer()
+                            .when(on, |style| style.bg(theme::color(theme::GREEN_DARK)))
+                            .hover(|style| style.bg(theme::color(theme::DIVIDER)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.show_file_panel = !(this.show_file_panel && this.left_panel == panel);
+                                this.left_panel = panel;
+                                cx.notify();
+                            }))
+                            .child(svg().path(path).size(px(18.)).flex_none().text_color(theme::color(theme::UI_TEXT)))
+                    })),
             )
             .child(
                 div()
@@ -2859,6 +3218,87 @@ impl Workspace {
         ]
     }
 
+    fn render_addon_settings(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut rows = vec![
+            div()
+                .flex_none()
+                .py(px(8.))
+                .text_color(theme::color(theme::UI_MUTED))
+                .child("Add-ons are programs that run with your user rights. They have no sandbox, so turn on only those you trust. What is listed below limits their requests to the editor, not the program itself.")
+                .into_any_element(),
+        ];
+        if self.installed_addons.is_empty() {
+            rows.push(div().flex_none().py(px(8.)).child("No add-ons are installed.").into_any_element());
+        }
+        for (index, add_on) in self.installed_addons.iter().enumerate() {
+            let manifest = &add_on.manifest;
+            let permissions = manifest.permissions.iter().map(|permission| permission.description()).collect::<Vec<_>>().join(", ");
+            let (for_toggle, for_remove) = (add_on.clone(), add_on.clone());
+            let enabled = add_on.enabled;
+            rows.push(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .py(px(10.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(px(2.))
+                            .child(div().font_weight(FontWeight::SEMIBOLD).child(format!("{} {}", manifest.name, manifest.version)))
+                            .child(div().text_color(theme::color(theme::UI_MUTED)).child(format!("By {}", manifest.author)))
+                            .child(div().text_color(theme::color(theme::UI_MUTED)).child(if permissions.is_empty() {
+                                "Asks for no permissions.".to_string()
+                            } else {
+                                permissions
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id(("addon-remove", index))
+                            .flex_none()
+                            .px(px(8.))
+                            .py(px(3.))
+                            .rounded(px(4.))
+                            .cursor_pointer()
+                            .bg(theme::color(theme::DIVIDER))
+                            .on_click(cx.listener(move |this, _, _, cx| this.remove_addon(&for_remove, cx)))
+                            .child("Remove"),
+                    )
+                    .child(
+                        div()
+                            .id(("addon-toggle", index))
+                            .flex_none()
+                            .px(px(8.))
+                            .py(px(3.))
+                            .rounded(px(4.))
+                            .cursor_pointer()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .bg(theme::color(if enabled { theme::GREEN_DARK } else { theme::DIVIDER }))
+                            .on_click(cx.listener(move |this, _, _, cx| this.set_addon_enabled(&for_toggle, !enabled, cx)))
+                            .child(if enabled { "On" } else { "Off" }),
+                    )
+                    .into_any_element(),
+            );
+        }
+        rows.push(
+            div()
+                .flex()
+                .flex_none()
+                .pt(px(8.))
+                .child(self.panel_button("addon-install", "Install from folder", false, cx, |this, _, cx| {
+                    this.prompt_install_addon(cx);
+                }))
+                .into_any_element(),
+        );
+        rows
+    }
+
     fn render_compiler_settings(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let trigger = self.config.trigger;
         let engine = self.config.engine;
@@ -2981,6 +3421,7 @@ impl Workspace {
         let content = match dialog {
             Dialog::Settings(SettingsPage::Editor) => self.render_editor_settings(cx),
             Dialog::Settings(SettingsPage::Compiler) => self.render_compiler_settings(cx),
+            Dialog::Settings(SettingsPage::Addons) => self.render_addon_settings(cx),
             Dialog::Shortcuts => self.render_shortcuts(),
         };
         div()
@@ -3047,7 +3488,8 @@ impl Workspace {
                                             .border_r_1()
                                             .border_color(theme::color(theme::DIVIDER))
                                             .child(self.settings_tab(SettingsPage::Editor, page, "Editor", cx))
-                                            .child(self.settings_tab(SettingsPage::Compiler, page, "Compiler", cx)),
+                                            .child(self.settings_tab(SettingsPage::Compiler, page, "Compiler", cx))
+                                            .child(self.settings_tab(SettingsPage::Addons, page, "Add-ons", cx)),
                                     )
                                 },
                             )
@@ -3272,6 +3714,10 @@ impl Render for Workspace {
         // Git runs only while its panel shows.
         let git_visible = show_file_panel && self.left_panel == LeftPanel::Git;
         self.git_panel.update(cx, |panel, cx| panel.set_visible(git_visible, cx));
+        for index in 0..self.addon_panels.len() {
+            let visible = show_file_panel && self.left_panel == LeftPanel::Addon(index);
+            self.addon_panels[index].panel.clone().update(cx, |panel, cx| panel.set_visible(visible, cx));
+        }
         div()
             .id("workspace")
             .relative()
@@ -3344,6 +3790,12 @@ impl Render for Workspace {
                                 .w(self.file_panel_width)
                                 .h_full()
                                 .child(self.git_panel.clone())
+                                .into_any_element(),
+                            LeftPanel::Addon(index) => div()
+                                .flex_none()
+                                .w(self.file_panel_width)
+                                .h_full()
+                                .children(self.addon_panels.get(index).map(|entry| entry.panel.clone()))
                                 .into_any_element(),
                         };
                         element

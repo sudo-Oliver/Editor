@@ -1,4 +1,6 @@
 mod actions;
+mod addon_panel;
+mod addons;
 mod assets;
 mod editor_view;
 mod file_tree;

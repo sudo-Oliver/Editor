@@ -148,6 +148,14 @@ impl EditorView {
         px(if self.plain { PLAIN_GUTTER_WIDTH } else { GUTTER_WIDTH })
     }
 
+    /// Changes the text from outside, leaving the cursors where they are.
+    pub fn edit_from_outside(&mut self, range: Range<usize>, text: &str, cx: &mut Context<Self>) {
+        self.state.edit_keeping_selections(range, text);
+        self.schedule_parse(cx);
+        cx.emit(EditorEvent::Edited);
+        cx.notify();
+    }
+
     /// Empties a text field.
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.state.reload("");

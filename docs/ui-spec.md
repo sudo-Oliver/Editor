@@ -66,6 +66,11 @@ The second rail button swaps the file tree and outline for the panel, at the sam
 the top: branch with ahead and behind counts, pull, push, refresh; conflicts, staged files and
 changes; the commit message and button; history with one lane per branch.
 
+## Add-on panels
+
+An add-on that is turned on gets a rail button below Git, and its panel takes the place of the
+file tree. The add-on sends a tree of nodes, so its panel uses the colors and controls of the app.
+
 ## Vim status bar
 
 The status bar exists only in Vim mode. It follows the NvChad statusline with

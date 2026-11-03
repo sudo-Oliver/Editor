@@ -83,6 +83,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "addon_api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.27.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -174,6 +182,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 name = "app"
 version = "0.1.0"
 dependencies = [
+ "addon_api",
  "build",
  "editor_core",
  "git",
@@ -181,11 +190,14 @@ dependencies = [
  "gpui_platform",
  "ignore",
  "image",
+ "libc",
  "notify",
  "pdf",
  "serde",
+ "serde_json",
  "synctex",
  "tempfile",
+ "tokio",
  "toml 0.9.12+spec-1.1.0",
 ]
 

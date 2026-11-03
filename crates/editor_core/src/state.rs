@@ -398,6 +398,11 @@ impl EditorState {
         self.apply_planned(planned, GroupKind::Other);
     }
 
+    /// Replaces text without moving the cursors of the user, except past the edit.
+    pub fn edit_keeping_selections(&mut self, range: Range<usize>, text: &str) {
+        self.apply_edits_mapping_selections(vec![Edit { range, text: text.to_string() }]);
+    }
+
     /// Inserts a snippet at every selection, with selected text in the first slot.
     /// With `math`, the snippet gets `$` around it outside a formula. `Tab` walks
     /// the slots when there is one cursor.
