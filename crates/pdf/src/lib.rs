@@ -1,5 +1,9 @@
 //! Renders PDF pages with PDFium. All PDFium handles stay on one worker thread.
 
+mod content;
+
+pub use content::{LinkTarget, PageChar, PageContent, PageLink, Rect};
+
 use std::{
     collections::VecDeque,
     path::Path,
@@ -21,12 +25,14 @@ pub enum PdfEvent {
     /// `pages` holds the size of each page in PDF points.
     Loaded { generation: u64, pages: Vec<(f32, f32)> },
     Rendered { generation: u64, request: PageRequest, height_px: u32, bgra: Vec<u8> },
+    PageContent { generation: u64, page: usize, content: PageContent },
     Failed { generation: u64, message: String },
 }
 
 enum Command {
     Load { generation: u64, bytes: Vec<u8> },
     Render { generation: u64, pages: Vec<PageRequest> },
+    Content { generation: u64, page: usize },
 }
 
 pub struct PdfWorker {
@@ -70,10 +76,17 @@ impl PdfWorker {
     pub fn render(&self, generation: u64, pages: Vec<PageRequest>) {
         self.commands.send(Command::Render { generation, pages }).ok();
     }
+
+    /// Asks for the text and links of a page. Commands go before queued renders, so
+    /// the page under the pointer does not wait for scrolling to finish.
+    pub fn content(&self, generation: u64, page: usize) {
+        self.commands.send(Command::Content { generation, page }).ok();
+    }
 }
 
 fn run(pdfium: Pdfium, commands: mpsc::Receiver<Command>, events: UnboundedSender<PdfEvent>) {
     let mut document: Option<(u64, PdfDocument)> = None;
+    let mut heights: Vec<f32> = Vec::new();
     let mut queue: VecDeque<PageRequest> = VecDeque::new();
     let mut pending: Option<Command> = None;
     loop {
@@ -100,11 +113,12 @@ fn run(pdfium: Pdfium, commands: mpsc::Receiver<Command>, events: UnboundedSende
                 document = None;
                 match pdfium.load_pdf_from_byte_vec(bytes, None) {
                     Ok(loaded) => {
-                        let pages = loaded
+                        let pages: Vec<(f32, f32)> = loaded
                             .pages()
                             .iter()
                             .map(|page| (page.width().value, page.height().value))
                             .collect();
+                        heights = pages.iter().map(|(_, height)| *height).collect();
                         document = Some((generation, loaded));
                         events.send(PdfEvent::Loaded { generation, pages }).ok();
                     }
@@ -120,8 +134,31 @@ fn run(pdfium: Pdfium, commands: mpsc::Receiver<Command>, events: UnboundedSende
                     queue = pages.into();
                 }
             }
+            Command::Content { generation, page } => {
+                if let Some((current, document)) = &document
+                    && *current == generation
+                {
+                    send_content(document, generation, page, &heights, &events);
+                }
+            }
         }
     }
+}
+
+fn send_content(
+    document: &PdfDocument,
+    generation: u64,
+    page: usize,
+    heights: &[f32],
+    events: &UnboundedSender<PdfEvent>,
+) {
+    let content = u16::try_from(page)
+        .map_err(|_| PdfiumError::PageIndexOutOfBounds)
+        .and_then(|index| document.pages().get(index))
+        .and_then(|page| content::extract(&page, heights))
+        // A page without readable text still shows, it only cannot be selected.
+        .unwrap_or_default();
+    events.send(PdfEvent::PageContent { generation, page, content }).ok();
 }
 
 fn render_page(
