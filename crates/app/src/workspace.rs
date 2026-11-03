@@ -89,6 +89,8 @@ enum Divider {
 enum LeftPanel {
     Files,
     Git,
+    /// The list of installed add-ons.
+    Addons,
     /// An index into `addon_panels`.
     Addon(usize),
 }
@@ -111,7 +113,6 @@ enum Menu {
 enum SettingsPage {
     Editor,
     Compiler,
-    Addons,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2084,11 +2085,12 @@ impl Workspace {
                     .gap(px(6.))
                     .child(rail_button("rail-files", "file", LeftPanel::Files, cx))
                     .child(rail_button("rail-git", "git-branch", LeftPanel::Git, cx))
+                    .child(rail_button("rail-addons", "addon", LeftPanel::Addons, cx))
                     .children(self.addon_panels.iter().enumerate().map(|(index, entry)| {
                         let panel = LeftPanel::Addon(index);
                         let on = self.show_file_panel && self.left_panel == panel;
                         let icon = entry.panel.read(cx).add_on.icon();
-                        let path: SharedString = icon.map_or_else(|| "icons/addon.svg".to_string(), |icon| icon.display().to_string()).into();
+                        let path: SharedString = icon.map_or_else(|| "icons/puzzle.svg".to_string(), |icon| icon.display().to_string()).into();
                         div()
                             .id(("rail-addon", index))
                             .flex()
@@ -3218,85 +3220,89 @@ impl Workspace {
         ]
     }
 
-    fn render_addon_settings(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let mut rows = vec![
-            div()
-                .flex_none()
-                .py(px(8.))
-                .text_color(theme::color(theme::UI_MUTED))
-                .child("Add-ons are programs that run with your user rights. They have no sandbox, so turn on only those you trust. What is listed below limits their requests to the editor, not the program itself.")
-                .into_any_element(),
-        ];
-        if self.installed_addons.is_empty() {
-            rows.push(div().flex_none().py(px(8.)).child("No add-ons are installed.").into_any_element());
-        }
-        for (index, add_on) in self.installed_addons.iter().enumerate() {
-            let manifest = &add_on.manifest;
-            let permissions = manifest.permissions.iter().map(|permission| permission.description()).collect::<Vec<_>>().join(", ");
-            let (for_toggle, for_remove) = (add_on.clone(), add_on.clone());
-            let enabled = add_on.enabled;
-            rows.push(
+    fn render_addons_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let rows: Vec<AnyElement> = self
+            .installed_addons
+            .iter()
+            .enumerate()
+            .map(|(index, add_on)| {
+                let manifest = &add_on.manifest;
+                let permissions = manifest.permissions.iter().map(|permission| permission.description()).collect::<Vec<_>>().join(", ");
+                let (for_toggle, for_remove) = (add_on.clone(), add_on.clone());
+                let enabled = add_on.enabled;
                 div()
                     .flex()
+                    .flex_col()
                     .flex_none()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(12.))
+                    .gap(px(4.))
                     .py(px(10.))
+                    .border_t_1()
+                    .border_color(theme::color(theme::PANEL))
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child(format!("{} {}", manifest.name, manifest.version)))
+                    .child(div().text_color(theme::color(theme::UI_MUTED)).child(format!("By {}", manifest.author)))
+                    .child(div().text_color(theme::color(theme::UI_MUTED)).child(if permissions.is_empty() {
+                        "Asks for no permissions.".to_string()
+                    } else {
+                        permissions
+                    }))
                     .child(
                         div()
                             .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_w_0()
-                            .gap(px(2.))
-                            .child(div().font_weight(FontWeight::SEMIBOLD).child(format!("{} {}", manifest.name, manifest.version)))
-                            .child(div().text_color(theme::color(theme::UI_MUTED)).child(format!("By {}", manifest.author)))
-                            .child(div().text_color(theme::color(theme::UI_MUTED)).child(if permissions.is_empty() {
-                                "Asks for no permissions.".to_string()
-                            } else {
-                                permissions
-                            })),
+                            .gap(px(6.))
+                            .pt(px(4.))
+                            .child(
+                                div()
+                                    .id(("addon-toggle", index))
+                                    .flex_none()
+                                    .px(px(8.))
+                                    .py(px(3.))
+                                    .rounded(px(4.))
+                                    .cursor_pointer()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .bg(theme::color(if enabled { theme::GREEN_DARK } else { theme::DIVIDER }))
+                                    .on_click(cx.listener(move |this, _, _, cx| this.set_addon_enabled(&for_toggle, !enabled, cx)))
+                                    .child(if enabled { "On" } else { "Off" }),
+                            )
+                            .child(
+                                div()
+                                    .id(("addon-remove", index))
+                                    .flex_none()
+                                    .px(px(8.))
+                                    .py(px(3.))
+                                    .rounded(px(4.))
+                                    .cursor_pointer()
+                                    .bg(theme::color(theme::DIVIDER))
+                                    .on_click(cx.listener(move |this, _, _, cx| this.remove_addon(&for_remove, cx)))
+                                    .child("Remove"),
+                            ),
                     )
-                    .child(
-                        div()
-                            .id(("addon-remove", index))
-                            .flex_none()
-                            .px(px(8.))
-                            .py(px(3.))
-                            .rounded(px(4.))
-                            .cursor_pointer()
-                            .bg(theme::color(theme::DIVIDER))
-                            .on_click(cx.listener(move |this, _, _, cx| this.remove_addon(&for_remove, cx)))
-                            .child("Remove"),
-                    )
-                    .child(
-                        div()
-                            .id(("addon-toggle", index))
-                            .flex_none()
-                            .px(px(8.))
-                            .py(px(3.))
-                            .rounded(px(4.))
-                            .cursor_pointer()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .bg(theme::color(if enabled { theme::GREEN_DARK } else { theme::DIVIDER }))
-                            .on_click(cx.listener(move |this, _, _, cx| this.set_addon_enabled(&for_toggle, !enabled, cx)))
-                            .child(if enabled { "On" } else { "Off" }),
-                    )
-                    .into_any_element(),
-            );
-        }
-        rows.push(
-            div()
-                .flex()
-                .flex_none()
-                .pt(px(8.))
-                .child(self.panel_button("addon-install", "Install from folder", false, cx, |this, _, cx| {
+                    .into_any_element()
+            })
+            .collect();
+        div()
+            .id("addons-panel")
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w(self.file_panel_width)
+            .h_full()
+            .gap(px(8.))
+            .p(px(8.))
+            .overflow_y_scroll()
+            .child(div().flex_none().font_weight(FontWeight::SEMIBOLD).child("Add-ons"))
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(theme::color(theme::UI_MUTED))
+                    .child("Add-ons run with your user rights and have no sandbox, so turn on only those you trust. Permissions limit their requests to the editor, not the program itself."),
+            )
+            .child(
+                div().flex().flex_none().child(self.panel_button("addon-install", "Install from folder", false, cx, |this, _, cx| {
                     this.prompt_install_addon(cx);
-                }))
-                .into_any_element(),
-        );
-        rows
+                })),
+            )
+            .when(rows.is_empty(), |element| element.child(div().flex_none().child("No add-ons are installed.")))
+            .children(rows)
     }
 
     fn render_compiler_settings(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -3421,7 +3427,6 @@ impl Workspace {
         let content = match dialog {
             Dialog::Settings(SettingsPage::Editor) => self.render_editor_settings(cx),
             Dialog::Settings(SettingsPage::Compiler) => self.render_compiler_settings(cx),
-            Dialog::Settings(SettingsPage::Addons) => self.render_addon_settings(cx),
             Dialog::Shortcuts => self.render_shortcuts(),
         };
         div()
@@ -3488,8 +3493,7 @@ impl Workspace {
                                             .border_r_1()
                                             .border_color(theme::color(theme::DIVIDER))
                                             .child(self.settings_tab(SettingsPage::Editor, page, "Editor", cx))
-                                            .child(self.settings_tab(SettingsPage::Compiler, page, "Compiler", cx))
-                                            .child(self.settings_tab(SettingsPage::Addons, page, "Add-ons", cx)),
+                                            .child(self.settings_tab(SettingsPage::Compiler, page, "Compiler", cx)),
                                     )
                                 },
                             )
@@ -3791,6 +3795,7 @@ impl Render for Workspace {
                                 .h_full()
                                 .child(self.git_panel.clone())
                                 .into_any_element(),
+                            LeftPanel::Addons => self.render_addons_panel(cx).into_any_element(),
                             LeftPanel::Addon(index) => div()
                                 .flex_none()
                                 .w(self.file_panel_width)
