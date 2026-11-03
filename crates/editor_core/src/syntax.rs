@@ -327,6 +327,24 @@ impl Syntax {
         true
     }
 
+    /// Whether `offset` lies inside a formula. Without a tree the answer is no.
+    pub fn in_math(&self, offset: usize) -> bool {
+        let Some(tree) = &self.tree else {
+            return false;
+        };
+        let mut node = tree.root_node().descendant_for_byte_range(offset, offset);
+        while let Some(current) = node {
+            if matches!(current.kind(), "inline_formula" | "displayed_equation" | "math_environment" | "math")
+                && current.start_byte() < offset
+                && offset < current.end_byte()
+            {
+                return true;
+            }
+            node = current.parent();
+        }
+        false
+    }
+
     pub fn has_tree(&self) -> bool {
         self.tree.is_some()
     }

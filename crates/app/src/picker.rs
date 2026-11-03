@@ -19,6 +19,10 @@ const MAX_SEARCHED_FILE_BYTES: u64 = 4 << 20;
 pub enum PickerKind {
     Files,
     Text,
+    /// Images for a figure at the cursor.
+    Figures,
+    /// `.bib` entries for a citation at the cursor.
+    Citations,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,6 +42,8 @@ pub struct Picker {
     pub selected: usize,
     pub root: PathBuf,
     pub files: Arc<Vec<PathBuf>>,
+    /// The citations to choose from.
+    pub entries: Arc<Vec<PickerItem>>,
     /// Set to stop the running text search when the query changes.
     pub cancel: Arc<AtomicBool>,
     pub task: Option<Task<()>>,
@@ -59,6 +65,57 @@ pub fn match_files(files: &[PathBuf], root: &Path, query: &str) -> Vec<PickerIte
         .collect();
     scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.label.cmp(&right.1.label)));
     scored.into_iter().take(MAX_RESULTS).map(|(_, item)| item).collect()
+}
+
+/// The entries of the `.bib` files. `label` is the key, `detail` the title.
+pub fn read_citations(files: &[PathBuf]) -> Vec<PickerItem> {
+    let mut items = Vec::new();
+    for path in files {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        items.extend(parse_bib(&text).into_iter().map(|(label, title)| PickerItem {
+            path: path.clone(),
+            label,
+            position: None,
+            detail: title,
+        }));
+    }
+    items
+}
+
+/// Reads keys and titles line by line, which fits how `.bib` files are written.
+fn parse_bib(text: &str) -> Vec<(String, Option<String>)> {
+    let mut entries: Vec<(String, Option<String>)> = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if let Some((kind, rest)) = line.strip_prefix('@').and_then(|rest| rest.split_once(['{', '('])) {
+            let kind = kind.trim().to_ascii_lowercase();
+            let key = rest.split(',').next().unwrap_or_default().trim();
+            if !key.is_empty() && !matches!(kind.as_str(), "comment" | "string" | "preamble") {
+                entries.push((key.to_string(), None));
+            }
+        } else if let Some((name, value)) = line.split_once('=')
+            && name.trim().eq_ignore_ascii_case("title")
+            && let Some((_, title)) = entries.last_mut()
+        {
+            let value = value.trim().trim_end_matches(',').replace(['{', '}', '"'], "");
+            *title = Some(value.trim().to_string());
+        }
+    }
+    entries
+}
+
+/// Entries that match `query` in the label or detail, best first.
+pub fn match_entries(entries: &[PickerItem], query: &str) -> Vec<PickerItem> {
+    let mut scored: Vec<(i64, &PickerItem)> = entries
+        .iter()
+        .filter_map(|item| {
+            let text = format!("{} {}", item.label, item.detail.as_deref().unwrap_or_default());
+            Some((fuzzy_score(query, &text)?, item))
+        })
+        .collect();
+    scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.label.cmp(&right.1.label)));
+    scored.into_iter().take(MAX_RESULTS).map(|(_, item)| item.clone()).collect()
 }
 
 /// Rates a subsequence match. Runs of letters and starts of names count more.
@@ -171,5 +228,27 @@ mod tests {
         let files = vec![binary, text];
         assert_eq!(search_text(&files, directory.path(), "x", &AtomicBool::new(false)).len(), 1);
         assert!(search_text(&files, directory.path(), "x", &AtomicBool::new(true)).is_empty());
+    }
+
+    #[test]
+    fn bib_entries_give_key_and_title() {
+        let text = "@comment{skip,}\n@string{a = \"b\"}\n@article{one,\n  booktitle = {No},\n  TITLE = \"The {C}omprehensive\",\n}\n@book{two, year = 1}\n";
+        assert_eq!(
+            parse_bib(text),
+            vec![("one".to_string(), Some("The Comprehensive".to_string())), ("two".to_string(), None)]
+        );
+    }
+
+    #[test]
+    fn citations_match_key_and_title() {
+        let item = |label: &str, title: &str| PickerItem {
+            path: PathBuf::new(),
+            label: label.to_string(),
+            position: None,
+            detail: Some(title.to_string()),
+        };
+        let citations = [item("knuth", "Art"), item("greenwade", "Network")];
+        assert_eq!(match_entries(&citations, "network")[0].label, "greenwade");
+        assert_eq!(match_entries(&citations, "kn")[0].label, "knuth");
     }
 }

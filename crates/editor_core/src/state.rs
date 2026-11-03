@@ -8,6 +8,7 @@ use tree_sitter::{InputEdit, Point};
 use crate::{
     buffer::Buffer,
     selection::{Selection, SelectionSet},
+    snippet::Snippet,
     syntax::{Language, ParseJob, ParseResult, Syntax},
 };
 
@@ -94,6 +95,30 @@ pub struct EditorState {
     syntax: Syntax,
     edits_since_job: Vec<InputEdit>,
     line_changes: Vec<LineChange>,
+    active_snippet: Option<ActiveSnippet>,
+}
+
+/// The stops of the snippet that `Tab` is walking through, in document order.
+struct ActiveSnippet {
+    stops: Vec<Range<usize>>,
+    current: usize,
+}
+
+impl ActiveSnippet {
+    /// Follows an edit. An edit outside the current stop ends the snippet.
+    fn edited(&mut self, range: &Range<usize>, inserted: usize) -> bool {
+        let current = &self.stops[self.current];
+        if range.start < current.start || range.end > current.end {
+            return false;
+        }
+        let delta = inserted as isize - range.len() as isize;
+        let shift = |offset: usize| (offset as isize + delta) as usize;
+        self.stops[self.current].end = shift(self.stops[self.current].end);
+        for stop in &mut self.stops[self.current + 1..] {
+            *stop = shift(stop.start)..shift(stop.end);
+        }
+        true
+    }
 }
 
 impl EditorState {
@@ -113,6 +138,7 @@ impl EditorState {
             syntax: Syntax::new(language),
             edits_since_job: Vec::new(),
             line_changes: Vec::new(),
+            active_snippet: None,
         }
     }
 
@@ -130,6 +156,7 @@ impl EditorState {
 
     pub fn set_selections(&mut self, selections: Vec<Selection>) {
         self.selections = SelectionSet::from_vec(self.clip_selections(selections));
+        self.check_snippet();
         self.seal_undo_group();
     }
 
@@ -371,6 +398,84 @@ impl EditorState {
         self.apply_planned(planned, GroupKind::Other);
     }
 
+    /// Inserts a snippet at every selection, with selected text in the first slot.
+    /// With `math`, the snippet gets `$` around it outside a formula. `Tab` walks
+    /// the slots when there is one cursor.
+    pub fn insert_snippet(&mut self, template: &str, math: bool) {
+        let single = self.selections.len() == 1;
+        let mut first_stops = None;
+        let planned: Vec<PlannedEdit> = self
+            .selections
+            .iter()
+            .map(|selection| {
+                let start = selection.start();
+                let line = self.buffer.line_text(self.buffer.offset_to_line(start));
+                let indent = &line[..line.len() - line.trim_start().len()];
+                let mut snippet = Snippet::parse(template, indent);
+                if !selection.is_empty() {
+                    snippet.fill_first(&self.buffer.slice(selection.range()));
+                }
+                if math && !self.syntax.in_math(start) {
+                    snippet.surround("$", "$");
+                } else {
+                    let before = self.char_before(start);
+                    let after = self.buffer.char_at(selection.end());
+                    let (prefix, suffix) = word_padding(&snippet.text, before, after);
+                    snippet.surround(prefix, suffix);
+                }
+                let (anchor, head) = snippet
+                    .slots
+                    .first()
+                    .map_or((snippet.text.len(), snippet.text.len()), |slot| (slot.start, slot.end));
+                if single {
+                    first_stops = Some((start, snippet.slots.clone(), snippet.text.len()));
+                }
+                PlannedEdit {
+                    range: selection.range(),
+                    text: snippet.text,
+                    anchor,
+                    head,
+                }
+            })
+            .collect();
+        self.apply_planned(planned, GroupKind::Other);
+        self.seal_undo_group();
+        let Some((start, slots, end)) = first_stops.filter(|(_, slots, _)| !slots.is_empty()) else {
+            return;
+        };
+        let mut stops: Vec<Range<usize>> = slots.iter().map(|slot| start + slot.start..start + slot.end).collect();
+        // Inside another snippet, the new slots come before the next outer one.
+        if let Some(active) = &mut self.active_snippet {
+            active.stops.splice(active.current..=active.current, stops);
+        } else {
+            stops.push(start + end..start + end);
+            self.active_snippet = Some(ActiveSnippet { stops, current: 0 });
+        }
+    }
+
+    /// Moves to the next slot of the active snippet. Returns false without one.
+    pub fn next_snippet_slot(&mut self) -> bool {
+        let Some(active) = &mut self.active_snippet else {
+            return false;
+        };
+        active.current += 1;
+        let stop = active.stops[active.current].clone();
+        if active.current + 1 == active.stops.len() {
+            self.active_snippet = None;
+        }
+        self.selections = SelectionSet::single(Selection::new(stop.start, stop.end));
+        self.seal_undo_group();
+        true
+    }
+
+    pub fn end_snippet(&mut self) {
+        self.active_snippet = None;
+    }
+
+    pub fn in_math(&self, offset: usize) -> bool {
+        self.syntax.in_math(offset)
+    }
+
     /// Pastes one line per selection when the line count matches the cursor count.
     pub fn paste(&mut self, text: &str) {
         let lines: Vec<&str> = text.split('\n').collect();
@@ -539,6 +644,7 @@ impl EditorState {
     }
 
     pub fn undo(&mut self) -> bool {
+        self.active_snippet = None;
         let Some(transaction) = self.undo_stack.pop() else {
             return false;
         };
@@ -555,6 +661,7 @@ impl EditorState {
     }
 
     pub fn redo(&mut self) -> bool {
+        self.active_snippet = None;
         let Some(transaction) = self.redo_stack.pop() else {
             return false;
         };
@@ -587,6 +694,22 @@ impl EditorState {
     }
 
     // Internals
+
+    /// Ends the active snippet once the selection leaves the current stop.
+    fn check_snippet(&mut self) {
+        let Some(active) = &self.active_snippet else {
+            return;
+        };
+        let stop = &active.stops[active.current];
+        let primary = self.selections.primary();
+        if self.selections.len() != 1 || primary.start() < stop.start || primary.end() > stop.end {
+            self.active_snippet = None;
+        }
+    }
+
+    fn char_before(&self, offset: usize) -> Option<char> {
+        (offset > 0).then(|| self.buffer.char_at(self.buffer.previous_boundary(offset))).flatten()
+    }
 
     fn selected_lines(&self) -> Vec<usize> {
         let mut lines = Vec::new();
@@ -679,6 +802,7 @@ impl EditorState {
             });
         }
         self.selections = selections_after;
+        self.check_snippet();
         if operations.is_empty() {
             return;
         }
@@ -734,6 +858,9 @@ impl EditorState {
         });
         self.version += 1;
 
+        if self.active_snippet.as_mut().is_some_and(|active| !active.edited(&range, text.len())) {
+            self.active_snippet = None;
+        }
         for mark in &mut self.marks {
             mark.range.start = map_mark_offset(mark.range.start, &range, text.len());
             mark.range.end = map_mark_offset(mark.range.end, &range, text.len());
@@ -827,6 +954,15 @@ fn closer_for(open: char) -> Option<char> {
         '$' => Some('$'),
         _ => None,
     }
+}
+
+/// The spaces that keep a snippet from merging with the word next to it, because
+/// `xalpha` is one name in Typst, as is `\\alphax` in LaTeX.
+fn word_padding(text: &str, before: Option<char>, after: Option<char>) -> (&'static str, &'static str) {
+    let joins = |ch: Option<char>| ch.is_some_and(char::is_alphanumeric);
+    let starts = text.chars().next().is_some_and(|ch| ch.is_alphanumeric() || ch == '@');
+    let ends = text.chars().next_back().is_some_and(char::is_alphanumeric);
+    (if starts && joins(before) { " " } else { "" }, if ends && joins(after) { " " } else { "" })
 }
 
 fn plan_typed_char(
@@ -1143,5 +1279,141 @@ mod tests {
         let rope = state.buffer().rope().clone();
         let spans = state.syntax().highlights(&rope, 0..rope.len_bytes());
         assert!(spans.iter().any(|span| span.range == (0..6)));
+    }
+
+    #[test]
+    fn tab_walks_snippet_slots() {
+        let mut state = state("");
+        state.insert_snippet("\\frac{${}}{${}}", false);
+        assert_eq!(state.buffer().to_string(), "\\frac{}{}");
+        state.type_text("ä");
+        assert!(state.next_snippet_slot());
+        state.type_text("b");
+        assert_eq!(state.buffer().to_string(), "\\frac{ä}{b}");
+        assert!(state.next_snippet_slot());
+        assert_eq!(state.selections().primary().head, state.buffer().len());
+        assert!(!state.next_snippet_slot());
+    }
+
+    #[test]
+    fn default_slot_is_selected_and_typing_replaces_it() {
+        let mut state = state("");
+        state.insert_snippet("a{${old}}b{${}}", false);
+        assert_eq!(state.selections().primary().range(), 2..5);
+        state.type_text("new");
+        assert!(state.next_snippet_slot());
+        assert_eq!(state.selections().primary().head, "a{new}b{".len());
+    }
+
+    #[test]
+    fn selection_fills_first_slot() {
+        let mut state = state("word");
+        state.set_selections(vec![Selection::new(0, 4)]);
+        state.insert_snippet("\\sqrt{${}}", false);
+        assert_eq!(state.buffer().to_string(), "\\sqrt{word}");
+        assert_eq!(state.selections().primary().range(), 6..10);
+    }
+
+    #[test]
+    fn leaving_the_slot_ends_the_snippet() {
+        let mut state = state("x");
+        state.set_selections(vec![Selection::cursor(0)]);
+        state.insert_snippet("{${}}{${}}", false);
+        state.set_selections(vec![Selection::cursor(state.buffer().len())]);
+        assert!(!state.next_snippet_slot());
+    }
+
+    #[test]
+    fn undo_removes_the_whole_snippet_and_ends_it() {
+        let mut state = state("");
+        state.insert_snippet("{${}}{${}}", false);
+        assert!(state.undo());
+        assert_eq!(state.buffer().to_string(), "");
+        assert!(!state.next_snippet_slot());
+    }
+
+    #[test]
+    fn snippet_inside_a_slot_comes_before_the_next_slot() {
+        let mut state = state("");
+        state.insert_snippet("A${}B${}", false);
+        state.insert_snippet("(${})", false);
+        state.type_text("x");
+        assert!(state.next_snippet_slot());
+        state.type_text("y");
+        assert_eq!(state.buffer().to_string(), "A(x)By");
+        assert!(state.next_snippet_slot());
+        assert!(!state.next_snippet_slot());
+    }
+
+    #[test]
+    fn plain_symbol_keeps_the_active_snippet() {
+        let mut state = state("");
+        state.insert_snippet("{${}}{${}}", false);
+        state.insert_snippet("\\alpha", false);
+        assert!(state.next_snippet_slot());
+        assert_eq!(state.selections().primary().head, "{\\alpha}{".len());
+    }
+
+    #[test]
+    fn several_cursors_get_no_slots() {
+        let mut state = state_at("a b", &[0, 2]);
+        state.insert_snippet("{${}}", false);
+        assert_eq!(state.buffer().to_string(), "{}a {}b");
+        assert!(!state.next_snippet_slot());
+    }
+
+    #[test]
+    fn indents_following_lines_like_the_cursor_line() {
+        let mut state = state_at("  x", &[3]);
+        state.insert_snippet("\\a\nb", false);
+        assert_eq!(state.buffer().to_string(), "  x\\a\n  b");
+    }
+
+    #[test]
+    fn word_padding_separates_names() {
+        let mut state = state_at("xy", &[1]);
+        state.insert_snippet("alpha", false);
+        assert_eq!(state.buffer().to_string(), "x alpha y");
+    }
+
+    fn parsed(text: &str, language: Language) -> EditorState {
+        let mut state = EditorState::new(text, language);
+        let job = state.start_parse().unwrap();
+        state.finish_parse(job.run());
+        state
+    }
+
+    #[test]
+    fn math_mode_comes_from_the_tree() {
+        for (text, language, offset, expected) in [
+            ("a $x$ b", Language::Latex, 3, true),
+            ("a $x$ b", Language::Latex, 1, false),
+            ("a $x$ b", Language::Latex, 5, false),
+            ("\\[ x \\]", Language::Latex, 3, true),
+            ("\\begin{equation}\nx\n\\end{equation}", Language::Latex, 17, true),
+            ("a $x$ b", Language::Typst, 3, true),
+            ("a $x$ b", Language::Typst, 1, false),
+            ("a $x$ b", Language::Typst, 5, false),
+        ] {
+            assert_eq!(parsed(text, language).in_math(offset), expected, "{text} at {offset}");
+        }
+    }
+
+    #[test]
+    fn math_snippet_gets_dollars_only_outside_formulas() {
+        let mut outside = parsed("a ", Language::Latex);
+        outside.set_selections(vec![Selection::cursor(2)]);
+        outside.insert_snippet("\\alpha", true);
+        assert_eq!(outside.buffer().to_string(), "a $\\alpha$");
+
+        let mut inside = parsed("$x $", Language::Latex);
+        inside.set_selections(vec![Selection::cursor(3)]);
+        inside.insert_snippet("\\alpha", true);
+        assert_eq!(inside.buffer().to_string(), "$x \\alpha$");
+
+        let mut typst = parsed("$x$", Language::Typst);
+        typst.set_selections(vec![Selection::cursor(2)]);
+        typst.insert_snippet("alpha", true);
+        assert_eq!(typst.buffer().to_string(), "$x alpha$");
     }
 }
