@@ -2,6 +2,7 @@
 
 mod content;
 
+use content::PageFrame;
 pub use content::{LinkTarget, PageChar, PageContent, PageLink, Rect};
 
 use std::{
@@ -86,7 +87,7 @@ impl PdfWorker {
 
 fn run(pdfium: Pdfium, commands: mpsc::Receiver<Command>, events: UnboundedSender<PdfEvent>) {
     let mut document: Option<(u64, PdfDocument)> = None;
-    let mut heights: Vec<f32> = Vec::new();
+    let mut frames: Vec<PageFrame> = Vec::new();
     let mut queue: VecDeque<PageRequest> = VecDeque::new();
     let mut pending: Option<Command> = None;
     loop {
@@ -118,7 +119,7 @@ fn run(pdfium: Pdfium, commands: mpsc::Receiver<Command>, events: UnboundedSende
                             .iter()
                             .map(|page| (page.width().value, page.height().value))
                             .collect();
-                        heights = pages.iter().map(|(_, height)| *height).collect();
+                        frames = loaded.pages().iter().filter_map(|page| PageFrame::of(&page).ok()).collect();
                         document = Some((generation, loaded));
                         events.send(PdfEvent::Loaded { generation, pages }).ok();
                     }
@@ -138,7 +139,7 @@ fn run(pdfium: Pdfium, commands: mpsc::Receiver<Command>, events: UnboundedSende
                 if let Some((current, document)) = &document
                     && *current == generation
                 {
-                    send_content(document, generation, page, &heights, &events);
+                    send_content(document, generation, page, &frames, &events);
                 }
             }
         }
@@ -149,13 +150,16 @@ fn send_content(
     document: &PdfDocument,
     generation: u64,
     page: usize,
-    heights: &[f32],
+    frames: &[PageFrame],
     events: &UnboundedSender<PdfEvent>,
 ) {
     let content = u16::try_from(page)
         .map_err(|_| PdfiumError::PageIndexOutOfBounds)
         .and_then(|index| document.pages().get(index))
-        .and_then(|page| content::extract(&page, heights))
+        .and_then(|loaded| {
+            let frame = frames.get(page).ok_or(PdfiumError::PageIndexOutOfBounds)?;
+            content::extract(&loaded, frame, frames)
+        })
         // A page without readable text still shows, it only cannot be selected.
         .unwrap_or_default();
     events.send(PdfEvent::PageContent { generation, page, content }).ok();
