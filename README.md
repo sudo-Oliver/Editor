@@ -51,6 +51,16 @@ Navigation uses SyncTeX, so it works for LaTeX only. Typst and Pandoc do not pro
 
 - Click a line in the editor to jump to it in the PDF. The Recompile menu can turn this off.
 - Cmd+click (macOS) or Ctrl+click (Linux) in the PDF to jump to the source line.
+- The position button in the PDF toolbar makes the PDF follow the editor cursor. It stays off until you turn it on, and Settings, Editor has the same switch.
+
+These work for every engine:
+
+- Drag over text in the PDF to select it, Cmd+C (macOS) or Ctrl+C (Linux) copies it.
+- Click a link, such as a citation or `\ref`, to jump to its target. Cmd+[ or Alt+Left goes back, Cmd+] or Alt+Right forward again. Links to websites open in the browser, other kinds of external links stay closed.
+
+## Images
+
+Clicking a PNG, JPEG, WebP or SVG in the file tree shows it in place of the editor, with its resolution and file size. Copy include puts the matching code for the engine on the clipboard, for example `\includegraphics{images/photo.png}` or `#image("images/photo.png")`. Export saves a copy elsewhere. Cmd+W or selecting a tab closes the image.
 
 ## Settings
 

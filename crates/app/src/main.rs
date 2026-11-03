@@ -2,6 +2,7 @@ mod actions;
 mod assets;
 mod editor_view;
 mod file_tree;
+mod image_view;
 mod outline;
 mod pdf_text;
 mod pdf_view;

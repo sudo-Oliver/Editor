@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 pub struct Settings {
     pub vim_mode: bool,
     pub smooth_cursor: bool,
+    /// The PDF follows the editor cursor.
+    pub auto_scroll_pdf: bool,
 }
 
 impl Default for Settings {
@@ -15,6 +17,7 @@ impl Default for Settings {
         Self {
             vim_mode: false,
             smooth_cursor: true,
+            auto_scroll_pdf: false,
         }
     }
 }
@@ -67,7 +70,7 @@ mod tests {
     fn settings_survive_a_restart() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("nested").join("settings.toml");
-        let settings = Settings { vim_mode: true, smooth_cursor: false };
+        let settings = Settings { vim_mode: true, smooth_cursor: false, auto_scroll_pdf: true };
         settings.save(&path).unwrap();
         assert_eq!(Settings::load(&path), settings);
     }
@@ -77,6 +80,6 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.toml");
         std::fs::write(&path, "vim_mode = true").unwrap();
-        assert_eq!(Settings::load(&path), Settings { vim_mode: true, smooth_cursor: true });
+        assert_eq!(Settings::load(&path), Settings { vim_mode: true, smooth_cursor: true, auto_scroll_pdf: false });
     }
 }

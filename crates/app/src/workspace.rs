@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use build::{BuildEvent, BuildManager, BuildOutcome, BuildRequest, Config, Diagnostic, Engine, Severity, Trigger};
+use build::{BuildEvent, BuildManager, BuildOutcome, BuildRequest, Config, Diagnostic, Engine, Severity, Trigger, find_main};
 use editor_core::{
     Language, Mark, MarkSeverity,
     vim::{self, Effect, Key, Leader, Mode},
@@ -28,6 +28,7 @@ use crate::{
     editor_view::{EditorEvent, EditorView, FormatKind},
     file_tree::{self, TreeEntry},
     outline::{self, OutlineItem},
+    image_view::{ImageView, ImageViewEvent, include_snippet, is_image, relative_path},
     pdf_view::{PdfView, PdfViewEvent, ZOOM_STEP},
     picker::{self, Picker, PickerKind},
     problems::{self, Problem},
@@ -44,6 +45,7 @@ const TAB_BAR_HEIGHT: f32 = 36.0;
 const TOOLBAR_HEIGHT: f32 = 32.0;
 const PREVIEW_TOOLBAR_HEIGHT: f32 = 32.0;
 const MIN_PANE_WIDTH: f32 = 160.0;
+const FOLLOW_DEBOUNCE: Duration = Duration::from_millis(150);
 /// Oldest output is dropped beyond this size.
 const MAX_LOG_BYTES: usize = 2 << 20;
 const MAX_LOG_LINES_SHOWN: usize = 2000;
@@ -129,6 +131,12 @@ fn entry(
 struct OpenDocument {
     view: Entity<EditorView>,
     _subscription: Subscription,
+    _observer: Subscription,
+}
+
+struct ImagePreview {
+    view: Entity<ImageView>,
+    _subscription: Subscription,
 }
 
 pub struct Workspace {
@@ -169,6 +177,11 @@ pub struct Workspace {
     engine: Option<Engine>,
     synctex: Option<SyncTex>,
     sync_on_click: bool,
+    /// The line of the active document that the PDF last followed.
+    follow_line: Option<usize>,
+    follow_task: Option<Task<()>>,
+    /// Shown instead of the editor. The tabs stay as they are.
+    image_preview: Option<ImagePreview>,
     last_pdf: Option<PathBuf>,
     last_main: Option<PathBuf>,
     /// The main file of the PDF on screen.
@@ -255,6 +268,9 @@ impl Workspace {
             engine: None,
             synctex: None,
             sync_on_click: true,
+            follow_line: None,
+            follow_task: None,
+            image_preview: None,
             last_pdf: None,
             last_main: None,
             pdf_main: None,
@@ -292,6 +308,7 @@ impl Workspace {
         self.entries = file_tree::scan(&root, &self.collapsed);
         self.documents.clear();
         self.active = None;
+        self.image_preview = None;
         self.start_watching(&root, cx);
         self.git_branch = git_branch(&root);
         self.root = Some(root.clone());
@@ -377,6 +394,10 @@ impl Workspace {
     }
 
     fn open_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if is_image(&path) {
+            self.open_image(path, window, cx);
+            return;
+        }
         if let Some(index) = self
             .documents
             .iter()
@@ -411,15 +432,36 @@ impl Workspace {
                 }
             }
         });
+        let observer = cx.observe(&view, |this, view, cx| this.cursor_changed(&view, cx));
         self.documents.push(OpenDocument {
             view,
             _subscription: subscription,
+            _observer: observer,
         });
         self.activate(self.documents.len() - 1, window, cx);
         self.apply_marks(cx);
     }
 
+    fn open_image(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let active = self.active_view().and_then(|view| view.read(cx).path.clone());
+        let main = self.root.as_deref().and_then(|root| find_main(root, &self.config, active.as_deref()));
+        let engine = self.engine.or_else(|| Engine::for_path(main.as_deref()?));
+        let directory = main.as_deref().and_then(Path::parent).or(self.root.as_deref());
+        let relative = directory.map_or_else(|| path.display().to_string(), |directory| relative_path(directory, &path));
+        let include = include_snippet(engine, &relative);
+        let view = cx.new(|cx| ImageView::new(path, include, cx));
+        let subscription = cx.subscribe(&view, |this, _, event, cx| match event {
+            ImageViewEvent::Status(message) => this.set_status(message.clone(), cx),
+        });
+        let focus = view.read(cx).focus_handle().clone();
+        window.focus(&focus, cx);
+        self.image_preview = Some(ImagePreview { view, _subscription: subscription });
+        cx.notify();
+    }
+
     fn activate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.image_preview = None;
+        self.follow_line = None;
         self.active = Some(index);
         let view = self.documents[index].view.clone();
         window.focus(&view.read(cx).focus_handle(cx), cx);
@@ -650,7 +692,10 @@ impl Workspace {
             cx.spawn(async move |this, cx| {
                 let synctex = cx.background_spawn(async move { SyncTex::open(&path) }).await;
                 this.update(cx, |this, cx| match synctex {
-                    Ok(synctex) => this.synctex = Some(synctex),
+                    Ok(synctex) => {
+                        this.synctex = Some(synctex);
+                        this.follow_cursor(cx);
+                    }
                     Err(error) => {
                         this.synctex = None;
                         this.set_status(format!("Cannot read SyncTeX data: {error}"), cx);
@@ -744,6 +789,49 @@ impl Workspace {
         }
     }
 
+    /// Runs whenever the document notifies, which covers every way of moving the
+    /// cursor, so it has to stay cheap until the line changes.
+    fn cursor_changed(&mut self, view: &Entity<EditorView>, cx: &mut Context<Self>) {
+        if !self.settings.auto_scroll_pdf || self.active_view().as_ref() != Some(view) {
+            return;
+        }
+        let state = &view.read(cx).state;
+        let line = state.buffer().offset_to_line(state.selections().primary().head);
+        if self.follow_line == Some(line) {
+            return;
+        }
+        self.follow_line = Some(line);
+        self.follow_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(FOLLOW_DEBOUNCE).await;
+            this.update(cx, |this, cx| this.follow_cursor(cx)).ok();
+        }));
+    }
+
+    fn follow_cursor(&mut self, cx: &mut Context<Self>) {
+        if !self.settings.auto_scroll_pdf || self.synctex_unavailable_reason().is_some() {
+            return;
+        }
+        let Some(view) = self.active_view() else {
+            return;
+        };
+        let view = view.read(cx);
+        let line = view.state.buffer().offset_to_line(view.state.selections().primary().head);
+        let location = view.path.as_ref().and_then(|path| self.synctex.as_ref()?.forward(path, line + 1));
+        if let Some(location) = location {
+            self.pdf.update(cx, |pdf, cx| pdf.follow(location, cx));
+        }
+    }
+
+    fn toggle_auto_scroll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.update_settings(|settings| settings.auto_scroll_pdf = !settings.auto_scroll_pdf, window, cx);
+        if self.settings.auto_scroll_pdf {
+            match self.synctex_unavailable_reason() {
+                Some(reason) => self.set_status(reason, cx),
+                None => self.follow_cursor(cx),
+            }
+        }
+    }
+
     fn forward_from_cursor(&mut self, cx: &mut Context<Self>) {
         let Some(view) = self.active_view() else {
             return;
@@ -764,6 +852,9 @@ impl Workspace {
         };
         let line = location.line.saturating_sub(1);
         self.open_file(location.file, window, cx);
+        // The PDF is already there, following this jump would pull it away from the click.
+        self.follow_line = Some(line);
+        self.follow_task = None;
         if let Some(view) = self.active_view() {
             view.update(cx, |view, cx| view.go_to_line(line, 0, window, cx));
         }
@@ -838,6 +929,10 @@ impl Workspace {
         }
         // An open menu or dialog holds the focus and gets `Esc` itself.
         if self.open_menu.is_some() || self.dialog.is_some() {
+            return;
+        }
+        // These keep their own key bindings, also with no document open.
+        if self.pdf.read(cx).is_focused(window) || self.image_preview.is_some() {
             return;
         }
         let view = self.active_view();
@@ -1835,9 +1930,11 @@ impl Workspace {
     }
 
     fn render_editor_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let body: AnyElement = match self.active_view() {
-            Some(view) => view.into_any_element(),
-            None => div()
+        let active = self.active_view();
+        let body: AnyElement = match (&self.image_preview, active) {
+            (Some(preview), _) => preview.view.clone().into_any_element(),
+            (None, Some(view)) => view.into_any_element(),
+            (None, None) => div()
                 .size_full()
                 .flex()
                 .items_center()
@@ -2020,6 +2117,14 @@ impl Workspace {
                                 this.pdf.update(cx, |view, cx| view.set_fit_width(cx));
                             }))
                             .child(zoom_label),
+                    )
+                    .child(
+                        div()
+                            .rounded(px(4.))
+                            .when(self.settings.auto_scroll_pdf, |element| element.bg(theme::color(theme::GREEN_DARK)))
+                            .child(self.icon_button("auto-scroll-pdf", "position", cx, |this, window, cx| {
+                                this.toggle_auto_scroll(window, cx);
+                            })),
                     )
                     .child(self.icon_button("invert", "contrast", cx, |this, _, cx| {
                         this.pdf.update(cx, |view, cx| view.toggle_invert(cx));
@@ -2401,6 +2506,14 @@ impl Workspace {
                 },
                 self.toggle_switch("smooth-cursor", vim_on && self.settings.smooth_cursor, vim_on, cx, |this, window, cx| {
                     this.update_settings(|settings| settings.smooth_cursor = !settings.smooth_cursor, window, cx);
+                }),
+            )
+            .into_any_element(),
+            Self::setting_row(
+                "Follow cursor in PDF",
+                "Scrolls the PDF along with the editor cursor. Needs SyncTeX, so LaTeX only.",
+                self.toggle_switch("auto-scroll-pdf-setting", self.settings.auto_scroll_pdf, true, cx, |this, window, cx| {
+                    this.toggle_auto_scroll(window, cx);
                 }),
             )
             .into_any_element(),
@@ -2839,7 +2952,10 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &Save, _, cx| this.save_active(cx)))
             .on_action(cx.listener(|this, _: &Recompile, _, cx| this.recompile(cx)))
             .on_action(cx.listener(|this, _: &CloseTab, window, cx| {
-                if let Some(index) = this.active {
+                if this.image_preview.take().is_some() {
+                    this.focus_active(window, cx);
+                    cx.notify();
+                } else if let Some(index) = this.active {
                     this.close_document(index, window, cx);
                 }
             }))
