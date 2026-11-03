@@ -1,0 +1,11 @@
+[package]
+name = "synctex"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+flate2 = "1"
+
+[dev-dependencies]
+tempfile = "3"
