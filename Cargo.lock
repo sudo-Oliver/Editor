@@ -176,6 +176,7 @@ version = "0.1.0"
 dependencies = [
  "build",
  "editor_core",
+ "git",
  "gpui",
  "gpui_platform",
  "ignore",
@@ -1837,6 +1838,13 @@ name = "gimli"
 version = "0.34.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1033caf0b349c518623b5396bfb2cf0bddf44f0306d543a250e5743297aafd10"
+
+[[package]]
+name = "git"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
 
 [[package]]
 name = "gl_generator"

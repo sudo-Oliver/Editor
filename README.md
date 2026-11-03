@@ -74,6 +74,18 @@ After an insert, `Tab` moves to the next empty field. `Esc` or moving the cursor
 
 Some LaTeX output needs a package in the preamble, which the editor does not add: `graphicx` for figures, `svg` for SVG figures and `amsmath` for matrices and cases.
 
+## Git
+
+The branch button in the left rail shows the Git panel in place of the file tree. It uses the `git` program, so Git LFS, hooks, SSH keys, credential helpers and commit signing work as they do in a terminal.
+
+- A folder without a repository offers to create one, with `.build/` in `.gitignore`.
+- Click `+` and `-` to stage and unstage. Click a file to open it. `⌘↩` in the message field commits, and open documents are saved first.
+- The branch name opens a list of branches. Type a new name to create one. Git refuses a switch that would overwrite changes.
+- Pull only fast-forwards. Push publishes a new branch to `origin`, and never forces. Merges and conflicts belong in a terminal for now: the panel lists conflicts but does not resolve them.
+- History shows all branches as a graph and loads more while you scroll.
+
+Git runs only while the panel is open, never when a folder opens. Hooks and filters in a repository run as they would in a terminal, so open this panel only for repositories you trust. Build output in `.build` stays out of the lists. Changes appear on their own, but the panel does not fetch: pull or push to talk to a remote.
+
 ## Settings
 
 The gear at the bottom left opens the settings, the question mark above it lists the keyboard shortcuts. Cmd+, (macOS) or Ctrl+, (Linux) also opens the settings. They are stored in `~/.config/editor/settings.toml`, or under `XDG_CONFIG_HOME` if it is set. Project settings stay in `.editor.toml`.
@@ -98,5 +110,6 @@ Not included: LSP keys, git hunks, macros, named registers, marks and custom key
 | `app` | Window, panels, editor view, PDF view |
 | `editor_core` | Rope buffer, multicursor, undo, Tree-sitter highlighting |
 | `build` | Compiler runner, log parsers, project settings |
+| `git` | Status, staging, commits, branches and history through the `git` program |
 | `pdf` | PDFium worker thread |
 | `synctex` | SyncTeX parser and lookups |

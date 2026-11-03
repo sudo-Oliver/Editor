@@ -60,6 +60,12 @@ The toolbar follows the file type. LaTeX and Typst show undo, redo, bold, italic
 the symbol palette, the table grid, figure and citation. Markdown keeps undo, redo, bold,
 italic and link. Other files and the image preview keep undo and redo.
 
+## Git panel
+
+The second rail button swaps the file tree and outline for the panel, at the same width. From
+the top: branch with ahead and behind counts, pull, push, refresh; conflicts, staged files and
+changes; the commit message and button; history with one lane per branch.
+
 ## Vim status bar
 
 The status bar exists only in Vim mode. It follows the NvChad statusline with
