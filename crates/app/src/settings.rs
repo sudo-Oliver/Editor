@@ -12,6 +12,8 @@ pub struct Settings {
     pub auto_scroll_pdf: bool,
     /// The popup with commands and project names while typing.
     pub auto_suggestions: bool,
+    /// Underlines missing and unused LaTeX packages before a compiler complains.
+    pub package_hints: bool,
 }
 
 impl Default for Settings {
@@ -21,6 +23,7 @@ impl Default for Settings {
             smooth_cursor: true,
             auto_scroll_pdf: false,
             auto_suggestions: true,
+            package_hints: true,
         }
     }
 }
@@ -73,7 +76,7 @@ mod tests {
     fn settings_survive_a_restart() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("nested").join("settings.toml");
-        let settings = Settings { vim_mode: true, smooth_cursor: false, auto_scroll_pdf: true, auto_suggestions: false };
+        let settings = Settings { vim_mode: true, smooth_cursor: false, auto_scroll_pdf: true, auto_suggestions: false, package_hints: false };
         settings.save(&path).unwrap();
         assert_eq!(Settings::load(&path), settings);
     }
@@ -83,6 +86,6 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.toml");
         std::fs::write(&path, "vim_mode = true").unwrap();
-        assert_eq!(Settings::load(&path), Settings { vim_mode: true, smooth_cursor: true, auto_scroll_pdf: false, auto_suggestions: true });
+        assert_eq!(Settings::load(&path), Settings { vim_mode: true, smooth_cursor: true, auto_scroll_pdf: false, auto_suggestions: true, package_hints: true });
     }
 }

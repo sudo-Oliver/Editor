@@ -9,6 +9,7 @@ mod git_panel;
 mod image_view;
 mod marketplace;
 mod outline;
+mod package_check;
 mod pdf_text;
 mod pdf_view;
 mod picker;

@@ -1,5 +1,6 @@
 pub mod vim;
 pub mod buffer;
+pub mod latex_usage;
 pub mod selection;
 pub mod snippet;
 pub mod state;

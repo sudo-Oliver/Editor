@@ -19,6 +19,8 @@ const INDENT_WIDTH: usize = 2;
 pub enum MarkSeverity {
     Error,
     Warning,
+    /// Advice from the editor, not from the compiler.
+    Hint,
 }
 
 /// A diagnostic range that follows edits.

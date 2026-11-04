@@ -72,6 +72,17 @@ The buttons insert code in the language of the open file, LaTeX or Typst.
 
 After an insert, `Tab` moves to the next empty field. `Esc` or moving the cursor away ends this. In Vim mode, a button click switches to Insert mode.
 
+### Packages
+
+LaTeX errors about a missing package get a button that adds `\\usepackage` to the preamble of the main file. After each build, the editor also looks through the whole project:
+
+- A command or environment from a known package, with that package not loaded, gets a quiet underline.
+- A package that nothing in the project uses gets one too. This covers only packages whose commands are all known and that change nothing by being loaded, such as `booktabs`.
+
+The editor stays silent when it cannot be sure: with an unknown document class or package, with `.sty` or `.cls` files in the project, or when the project defines the name itself. The compiler's error still has the button then.
+
+`Cmd+.` applies the fix on the line of the cursor, in Vim's Normal mode also `Space .`. A strip below the editor explains the underline on the cursor's line. All details lists every hint with its button. Undo reverts a fix. Turn the underlines off with Settings, Editor, Package hints, or `package_hints = false` in `settings.toml`.
+
 ### Suggestions
 
 A popup at the cursor offers commands and names while you type, without AI or network access:

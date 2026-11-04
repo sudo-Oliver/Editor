@@ -60,6 +60,13 @@ The toolbar follows the file type. LaTeX and Typst show undo, redo, bold, italic
 the symbol palette, the table grid, figure and citation. Markdown keeps undo, redo, bold,
 italic and link. Other files and the image preview keep undo and redo.
 
+## Package hints
+
+Hints from the editor use a muted underline, so that they do not read as compiler errors. They add
+to neither the error count nor the badge. The error card shows a primary button with the fix, and
+the log panel lists all hints in a Packages section, each with its button. With the cursor on a
+hinted line, a strip below the editor says what the underline means and applies the fix on click.
+
 ## Suggestion popup
 
 A small list opens below the start of the replaced text, at most 8 rows of name and detail on the
