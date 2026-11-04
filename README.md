@@ -92,6 +92,12 @@ An add-on is a program in its own folder, with an `addon.toml` that names it and
 
 Add-ons have no sandbox. They run with your user rights, so install only those you trust. The permissions limit what they can ask the editor for, not what the program can do by itself. Through the editor, they reach only files inside the project and never `.git`.
 
+The Add-ons panel also lists what the catalog offers, with each add-on's description and permissions before you install it. The catalog is the public repository [editor-addons](https://github.com/sudo-Oliver/editor-addons). The editor contacts it only when you first open the panel in a session or press Refresh, through `curl` over https. A failed request leaves a line in the panel and installed add-ons keep working. Downloads must match their sha256 and start turned off. An update stays on only if it asks for no new permissions.
+
+There are no signatures. The checksum protects the download but does not say who wrote it, so installing means trusting that repository.
+
+An add-on can supply entries for the citation picker. In LaTeX, typing `\cite{` or a relative such as `\autocite[p. 3]{` opens the picker when entries exist. Insert citation and Cmd+Shift+C open it in LaTeX and Typst.
+
 The crate `addon_api` describes the protocol: one JSON message per line over stdin and stdout, with the panel sent as a tree of nodes that the editor draws.
 
 ## Settings

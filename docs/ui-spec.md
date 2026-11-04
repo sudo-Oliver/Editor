@@ -72,6 +72,17 @@ The Add-ons rail button below Git lists installed add-ons with On, Off, Remove a
 folder. An add-on that is turned on gets a rail button of its own below that, with its own icon, and
 its panel takes the place of the file tree. The add-on sends a tree of nodes, so its panel uses the colors and controls of the app.
 
+The same panel has two sections: Installed, and Available from the catalog with description,
+permissions, Install and Refresh. Its text says that downloads are checked but not signed. An update
+appears on the installed add-on when the catalog holds another version. Installing never turns an
+add-on on.
+
+## Citation picker
+
+`\cite{` and its relatives open the picker in LaTeX when entries exist. Backspace after a pick does not
+open it again at that place. A pick inserts the key, adds `}` if none follows, and leaves the cursor
+after the brace. An open picker takes the keyboard in every mode.
+
 ## Vim status bar
 
 The status bar exists only in Vim mode. It follows the NvChad statusline with
