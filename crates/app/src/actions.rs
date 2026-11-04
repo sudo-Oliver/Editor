@@ -53,6 +53,7 @@ actions!(
     [
         OpenFolder,
         Save,
+        InsertCitation,
         Recompile,
         CloseTab,
         ToggleFileTree,
@@ -117,6 +118,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("alt-left", PdfBack, pdf),
         KeyBinding::new("alt-right", PdfForward, pdf),
         KeyBinding::new("secondary-s", Save, None),
+        KeyBinding::new("secondary-shift-c", InsertCitation, None),
         KeyBinding::new("secondary-enter", Recompile, None),
         KeyBinding::new("secondary-o", OpenFolder, None),
         KeyBinding::new("secondary-w", CloseTab, None),

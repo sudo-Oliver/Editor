@@ -180,6 +180,35 @@ pub fn citation(language: Language, key: &str) -> String {
     if language == Language::Typst { format!("@{key}") } else { format!("\\cite{{{key}}}") }
 }
 
+/// A citation key for the braces of a `\cite{` at the cursor. Adds the closing
+/// brace only when the text after the cursor does not have it.
+pub fn citation_key(key: &str, closing: bool) -> String {
+    let key = literal(key);
+    if closing { format!("{key}}}") } else { key }
+}
+
+/// Whether `before`, the text before the cursor, ends in the opening brace of a
+/// LaTeX citation command such as `\cite{`, `\autocite[p. 3]{` or `\citep*{`.
+pub fn opens_citation(before: &str) -> bool {
+    let Some(mut rest) = before.strip_suffix('{') else {
+        return false;
+    };
+    while let Some(inner) = rest.strip_suffix(']') {
+        // An optional argument, on the same line.
+        let Some(open) = inner.rfind('[') else {
+            return false;
+        };
+        if inner[open..].contains('\n') {
+            return false;
+        }
+        rest = &inner[..open];
+    }
+    let rest = rest.strip_suffix('*').unwrap_or(rest);
+    let name_length = rest.chars().rev().take_while(char::is_ascii_alphabetic).map(char::len_utf8).sum::<usize>();
+    let (head, name) = rest.split_at(rest.len() - name_length);
+    head.ends_with('\\') && name.to_ascii_lowercase().contains("cite")
+}
+
 /// Whether a figure in `language` can show this file.
 pub fn is_figure_file(language: Language, path: &Path) -> bool {
     let extension = path.extension().and_then(|extension| extension.to_str()).unwrap_or_default().to_ascii_lowercase();
@@ -218,6 +247,8 @@ mod tests {
     #[test]
     fn citations_follow_the_language() {
         assert_eq!(citation(Language::Latex, "a"), "\\cite{a}");
+        assert_eq!(citation_key("a", true), "a}");
+        assert_eq!(citation_key("a", false), "a");
         assert_eq!(citation(Language::Typst, "a"), "@a");
     }
 
@@ -267,5 +298,15 @@ mod tests {
             .output()
             .unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
+    }
+
+    #[test]
+    fn citation_commands_are_recognized() {
+        for text in ["\\cite{", "x \\citep{", "\\autocite[p. 3]{", "\\parencite[a][b]{", "\\citep*{", "\\Cite{", "\\footcite{"] {
+            assert!(opens_citation(text), "{text}");
+        }
+        for text in ["\\section{", "cite{", "\\cite", "\\cite{a", "\\cite[{", "\\excited[x\n]{", "\\\\cit{", "{"] {
+            assert!(!opens_citation(text), "{text}");
+        }
     }
 }

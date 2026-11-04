@@ -39,6 +39,7 @@ pub fn sections(vim_mode: bool) -> Vec<Section> {
                 (modified("B"), "Bold"),
                 (modified("I"), "Italic"),
                 (modified("D"), "Select next occurrence"),
+                (modified("Shift+C"), "Insert citation"),
             ],
         },
         Section {
