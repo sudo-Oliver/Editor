@@ -1292,14 +1292,18 @@ impl Workspace {
 
     // Vim keys
 
-    /// Runs before the key bindings. With vim mode off, nothing changes.
+    /// Runs before the key bindings. An open picker takes its keys in any mode. Apart
+    /// from that, nothing changes with vim mode off.
     fn intercept_key(&mut self, event: &KeystrokeEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.settings.vim_mode || event.keystroke.modifiers.platform {
+        if event.keystroke.modifiers.platform {
             return;
         }
         if self.picker.is_some() {
             cx.stop_propagation();
             self.picker_key(&event.keystroke, window, cx);
+            return;
+        }
+        if !self.settings.vim_mode {
             return;
         }
         // An open menu or dialog holds the focus and gets `Esc` itself.
