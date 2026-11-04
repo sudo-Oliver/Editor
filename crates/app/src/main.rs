@@ -6,6 +6,7 @@ mod editor_view;
 mod file_tree;
 mod git_panel;
 mod image_view;
+mod marketplace;
 mod outline;
 mod pdf_text;
 mod pdf_view;

@@ -29,6 +29,7 @@ use crate::{
     actions::*,
     addon_panel::{AddonPanel, AddonPanelEvent},
     addons::{self, Installed},
+    marketplace::{self, CatalogEntry},
     editor_view::{EditorEvent, EditorView, FormatKind},
     file_tree::{self, TreeEntry},
     git_panel::{self, GitPanel, GitPanelEvent},
@@ -160,6 +161,14 @@ struct OpenDocument {
 }
 
 /// The panel of an add-on that is turned on.
+enum CatalogState {
+    /// Not asked for yet in this session.
+    Idle,
+    Loading,
+    Ready(Vec<CatalogEntry>),
+    Failed(String),
+}
+
 struct AddonEntry {
     panel: Entity<AddonPanel>,
     _subscription: Subscription,
@@ -191,6 +200,9 @@ pub struct Workspace {
     _git_subscription: Subscription,
     installed_addons: Vec<Installed>,
     addon_panels: Vec<AddonEntry>,
+    catalog: CatalogState,
+    /// The id of the add-on being downloaded.
+    installing: Option<String>,
     tracked_edits: HashMap<String, TrackedEdits>,
     /// Add-on requests that wait for the running build to end.
     compile_waiters: Vec<(Entity<AddonPanel>, u64)>,
@@ -314,6 +326,8 @@ impl Workspace {
             _git_subscription: git_subscription,
             installed_addons: Vec::new(),
             addon_panels: Vec::new(),
+            catalog: CatalogState::Idle,
+            installing: None,
             tracked_edits: HashMap::new(),
             compile_waiters: Vec::new(),
             show_preview: true,
@@ -724,6 +738,53 @@ impl Workspace {
             .ok();
         })
         .detach();
+    }
+
+    fn fetch_catalog(&mut self, cx: &mut Context<Self>) {
+        self.catalog = CatalogState::Loading;
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_spawn(async move { marketplace::fetch() }).await;
+            this.update(cx, |this, cx| {
+                this.catalog = match result {
+                    Ok(entries) => CatalogState::Ready(entries),
+                    Err(error) => CatalogState::Failed(error),
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn install_from_catalog(&mut self, entry: CatalogEntry, cx: &mut Context<Self>) {
+        let Some(directory) = addons::default_directory() else {
+            return self.set_status("The add-on folder is unknown, because HOME is not set.", cx);
+        };
+        if self.installing.is_some() {
+            return;
+        }
+        let previous = self.installed_addons.iter().find(|add_on| add_on.manifest.id == entry.id).cloned();
+        self.installing = Some(entry.id.clone());
+        cx.spawn(async move |this, cx| {
+            let name = entry.name.clone();
+            let updating = previous.is_some();
+            let result = cx.background_spawn(async move { marketplace::install(&entry, &directory, previous.as_ref()) }).await;
+            this.update(cx, |this, cx| {
+                this.installing = None;
+                let message = match result {
+                    Ok(true) => format!("Updated {name}."),
+                    Ok(false) if updating => format!("Updated {name}. It is turned off, so check its permissions and turn it on."),
+                    Ok(false) => format!("Installed {name}. Turn it on to use it."),
+                    Err(error) => error,
+                };
+                this.set_status(message, cx);
+                this.reload_addons(cx);
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
     }
 
     fn addon_file(&self, relative: &str) -> Result<PathBuf, String> {
@@ -3365,16 +3426,32 @@ impl Workspace {
         ]
     }
 
+    fn catalog_button(&self, id: impl Into<gpui::ElementId>, label: String, entry: CatalogEntry, cx: &mut Context<Self>) -> impl IntoElement {
+        let busy = self.installing.as_deref() == Some(entry.id.as_str());
+        div()
+            .id(id)
+            .flex_none()
+            .px(px(8.))
+            .py(px(3.))
+            .rounded(px(4.))
+            .cursor_pointer()
+            .font_weight(FontWeight::SEMIBOLD)
+            .bg(theme::color(theme::GREEN_DARK))
+            .on_click(cx.listener(move |this, _, _, cx| this.install_from_catalog(entry.clone(), cx)))
+            .child(if busy { "Downloading…".to_string() } else { label })
+    }
+
     fn render_addons_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let catalog: &[CatalogEntry] = if let CatalogState::Ready(entries) = &self.catalog { entries } else { &[] };
         let rows: Vec<AnyElement> = self
             .installed_addons
             .iter()
             .enumerate()
             .map(|(index, add_on)| {
                 let manifest = &add_on.manifest;
-                let permissions = manifest.permissions.iter().map(|permission| permission.description()).collect::<Vec<_>>().join(", ");
                 let (for_toggle, for_remove) = (add_on.clone(), add_on.clone());
                 let enabled = add_on.enabled;
+                let update = catalog.iter().find(|entry| entry.id == manifest.id && entry.version != manifest.version).cloned();
                 div()
                     .flex()
                     .flex_col()
@@ -3385,11 +3462,10 @@ impl Workspace {
                     .border_color(theme::color(theme::PANEL))
                     .child(div().font_weight(FontWeight::SEMIBOLD).child(format!("{} {}", manifest.name, manifest.version)))
                     .child(div().text_color(theme::color(theme::UI_MUTED)).child(format!("By {}", manifest.author)))
-                    .child(div().text_color(theme::color(theme::UI_MUTED)).child(if permissions.is_empty() {
-                        "Asks for no permissions.".to_string()
-                    } else {
-                        permissions
-                    }))
+                    .when(!manifest.description.is_empty(), |element| {
+                        element.child(div().text_color(theme::color(theme::UI_MUTED)).child(manifest.description.clone()))
+                    })
+                    .child(div().text_color(theme::color(theme::UI_MUTED)).child(marketplace::permission_text(&manifest.permissions)))
                     .child(
                         div()
                             .flex()
@@ -3419,11 +3495,42 @@ impl Workspace {
                                     .bg(theme::color(theme::DIVIDER))
                                     .on_click(cx.listener(move |this, _, _, cx| this.remove_addon(&for_remove, cx)))
                                     .child("Remove"),
-                            ),
+                            )
+                            .children(update.map(|entry| {
+                                let label = format!("Update to {}", entry.version);
+                                self.catalog_button(("addon-update", index), label, entry, cx)
+                            })),
                     )
                     .into_any_element()
             })
             .collect();
+        let available: Vec<AnyElement> = catalog
+            .iter()
+            .filter(|entry| !self.installed_addons.iter().any(|add_on| add_on.manifest.id == entry.id))
+            .enumerate()
+            .map(|(index, entry)| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_none()
+                    .gap(px(4.))
+                    .py(px(10.))
+                    .border_t_1()
+                    .border_color(theme::color(theme::PANEL))
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child(format!("{} {}", entry.name, entry.version)))
+                    .child(div().text_color(theme::color(theme::UI_MUTED)).child(format!("By {}", entry.author)))
+                    .child(div().text_color(theme::color(theme::UI_MUTED)).child(entry.description.clone()))
+                    .child(div().text_color(theme::color(theme::UI_MUTED)).child(entry.permission_text()))
+                    .child(div().flex().pt(px(4.)).child(self.catalog_button(("addon-install", index), "Install".to_string(), entry.clone(), cx)))
+                    .into_any_element()
+            })
+            .collect();
+        let catalog_note = match &self.catalog {
+            CatalogState::Idle | CatalogState::Loading => Some("Looking for add-ons…".to_string()),
+            CatalogState::Failed(error) => Some(format!("Cannot reach the catalog. {error}")),
+            CatalogState::Ready(_) if available.is_empty() => Some("Everything in the catalog is installed.".to_string()),
+            CatalogState::Ready(_) => None,
+        };
         div()
             .id("addons-panel")
             .flex()
@@ -3446,8 +3553,27 @@ impl Workspace {
                     this.prompt_install_addon(cx);
                 })),
             )
+            .child(div().flex_none().font_weight(FontWeight::SEMIBOLD).child("Installed"))
             .when(rows.is_empty(), |element| element.child(div().flex_none().child("No add-ons are installed.")))
             .children(rows)
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_between()
+                    .pt(px(8.))
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Available"))
+                    .child(self.panel_button("addon-refresh", "Refresh", false, cx, |this, _, cx| this.fetch_catalog(cx))),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(theme::color(theme::UI_MUTED))
+                    .child("Downloads come from the repository sudo-Oliver/editor-addons. A checksum protects the download but does not say who wrote it, so installing means trusting that repository."),
+            )
+            .children(catalog_note.map(|note| div().flex_none().child(note)))
+            .children(available)
     }
 
     fn render_compiler_settings(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -3863,6 +3989,9 @@ impl Render for Workspace {
         // Git runs only while its panel shows.
         let git_visible = show_file_panel && self.left_panel == LeftPanel::Git;
         self.git_panel.update(cx, |panel, cx| panel.set_visible(git_visible, cx));
+        if show_file_panel && self.left_panel == LeftPanel::Addons && matches!(self.catalog, CatalogState::Idle) {
+            self.fetch_catalog(cx);
+        }
         if std::mem::take(&mut self.open_citations_soon) {
             cx.defer_in(window, |this, window, cx| this.open_picker(PickerKind::Citations, window, cx));
         }
