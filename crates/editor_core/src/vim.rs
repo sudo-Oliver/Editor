@@ -246,6 +246,17 @@ impl Vim {
         }
     }
 
+    /// Records an accepted suggestion, so that `.` types the same result. The
+    /// keys that typed `prefix` are already recorded.
+    pub fn record_completion(&mut self, prefix: &str, text: &str) {
+        for _ in prefix.chars() {
+            self.record_insert(Key::Backspace);
+        }
+        for ch in text.chars() {
+            self.record_insert(if ch == '\n' { Key::Enter } else { Key::Char(ch) });
+        }
+    }
+
     /// Starts inserting after a snippet from outside the keyboard. Stays out of
     /// `.`, which could not replay it.
     pub fn enter_insert(&mut self, state: &EditorState) {
@@ -1684,6 +1695,28 @@ mod tests {
         assert!(!fixture.state.next_snippet_slot());
         fixture.keys("0.");
         assert_eq!(fixture.state.buffer().to_string(), "a{p}{}ax");
+    }
+
+    #[test]
+    fn repeat_types_an_accepted_suggestion() {
+        let mut fixture = fixture("|x");
+        fixture.keys("i");
+        for ch in ['\\', 'f', 'r'] {
+            fixture.state.type_text(ch.encode_utf8(&mut [0; 4]));
+            fixture.vim.record_insert(Key::Char(ch));
+        }
+        fixture.vim.record_completion("\\fr", "\\frac{}{}");
+        fixture.state.complete_prefix(0..3, "\\frac{${}}{${}}");
+        assert_eq!(fixture.state.buffer().to_string(), "\\frac{}{}x");
+        fixture.keys("<esc>0.");
+        assert_eq!(fixture.state.buffer().to_string(), "\\frac{}{}\\frac{}{}x");
+    }
+
+    #[test]
+    fn tab_in_normal_mode_still_goes_to_the_tree() {
+        let mut fixture = fixture("|x");
+        let effects = fixture.vim.key(Key::Tab, &mut fixture.state, &Input::default());
+        assert!(effects.contains(&Effect::FocusTree));
     }
 
     #[test]

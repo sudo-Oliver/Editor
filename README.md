@@ -72,6 +72,15 @@ The buttons insert code in the language of the open file, LaTeX or Typst.
 
 After an insert, `Tab` moves to the next empty field. `Esc` or moving the cursor away ends this. In Vim mode, a button click switches to Insert mode.
 
+### Suggestions
+
+A popup at the cursor offers commands and names while you type, without AI or network access:
+
+- LaTeX: after `\\` commands and your own `\\newcommand` macros, in `\\begin{` environments, and in `\\ref{` and its relatives the labels of the open documents.
+- Typst: after `#` keywords, functions and your own `#let` names, after `@` the labels of the open documents.
+
+While the popup shows, `Tab` accepts, `Up` and `Down` or `Ctrl+N` and `Ctrl+P` choose, and `Esc` closes it. `Enter` always starts a new line. Prose gets no popup, and `\\cite{` keeps its citation picker. In Vim mode, the popup works in Insert mode and `.` repeats an accepted suggestion. Turn it off with Settings, Editor, Auto suggestions, or `auto_suggestions = false` in `settings.toml`.
+
 Some LaTeX output needs a package in the preamble, which the editor does not add: `graphicx` for figures, `svg` for SVG figures and `amsmath` for matrices and cases.
 
 ## Git

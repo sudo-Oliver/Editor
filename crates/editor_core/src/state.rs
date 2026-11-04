@@ -458,6 +458,17 @@ impl EditorState {
         }
     }
 
+    /// Replaces `prefix`, the text before the cursor, with a snippet. The typed
+    /// text comes back with one undo.
+    pub fn complete_prefix(&mut self, prefix: Range<usize>, template: &str) {
+        self.seal_undo_group();
+        let checkpoint = self.undo_checkpoint();
+        let start = prefix.start;
+        self.replace_range(prefix, "", Selection::cursor(start));
+        self.insert_snippet(template, false);
+        self.merge_undo_since(checkpoint);
+    }
+
     /// Moves to the next slot of the active snippet. Returns false without one.
     pub fn next_snippet_slot(&mut self) -> bool {
         let Some(active) = &mut self.active_snippet else {
@@ -1372,6 +1383,34 @@ mod tests {
         let mut state = state_at("  x", &[3]);
         state.insert_snippet("\\a\nb", false);
         assert_eq!(state.buffer().to_string(), "  x\\a\n  b");
+    }
+
+    #[test]
+    fn completion_replaces_the_prefix_and_walks_the_slots() {
+        let mut state = EditorState::new("", Language::Latex);
+        for ch in ["a", " ", "\\", "f", "r"] {
+            state.type_text(ch);
+        }
+        state.complete_prefix(2..5, "\\frac{${}}{${}}");
+        assert_eq!(state.buffer().to_string(), "a \\frac{}{}");
+        assert_eq!(state.selections().primary().head, "a \\frac{".len());
+        assert!(state.next_snippet_slot());
+        assert_eq!(state.selections().primary().head, "a \\frac{}{".len());
+        assert!(state.undo());
+        assert_eq!(state.buffer().to_string(), "a \\fr");
+    }
+
+    #[test]
+    fn completion_inside_a_slot_keeps_the_outer_snippet() {
+        let mut state = EditorState::new("", Language::Latex);
+        state.insert_snippet("{${}}[${}]", false);
+        for ch in ["\\", "a", "l"] {
+            state.type_text(ch);
+        }
+        state.complete_prefix(1..4, "\\alpha");
+        assert_eq!(state.buffer().to_string(), "{\\alpha}[]");
+        assert!(state.next_snippet_slot());
+        assert_eq!(state.selections().primary().head, "{\\alpha}[".len());
     }
 
     #[test]

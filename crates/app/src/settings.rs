@@ -10,6 +10,8 @@ pub struct Settings {
     pub smooth_cursor: bool,
     /// The PDF follows the editor cursor.
     pub auto_scroll_pdf: bool,
+    /// The popup with commands and project names while typing.
+    pub auto_suggestions: bool,
 }
 
 impl Default for Settings {
@@ -18,6 +20,7 @@ impl Default for Settings {
             vim_mode: false,
             smooth_cursor: true,
             auto_scroll_pdf: false,
+            auto_suggestions: true,
         }
     }
 }
@@ -70,7 +73,7 @@ mod tests {
     fn settings_survive_a_restart() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("nested").join("settings.toml");
-        let settings = Settings { vim_mode: true, smooth_cursor: false, auto_scroll_pdf: true };
+        let settings = Settings { vim_mode: true, smooth_cursor: false, auto_scroll_pdf: true, auto_suggestions: false };
         settings.save(&path).unwrap();
         assert_eq!(Settings::load(&path), settings);
     }
@@ -80,6 +83,6 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.toml");
         std::fs::write(&path, "vim_mode = true").unwrap();
-        assert_eq!(Settings::load(&path), Settings { vim_mode: true, smooth_cursor: true, auto_scroll_pdf: false });
+        assert_eq!(Settings::load(&path), Settings { vim_mode: true, smooth_cursor: true, auto_scroll_pdf: false, auto_suggestions: true });
     }
 }

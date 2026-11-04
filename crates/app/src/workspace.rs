@@ -13,6 +13,7 @@ use std::{
 use build::{BuildEvent, BuildManager, BuildOutcome, BuildRequest, Config, Diagnostic, Engine, Severity, Trigger, find_main};
 use addon_api::{ActiveFile, DiagnosticInfo, Reply, Request, SearchHit};
 use editor_core::{
+    Symbol,
     Language, Mark, MarkSeverity,
     snippet::Snippet,
     vim::{self, Effect, Key, Leader, Mode},
@@ -194,6 +195,9 @@ pub struct Workspace {
     active: Option<usize>,
     outline: Vec<OutlineItem>,
     outline_version: (usize, u64),
+    /// The active document and the number of documents when the active view last
+    /// got the names of the others.
+    symbols_version: (usize, usize),
     show_file_panel: bool,
     left_panel: LeftPanel,
     git_panel: Entity<GitPanel>,
@@ -323,6 +327,7 @@ impl Workspace {
             active: None,
             outline: Vec::new(),
             outline_version: (usize::MAX, 0),
+            symbols_version: (usize::MAX, 0),
             show_file_panel: true,
             left_panel: LeftPanel::Files,
             git_panel,
@@ -527,6 +532,7 @@ impl Workspace {
         let view = cx.new(|cx| {
             let mut view = EditorView::new(text, Some(path), cx);
             view.set_vim_mode(settings.vim_mode, settings.smooth_cursor, cx);
+            view.set_auto_suggestions(settings.auto_suggestions, cx);
             view
         });
         let subscription = cx.subscribe(&view, |this, view, event, cx| match event {
@@ -1385,7 +1391,10 @@ impl Workspace {
         }
         let settings = self.settings;
         for document in &self.documents {
-            document.view.update(cx, |view, cx| view.set_vim_mode(settings.vim_mode, settings.smooth_cursor, cx));
+            document.view.update(cx, |view, cx| {
+                view.set_vim_mode(settings.vim_mode, settings.smooth_cursor, cx);
+                view.set_auto_suggestions(settings.auto_suggestions, cx);
+            });
         }
         if !settings.vim_mode && self.tree_focus.is_focused(window) {
             self.focus_active(window, cx);
@@ -1478,7 +1487,10 @@ impl Workspace {
             return;
         };
         if !takes_keys && key != Key::Esc {
-            view.update(cx, |view, _| view.vim_record_insert(key));
+            // `Tab` accepts here, and accepting records its own result.
+            if key != Key::Tab || !view.read(cx).completion_open() {
+                view.update(cx, |view, _| view.vim_record_insert(key));
+            }
             return;
         }
         // `Esc` belongs to the input method while it composes.
@@ -2121,6 +2133,29 @@ impl Workspace {
             }
             self.outline = items;
             self.outline_version = key;
+        }
+    }
+
+    /// Gives the active view what the other open documents define. Those change
+    /// rarely, so this runs on a switch and not on every key.
+    fn sync_project_symbols(&mut self, cx: &mut Context<Self>) {
+        let Some(active) = self.active else {
+            return;
+        };
+        let key = (active, self.documents.len());
+        if key == self.symbols_version {
+            return;
+        }
+        self.symbols_version = key;
+        let symbols: Vec<Symbol> = self
+            .documents
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != active)
+            .flat_map(|(_, document)| document.view.read(cx).symbols().to_vec())
+            .collect();
+        if let Some(document) = self.documents.get(active) {
+            document.view.update(cx, |view, _| view.set_project_symbols(Arc::new(symbols)));
         }
     }
 
@@ -3545,6 +3580,14 @@ impl Workspace {
             )
             .into_any_element(),
             Self::setting_row(
+                "Auto suggestions",
+                "Shows commands and project names while typing a command, environment or reference. Tab accepts.",
+                self.toggle_switch("auto-suggestions", self.settings.auto_suggestions, true, cx, |this, window, cx| {
+                    this.update_settings(|settings| settings.auto_suggestions = !settings.auto_suggestions, window, cx);
+                }),
+            )
+            .into_any_element(),
+            Self::setting_row(
                 "Follow cursor in PDF",
                 "Scrolls the PDF along with the editor cursor. Needs SyncTeX, so LaTeX only.",
                 self.toggle_switch("auto-scroll-pdf-setting", self.settings.auto_scroll_pdf, true, cx, |this, window, cx| {
@@ -4111,6 +4154,7 @@ fn byte_column(text: &str, column: usize) -> usize {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.refresh_outline(cx);
+        self.sync_project_symbols(cx);
         self.settle_addon_dialog(window, cx);
         let addon_dialog = self.dialog_panel(cx).map(|panel| self.render_addon_dialog(panel, cx));
         self.tree_cursor = self.tree_cursor.min(self.entries.len().saturating_sub(1));

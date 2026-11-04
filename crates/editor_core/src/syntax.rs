@@ -92,6 +92,21 @@ pub struct Heading {
     pub line: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SymbolKind {
+    Label,
+    Command,
+    /// A name from `#let` in Typst.
+    Binding,
+}
+
+/// A name that the document defines, for suggestions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Symbol {
+    pub kind: SymbolKind,
+    pub name: String,
+}
+
 /// Finds headings in the parse tree of one grammar.
 #[derive(Clone, Copy)]
 struct HeadingRules {
@@ -184,11 +199,62 @@ fn collect_headings(rules: HeadingRules, tree: &Tree, rope: &Rope) -> Vec<Headin
     }
 }
 
+/// Returns the kind of a defining node and the bytes of its name.
+type SymbolFinder = fn(Node) -> Option<(SymbolKind, Range<usize>)>;
+
+fn latex_symbol(node: Node) -> Option<(SymbolKind, Range<usize>)> {
+    let (kind, field) = match node.kind() {
+        "label_definition" => (SymbolKind::Label, "name"),
+        "new_command_definition" | "old_command_definition" => (SymbolKind::Command, "declaration"),
+        _ => return None,
+    };
+    let name = node.child_by_field_name(field)?;
+    // A name in braces has the name as its one named child.
+    let inner = name.named_child(0).filter(|_| name.named_child_count() == 1).unwrap_or(name);
+    Some((kind, inner.byte_range()))
+}
+
+fn typst_symbol(node: Node) -> Option<(SymbolKind, Range<usize>)> {
+    match node.kind() {
+        "label" => {
+            let range = node.byte_range();
+            Some((SymbolKind::Label, range.start + 1..range.end - 1))
+        }
+        "let" => {
+            let pattern = node.child_by_field_name("pattern")?;
+            // `#let name(args) = ...` has the name as first child of the call.
+            let name = if pattern.kind() == "call" { pattern.named_child(0)? } else { pattern };
+            (name.kind() == "ident").then(|| (SymbolKind::Binding, name.byte_range()))
+        }
+        _ => None,
+    }
+}
+
+fn collect_symbols(find: SymbolFinder, tree: &Tree, rope: &Rope) -> Vec<Symbol> {
+    let mut symbols = Vec::new();
+    let mut cursor = tree.walk();
+    loop {
+        let node = cursor.node();
+        if let Some((kind, name)) = find(node) {
+            symbols.push(Symbol { kind, name: rope.byte_slice(name).to_string() });
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return symbols;
+            }
+        }
+    }
+}
+
 struct LanguageConfig {
     language: TsLanguage,
     query: Query,
     kinds: Vec<Option<HighlightKind>>,
     headings: Option<HeadingRules>,
+    symbols: Option<SymbolFinder>,
     /// Second grammar that parses the ranges of `inline` nodes in Markdown.
     inline: Option<Box<LanguageConfig>>,
 }
@@ -198,6 +264,7 @@ impl LanguageConfig {
         language: TsLanguage,
         source: &str,
         headings: Option<HeadingRules>,
+        symbols: Option<SymbolFinder>,
         inline: Option<Box<LanguageConfig>>,
     ) -> Self {
         let query = Query::new(&language, source).expect("bundled highlight query is valid");
@@ -211,6 +278,7 @@ impl LanguageConfig {
             query,
             kinds,
             headings,
+            symbols,
             inline,
         }
     }
@@ -225,6 +293,7 @@ impl LanguageConfig {
                     codebook_tree_sitter_latex::LANGUAGE.into(),
                     include_str!("../queries/latex.scm"),
                     Some(LATEX_HEADINGS),
+                    Some(latex_symbol),
                     None,
                 )
             })),
@@ -233,6 +302,7 @@ impl LanguageConfig {
                     codebook_tree_sitter_typst::LANGUAGE.into(),
                     include_str!("../queries/typst.scm"),
                     Some(TYPST_HEADINGS),
+                    Some(typst_symbol),
                     None,
                 )
             })),
@@ -241,9 +311,11 @@ impl LanguageConfig {
                     tree_sitter_md::LANGUAGE.into(),
                     tree_sitter_md::HIGHLIGHT_QUERY_BLOCK,
                     Some(MARKDOWN_HEADINGS),
+                    None,
                     Some(Box::new(Self::new(
                         tree_sitter_md::INLINE_LANGUAGE.into(),
                         tree_sitter_md::HIGHLIGHT_QUERY_INLINE,
+                        None,
                         None,
                         None,
                     ))),
@@ -261,6 +333,7 @@ pub struct Syntax {
     tree: Option<Tree>,
     inline_tree: Option<Tree>,
     headings: Vec<Heading>,
+    symbols: Vec<Symbol>,
     applied_results: u64,
     applied_version: u64,
 }
@@ -277,6 +350,7 @@ pub struct ParseResult {
     tree: Option<Tree>,
     inline_tree: Option<Tree>,
     headings: Vec<Heading>,
+    symbols: Vec<Symbol>,
     version: u64,
 }
 
@@ -287,6 +361,7 @@ impl Syntax {
             tree: None,
             inline_tree: None,
             headings: Vec::new(),
+            symbols: Vec::new(),
             applied_results: 0,
             applied_version: 0,
         }
@@ -320,6 +395,7 @@ impl Syntax {
         self.tree = result.tree;
         self.inline_tree = result.inline_tree;
         self.headings = result.headings;
+        self.symbols = result.symbols;
         self.applied_results += 1;
         for edit in edits_since {
             self.edit(edit);
@@ -352,6 +428,11 @@ impl Syntax {
     /// Headings of the last finished parse, so they can lag behind the latest edit.
     pub fn headings(&self) -> &[Heading] {
         &self.headings
+    }
+
+    /// Names that the document defines, as of the last finished parse.
+    pub fn symbols(&self) -> &[Symbol] {
+        &self.symbols
     }
 
     /// Counts finished parses, which tells when `headings` may have changed.
@@ -433,10 +514,16 @@ impl ParseJob {
             _ => Vec::new(),
         };
 
+        let symbols = match (self.config.symbols, &tree) {
+            (Some(find), Some(tree)) => collect_symbols(find, tree, &self.rope),
+            _ => Vec::new(),
+        };
+
         ParseResult {
             tree,
             inline_tree,
             headings,
+            symbols,
             version: self.version,
         }
     }
@@ -526,6 +613,44 @@ mod tests {
         assert!(spans.contains(&("\\caption".into(), HighlightKind::Function)));
         assert!(spans.contains(&("\\textcolor".into(), HighlightKind::Function)));
         assert!(spans.contains(&("\\def".into(), HighlightKind::Keyword)));
+    }
+
+    fn symbols_of(language: Language, text: &str) -> Vec<(SymbolKind, String)> {
+        let rope = Rope::from_str(text);
+        let mut syntax = Syntax::new(language);
+        let result = syntax.parse_job(&rope, 1).unwrap().run();
+        assert!(syntax.apply(result, &[]));
+        syntax.symbols().iter().map(|symbol| (symbol.kind, symbol.name.clone())).collect()
+    }
+
+    #[test]
+    fn latex_symbols_are_labels_and_own_commands() {
+        let symbols = symbols_of(
+            Language::Latex,
+            "\\newcommand{\\foo}{x}\n\\newcommand\\bar{y}\n\\def\\baz{z}\n\\section{A}\\label{sec:a}\n",
+        );
+        assert_eq!(
+            symbols,
+            [
+                (SymbolKind::Command, "\\foo".to_string()),
+                (SymbolKind::Command, "\\bar".to_string()),
+                (SymbolKind::Command, "\\baz".to_string()),
+                (SymbolKind::Label, "sec:a".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn typst_symbols_are_labels_and_bindings() {
+        let symbols = symbols_of(Language::Typst, "#let width = 3\n#let add(a, b) = a + b\n= Intro <intro>\n");
+        assert_eq!(
+            symbols,
+            [
+                (SymbolKind::Binding, "width".to_string()),
+                (SymbolKind::Binding, "add".to_string()),
+                (SymbolKind::Label, "intro".to_string()),
+            ]
+        );
     }
 
     #[test]

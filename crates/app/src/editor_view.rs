@@ -1,20 +1,22 @@
-use std::{ops::Range, path::PathBuf, time::Instant};
+use std::{ops::Range, path::PathBuf, sync::Arc, time::Instant};
 
 use editor_core::{
-    EditorState, HighlightKind, Language, Mark, MarkSeverity, Motion, Selection,
+    EditorState, HighlightKind, Language, Mark, MarkSeverity, Motion, Selection, Symbol,
+    snippet::Snippet,
     vim::{Effect, Input, Key, Mode, Vim},
 };
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
+    AnyElement, App, AvailableSpace, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
     Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, Font, FontStyle, FontWeight,
     GlobalElementId, InspectorElementId, IntoElement, LayoutId, LineFragment, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Render,
-    ScrollEvent, ShapedLine, SharedString, Style, Task, TextAlign, TextRun, UTF16Selection,
+    ScrollEvent, ShapedLine, SharedString, Size, Style, Task, TextAlign, TextRun, UTF16Selection,
     UnderlineStyle, Window, div, fill, font, point, prelude::*, px, relative, size,
 };
 
 use crate::{
     actions::*,
+    completion::{self, Entry},
     smear::{self, Smear},
     theme,
 };
@@ -26,6 +28,16 @@ const TEXT_RIGHT_PADDING: f32 = 8.0;
 /// `scrolloff=8` from the Neovim config.
 const VIM_SCROLL_OFF: f32 = 8.0;
 const FALLBACK_CHAR_WIDTH: f32 = 7.2;
+
+/// The open suggestion popup.
+struct Completion {
+    /// Where the text begins that accepting replaces.
+    start: usize,
+    /// The cursor it was made for. Any other cursor closes the popup.
+    head: usize,
+    items: Vec<Entry>,
+    selected: usize,
+}
 
 pub enum EditorEvent {
     Edited,
@@ -102,6 +114,10 @@ pub struct EditorView {
     smear: Option<Smear>,
     /// Where the cursor was last painted, in document coordinates.
     last_cursor: Option<(f32, f32)>,
+    completion: Option<Completion>,
+    auto_suggestions: bool,
+    /// What the other open documents define.
+    project_symbols: Arc<Vec<Symbol>>,
 }
 
 impl EventEmitter<EditorEvent> for EditorView {}
@@ -135,6 +151,9 @@ impl EditorView {
             plain: false,
             smear: None,
             last_cursor: None,
+            completion: None,
+            auto_suggestions: false,
+            project_symbols: Arc::default(),
         };
         view.schedule_parse(cx);
         view
@@ -218,6 +237,26 @@ impl EditorView {
         self.smooth_cursor = smooth_cursor;
         self.smear = None;
         cx.notify();
+    }
+
+    pub fn set_auto_suggestions(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.auto_suggestions = enabled;
+        if !enabled {
+            self.completion = None;
+        }
+        cx.notify();
+    }
+
+    pub fn set_project_symbols(&mut self, symbols: Arc<Vec<Symbol>>) {
+        self.project_symbols = symbols;
+    }
+
+    pub fn symbols(&self) -> &[Symbol] {
+        self.state.syntax().symbols()
+    }
+
+    pub fn completion_open(&self) -> bool {
+        self.completion.is_some()
     }
 
     /// Whether the vim layer takes every key, as opposed to only `Esc` while inserting.
@@ -347,7 +386,107 @@ impl EditorView {
         }
     }
 
+    /// Looks for suggestions at the cursor, after typing.
+    fn update_completion(&mut self) {
+        self.completion = None;
+        let selections = self.state.selections();
+        let head = selections.primary().head;
+        if !self.auto_suggestions
+            || self.plain
+            || self.marked_range.is_some()
+            || selections.len() != 1
+            || !selections.primary().is_empty()
+        {
+            return;
+        }
+        let buffer = self.state.buffer();
+        let line_start = buffer.line_start(buffer.offset_to_line(head));
+        let before = buffer.slice(line_start..head);
+        let language = self.state.language();
+        let Some(trigger) = completion::trigger(language, &before) else {
+            return;
+        };
+        let symbols = self.state.syntax().symbols().iter().chain(self.project_symbols.iter());
+        let items = completion::suggestions(language, trigger.kind, &before[trigger.start..], symbols);
+        if !items.is_empty() {
+            self.completion = Some(Completion { start: line_start + trigger.start, head, items, selected: 0 });
+        }
+    }
+
+    fn accept_completion(&mut self, cx: &mut Context<Self>) {
+        let Some(completion) = self.completion.take() else {
+            return;
+        };
+        let entry = &completion.items[completion.selected];
+        let prefix = completion.start..completion.head;
+        if let Some(vim) = &mut self.vim {
+            let typed = self.state.buffer().slice(prefix.clone());
+            vim.record_completion(&typed, &Snippet::parse(&entry.template, "").text);
+        }
+        self.state.complete_prefix(prefix, &entry.template);
+        self.changed(cx);
+    }
+
+    fn step_completion(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if let Some(completion) = &mut self.completion {
+            let count = completion.items.len();
+            completion.selected = (completion.selected + if forward { 1 } else { count - 1 }) % count;
+            cx.notify();
+        }
+    }
+
+    fn render_completion(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let completion = self.completion.as_ref()?;
+        let rows = completion.items.iter().enumerate().map(|(index, entry)| {
+            div()
+                .id(index)
+                .flex()
+                .justify_between()
+                .gap(px(24.))
+                .px(px(8.))
+                .py(px(2.))
+                .cursor_pointer()
+                .when(index == completion.selected, |row| row.bg(theme::color(theme::GREEN_DARK)))
+                .hover(|style| style.bg(theme::color(theme::GREEN_DARK)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(completion) = &mut this.completion {
+                        completion.selected = index;
+                    }
+                    this.accept_completion(cx);
+                }))
+                .child(entry.label.clone())
+                .child(div().text_color(theme::color(theme::UI_MUTED)).child(entry.detail.clone()))
+        });
+        Some(
+            div()
+                .id("completion")
+                .occlude()
+                .min_w(px(180.))
+                .py(px(4.))
+                .rounded(px(4.))
+                .font(Self::font(FontStyle::Normal, FontWeight::NORMAL))
+                .text_size(px(theme::CODE_FONT_SIZE))
+                .text_color(theme::color(theme::CODE_TEXT))
+                .bg(theme::color(theme::PANEL))
+                .border_1()
+                .border_color(theme::color(theme::DIVIDER))
+                .shadow_lg()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .children(rows)
+                .into_any_element(),
+        )
+    }
+
+    /// Below the start of the replaced text. Needs the rows of this frame.
+    fn completion_origin(&self, bounds: Bounds<Pixels>, window: &mut Window) -> Option<Point<Pixels>> {
+        let completion = self.completion.as_ref()?;
+        let (row, x) = self.row_and_x(completion.start, window);
+        let y = Self::line_height() * (row + 1) as f32 - self.scroll_y;
+        Some(point(bounds.left() + self.gutter_width() + x, bounds.top() + y))
+    }
+
     fn changed(&mut self, cx: &mut Context<Self>) {
+        self.completion = None;
         self.autoscroll = true;
         self.schedule_parse(cx);
         cx.emit(EditorEvent::Edited);
@@ -711,10 +850,16 @@ macro_rules! motion_actions {
 }
 
 impl Render for EditorView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let head = self.state.selections().primary().head;
+        if self.completion.as_ref().is_some_and(|completion| completion.head != head)
+            || !self.focus_handle.is_focused(window)
+        {
+            self.completion = None;
+        }
         let root = div()
             .id("editor")
-            .key_context("Editor")
+            .key_context(if self.completion.is_some() { "Editor Completion" } else { "Editor" })
             .track_focus(&self.focus_handle)
             .size_full()
             .bg(theme::color(theme::BG))
@@ -766,8 +911,19 @@ impl Render for EditorView {
                 this.selection_changed(cx);
             }))
             .on_action(cx.listener(|this, _: &Backspace, _, cx| {
+                let open = this.completion.is_some();
                 this.state.backspace();
                 this.changed(cx);
+                if open {
+                    this.update_completion();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &AcceptCompletion, _, cx| this.accept_completion(cx)))
+            .on_action(cx.listener(|this, _: &NextCompletion, _, cx| this.step_completion(true, cx)))
+            .on_action(cx.listener(|this, _: &PreviousCompletion, _, cx| this.step_completion(false, cx)))
+            .on_action(cx.listener(|this, _: &CloseCompletion, _, cx| {
+                this.completion = None;
+                cx.notify();
             }))
             .on_action(cx.listener(|this, _: &DeleteForward, _, cx| {
                 this.state.delete_forward();
@@ -827,7 +983,7 @@ impl Render for EditorView {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_scroll(cx.listener(Self::on_scroll))
-            .child(EditorElement { view: cx.entity() })
+            .child(EditorElement { view: cx.entity(), popup: self.render_completion(cx) })
     }
 }
 
@@ -912,6 +1068,7 @@ impl EntityInputHandler for EditorView {
             None => self.state.type_text(new_text),
         }
         self.changed(cx);
+        self.update_completion();
     }
 
     fn replace_and_mark_text_in_range(
@@ -976,6 +1133,7 @@ impl EntityInputHandler for EditorView {
 
 struct EditorElement {
     view: Entity<EditorView>,
+    popup: Option<AnyElement>,
 }
 
 struct PaintedRow {
@@ -1038,7 +1196,20 @@ impl Element for EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) -> EditorPrepaint {
-        self.view.update(cx, |view, _cx| view.prepaint_rows(bounds, window))
+        let prepaint = self.view.update(cx, |view, _cx| view.prepaint_rows(bounds, window));
+        if let Some(mut popup) = self.popup.take()
+            && let Some(mut origin) = self.view.read(cx).completion_origin(bounds, window)
+        {
+            let popup_size = popup.layout_as_root(Size::<AvailableSpace>::default(), window, cx);
+            let viewport = window.viewport_size();
+            // Above the line when there is no room below, and always inside the window.
+            if origin.y + popup_size.height > viewport.height {
+                origin.y -= popup_size.height + EditorView::line_height();
+            }
+            origin.x = origin.x.min(viewport.width - popup_size.width).max(px(0.));
+            window.defer_draw(popup, origin, 1, None);
+        }
+        prepaint
     }
 
     fn paint(
