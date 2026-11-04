@@ -517,6 +517,18 @@ mod tests {
     }
 
     #[test]
+    fn latex_highlights_commands_that_are_grammar_tokens() {
+        let spans = kinds_for(
+            Language::Latex,
+            "\\author{Olli}\n\\caption{x}\n\\textcolor{red}{x}\n\\def\\foo{x}\n",
+        );
+        assert!(spans.contains(&("\\author".into(), HighlightKind::Function)));
+        assert!(spans.contains(&("\\caption".into(), HighlightKind::Function)));
+        assert!(spans.contains(&("\\textcolor".into(), HighlightKind::Function)));
+        assert!(spans.contains(&("\\def".into(), HighlightKind::Keyword)));
+    }
+
+    #[test]
     fn typst_highlights_markup_and_code() {
         let spans = kinds_for(
             Language::Typst,
