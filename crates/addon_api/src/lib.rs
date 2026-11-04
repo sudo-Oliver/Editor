@@ -18,6 +18,7 @@ pub enum Permission {
     Compile,
     Secrets,
     Citations,
+    LookupDoi,
 }
 
 impl Permission {
@@ -28,6 +29,7 @@ impl Permission {
             Self::Compile => "Save and compile",
             Self::Secrets => "Keep secrets in the system keychain",
             Self::Citations => "Offer citations",
+            Self::LookupDoi => "Look up DOIs online",
         }
     }
 }
@@ -106,6 +108,9 @@ pub enum Node {
         id: String,
         #[serde(default)]
         placeholder: String,
+        /// The text of a new input. An id that the editor knows keeps its text.
+        #[serde(default)]
+        value: String,
     },
     /// All options stay visible, as in the settings of the editor.
     Select {
@@ -122,6 +127,8 @@ pub enum Node {
         #[serde(default)]
         indent: u32,
     },
+    /// Text that must not be overlooked.
+    Alert { text: String },
     Divider,
 }
 
@@ -147,6 +154,10 @@ pub enum AddonMessage {
     Request { id: u64, request: Request },
     /// Replaces what this add-on offers in the citation picker.
     SetCitations { entries: Vec<CitationEntry> },
+    /// Shows this view above the editor, or closes it. `Enter` acts like the first
+    /// enabled primary button and `Esc` closes it, which `HostMessage::DialogClosed`
+    /// reports. Needs `Permission::LookupDoi`.
+    SetDialog { view: Option<Node> },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -181,6 +192,9 @@ pub enum Request {
     DiscardEdits,
     GetSecret { key: String },
     SetSecret { key: String, value: String },
+    /// Writes a citation of this key at the cursor, in the form of the document.
+    /// Elsewhere the key goes to the clipboard. The reply says which, as text.
+    InsertCitation { key: String },
 }
 
 impl Request {
@@ -194,6 +208,7 @@ impl Request {
             }
             Self::Compile => Permission::Compile,
             Self::GetSecret { .. } | Self::SetSecret { .. } => Permission::Secrets,
+            Self::InsertCitation { .. } => Permission::Citations,
         }
     }
 }
@@ -250,6 +265,11 @@ pub enum HostMessage {
     Saved { path: String },
     /// The user chose an entry that this add-on offered.
     CitationPicked { key: String },
+    /// The user asked to look up a DOI. `suggestion` is the selection or clipboard
+    /// if it looks like a DOI or arXiv id, else empty.
+    LookupDoi { suggestion: String },
+    /// The user closed the dialog.
+    DialogClosed,
 }
 
 #[cfg(test)]
@@ -301,6 +321,7 @@ mod tests {
     fn requests_name_their_permission() {
         assert_eq!(Request::ListFiles.permission(), Permission::ReadProject);
         assert_eq!(Request::Compile.permission(), Permission::Compile);
+        assert_eq!(Request::InsertCitation { key: "k".to_string() }.permission(), Permission::Citations);
         assert_eq!(Request::GetSecret { key: "k".to_string() }.permission(), Permission::Secrets);
     }
 }
