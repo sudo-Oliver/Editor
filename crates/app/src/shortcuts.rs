@@ -79,6 +79,9 @@ pub fn sections(vim_mode: bool) -> Vec<Section> {
                 rows: plain(&[
                     ("j  k", "Move down and up"),
                     ("l  Enter", "Open"),
+                    ("a", "New file"),
+                    ("A", "New folder"),
+                    ("u", "Add files from elsewhere"),
                     ("h", "Close folder"),
                     ("gg  G", "First and last row"),
                 ]),
