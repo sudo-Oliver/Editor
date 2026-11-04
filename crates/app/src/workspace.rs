@@ -20,7 +20,7 @@ use editor_core::{
 use gpui::{
     AnyElement, Anchor, App, ClickEvent, Context, CursorStyle, Entity, FocusHandle, Focusable, FontWeight, Keystroke,
     KeystrokeEvent, MouseButton, MouseMoveEvent, PathPromptOptions, Pixels, Point, Render, ScrollHandle, SharedString,
-    Subscription, Task, Window, anchored, black, deferred, div, point, prelude::*, px, svg,
+    EntityId, Subscription, Task, Window, anchored, black, deferred, div, point, prelude::*, px, svg,
 };
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use synctex::SyncTex;
@@ -242,6 +242,11 @@ pub struct Workspace {
     dialog: Option<Dialog>,
     dialog_focus: FocusHandle,
     picker: Option<Picker>,
+    /// Where `\cite{` last opened the picker by itself.
+    citation_trigger: Option<(EntityId, usize)>,
+    citation_check_task: Option<Task<()>>,
+    /// The picker needs a window, so the next render opens it.
+    open_citations_soon: bool,
     picker_focus: FocusHandle,
     picker_scroll: ScrollHandle,
     picker_files_task: Option<Task<()>>,
@@ -350,6 +355,9 @@ impl Workspace {
             dialog: None,
             dialog_focus: cx.focus_handle(),
             picker: None,
+            citation_trigger: None,
+            citation_check_task: None,
+            open_citations_soon: false,
             picker_focus: cx.focus_handle(),
             picker_scroll: ScrollHandle::new(),
             picker_files_task: None,
@@ -501,9 +509,10 @@ impl Workspace {
             view.set_vim_mode(settings.vim_mode, settings.smooth_cursor, cx);
             view
         });
-        let subscription = cx.subscribe(&view, |this, _, event, cx| match event {
+        let subscription = cx.subscribe(&view, |this, view, event, cx| match event {
             EditorEvent::Edited => {
                 this.schedule_type_build(cx);
+                this.check_citation_trigger(&view, cx);
                 cx.notify();
             }
             EditorEvent::CursorClicked { line } => {
@@ -1580,6 +1589,7 @@ impl Workspace {
         };
         let scan_root = root.clone();
         let language = self.active_language(cx);
+        let offered = if kind == PickerKind::Citations { self.offered_citations(cx) } else { Vec::new() };
         let repository = self.git_panel.read(cx).repository();
         if kind == PickerKind::Branches && repository.is_none() {
             return;
@@ -1612,7 +1622,11 @@ impl Workspace {
                             PickerKind::Citations => path.extension().is_some_and(|extension| extension == "bib"),
                         })
                         .collect::<Vec<_>>();
-                    let entries = if kind == PickerKind::Citations { picker::read_citations(&files) } else { Vec::new() };
+                    let entries = if kind == PickerKind::Citations {
+                        picker::merge_citations(picker::read_citations(&files), offered)
+                    } else {
+                        Vec::new()
+                    };
                     (files, entries)
                 })
                 .await;
@@ -1714,7 +1728,16 @@ impl Workspace {
                 return;
             }
             PickerKind::Citations => {
-                if let Some(language) = self.active_language(cx) {
+                for entry in &self.addon_panels {
+                    entry.panel.read(cx).notify_citation_picked(&item.label);
+                }
+                if let Some(closing) = self.needs_closing_brace(cx) {
+                    self.insert_snippet(&snippets::citation_key(&item.label, closing), false, cx);
+                    // The next thing to type is the sentence, not another key.
+                    if !closing {
+                        self.with_active(cx, |view, cx| view.step_forward(cx));
+                    }
+                } else if let Some(language) = self.active_language(cx) {
                     self.insert_snippet(&snippets::citation(language, &item.label), false, cx);
                 }
                 return;
@@ -1724,6 +1747,83 @@ impl Workspace {
         if let (Some((line, column)), Some(view)) = (item.position, self.active_view()) {
             view.update(cx, |view, cx| view.go_to_line(line, column, window, cx));
         }
+    }
+
+    fn offered_citations(&self, cx: &App) -> Vec<(String, String)> {
+        self.addon_panels
+            .iter()
+            .flat_map(|entry| entry.panel.read(cx).citations())
+            .map(|entry| (entry.key.clone(), entry.detail.clone()))
+            .collect()
+    }
+
+    /// The text before and after a single cursor, on its line.
+    fn around_cursor(view: &EditorView) -> Option<(usize, String, String)> {
+        let state = &view.state;
+        let primary = state.selections().primary();
+        if state.selections().len() != 1 || !primary.is_empty() {
+            return None;
+        }
+        let head = primary.head;
+        let line = state.buffer().line_text(state.buffer().offset_to_line(head));
+        let column = head - state.buffer().line_start(state.buffer().offset_to_line(head));
+        let (before, after) = line.split_at(column);
+        Some((head, before.to_string(), after.to_string()))
+    }
+
+    /// `Some` when the cursor is right after `\cite{`, with whether a brace is missing.
+    fn needs_closing_brace(&self, cx: &App) -> Option<bool> {
+        if self.active_language(cx) != Some(Language::Latex) {
+            return None;
+        }
+        let view = self.active_view()?;
+        let (_, before, after) = Self::around_cursor(view.read(cx))?;
+        snippets::opens_citation(&before).then(|| !after.starts_with('}'))
+    }
+
+    /// Opens the picker when `\cite{` was typed and there is something to pick.
+    /// Taking the key back with Backspace does not open it again at that place.
+    fn check_citation_trigger(&mut self, view: &Entity<EditorView>, cx: &mut Context<Self>) {
+        if self.picker.is_some() || self.active_view().as_ref() != Some(view) || self.active_language(cx) != Some(Language::Latex) {
+            return;
+        }
+        let Some((head, before, _)) = Self::around_cursor(view.read(cx)) else {
+            return;
+        };
+        let id = view.entity_id();
+        if self.citation_trigger.is_some_and(|(view, offset)| view != id || head < offset) {
+            self.citation_trigger = None;
+        }
+        if !snippets::opens_citation(&before) || self.citation_trigger == Some((id, head)) {
+            return;
+        }
+        self.citation_trigger = Some((id, head));
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        let offered = !self.offered_citations(cx).is_empty();
+        let view = view.clone();
+        self.citation_check_task = Some(cx.spawn(async move |this, cx| {
+            let available = offered
+                || cx
+                    .background_spawn(async move {
+                        let files: Vec<PathBuf> = file_tree::scan(&root, &HashSet::new())
+                            .into_iter()
+                            .filter(|entry| !entry.is_dir && entry.path.extension().is_some_and(|extension| extension == "bib"))
+                            .map(|entry| entry.path)
+                            .collect();
+                        !picker::read_citations(&files).is_empty()
+                    })
+                    .await;
+            this.update(cx, |this, cx| {
+                let unmoved = Self::around_cursor(view.read(cx)).is_some_and(|(now, ..)| now == head);
+                if available && unmoved && this.active_view().as_ref() == Some(&view) {
+                    this.open_citations_soon = true;
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
     }
 
     fn insert_figure(&mut self, path: &Path, cx: &mut Context<Self>) {
@@ -3763,6 +3863,9 @@ impl Render for Workspace {
         // Git runs only while its panel shows.
         let git_visible = show_file_panel && self.left_panel == LeftPanel::Git;
         self.git_panel.update(cx, |panel, cx| panel.set_visible(git_visible, cx));
+        if std::mem::take(&mut self.open_citations_soon) {
+            cx.defer_in(window, |this, window, cx| this.open_picker(PickerKind::Citations, window, cx));
+        }
         for index in 0..self.addon_panels.len() {
             let visible = show_file_panel && self.left_panel == LeftPanel::Addon(index);
             self.addon_panels[index].panel.clone().update(cx, |panel, cx| panel.set_visible(visible, cx));
@@ -3792,6 +3895,11 @@ impl Render for Workspace {
             )
             .on_action(cx.listener(|this, _: &OpenFolder, window, cx| this.prompt_open_folder(window, cx)))
             .on_action(cx.listener(|this, _: &Save, _, cx| this.save_active(cx)))
+            .on_action(cx.listener(|this, _: &InsertCitation, window, cx| {
+                if matches!(this.active_language(cx), Some(Language::Latex | Language::Typst)) {
+                    this.open_picker(PickerKind::Citations, window, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &Recompile, _, cx| this.recompile(cx)))
             .on_action(cx.listener(|this, _: &CloseTab, window, cx| {
                 if this.image_preview.take().is_some() {

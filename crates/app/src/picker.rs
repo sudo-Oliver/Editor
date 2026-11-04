@@ -88,6 +88,18 @@ pub fn read_citations(files: &[PathBuf]) -> Vec<PickerItem> {
     items
 }
 
+/// Adds what add-ons offer to the `.bib` entries. A key in both keeps its place
+/// from the `.bib`, and the richer text of the add-on for searching.
+pub fn merge_citations(mut items: Vec<PickerItem>, offered: Vec<(String, String)>) -> Vec<PickerItem> {
+    for (key, detail) in offered {
+        match items.iter_mut().find(|item| item.label == key) {
+            Some(item) => item.detail = Some(detail),
+            None => items.push(PickerItem { path: PathBuf::new(), label: key, position: None, detail: Some(detail) }),
+        }
+    }
+    items
+}
+
 /// Reads keys and titles line by line, which fits how `.bib` files are written.
 fn parse_bib(text: &str) -> Vec<(String, Option<String>)> {
     let mut entries: Vec<(String, Option<String>)> = Vec::new();
@@ -204,6 +216,16 @@ pub fn search_text(files: &[PathBuf], root: &Path, query: &str, cancel: &AtomicB
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offered_citations_join_the_bib_entries_without_doubles() {
+        let bib = PickerItem { path: PathBuf::from("a.bib"), label: "a".to_string(), position: None, detail: Some("Title".to_string()) };
+        let merged = merge_citations(vec![bib], vec![("a".to_string(), "Ada 2024".to_string()), ("b".to_string(), "Bob".to_string())]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].path, PathBuf::from("a.bib"));
+        assert_eq!(merged[0].detail.as_deref(), Some("Ada 2024"));
+        assert_eq!(merged[1].label, "b");
+    }
 
     #[test]
     fn fuzzy_needs_the_letters_in_order() {

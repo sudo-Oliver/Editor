@@ -328,6 +328,13 @@ impl EditorView {
         self.changed(cx);
     }
 
+    /// Moves the cursor one character on, past a closing brace it stands before.
+    pub fn step_forward(&mut self, cx: &mut Context<Self>) {
+        let head = self.state.selections().primary().head;
+        self.state.set_selections(vec![Selection::cursor(head + 1)]);
+        self.selection_changed(cx);
+    }
+
     pub fn undo_edit(&mut self, cx: &mut Context<Self>) {
         if self.state.undo() {
             self.changed(cx);
