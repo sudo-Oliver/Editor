@@ -67,6 +67,15 @@ to neither the error count nor the badge. The error card shows a primary button 
 the log panel lists all hints in a Packages section, each with its button. With the cursor on a
 hinted line, a strip below the editor says what the underline means and applies the fix on click.
 
+## File tree header
+
+Clicking the header folds the tree, and the outline takes its space. To the right sit four 22 px
+buttons: new file, new folder, add files and close panel. New entries go to the last clicked folder,
+or the folder of the last clicked file, or else the project root. In Vim's tree that is the row under
+the cursor. A name field opens below the header, with `Enter` to create and `Esc` to cancel. Nothing
+gets replaced: an existing name shows an error below the field, and added files with an existing name
+are left out and named in the same place.
+
 ## Suggestion popup
 
 A small list opens below the start of the replaced text, at most 8 rows of name and detail on the

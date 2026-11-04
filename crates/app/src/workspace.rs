@@ -119,6 +119,16 @@ enum SettingsPage {
     Compiler,
 }
 
+/// The name field for a new file or folder at the top of the file tree.
+struct TreeInput {
+    folder: bool,
+    parent: PathBuf,
+    view: Entity<EditorView>,
+    /// Vim keeps working in the tree when the field closes.
+    back_to_tree: bool,
+    _observer: Subscription,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Dialog {
     Settings(SettingsPage),
@@ -276,6 +286,11 @@ pub struct Workspace {
     tree_focus: FocusHandle,
     tree_scroll: ScrollHandle,
     tree_cursor: usize,
+    show_tree: bool,
+    /// The row last clicked, which decides where a new entry goes.
+    tree_target: Option<PathBuf>,
+    tree_input: Option<TreeInput>,
+    tree_error: Option<SharedString>,
     tree_g_pending: bool,
     tree_leader: Option<String>,
     git_branch: Option<String>,
@@ -395,6 +410,10 @@ impl Workspace {
             tree_focus: cx.focus_handle(),
             tree_scroll: ScrollHandle::new(),
             tree_cursor: 0,
+            show_tree: true,
+            tree_target: None,
+            tree_input: None,
+            tree_error: None,
             tree_g_pending: false,
             tree_leader: None,
             git_branch: None,
@@ -417,6 +436,9 @@ impl Workspace {
 
     fn open_root(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         self.entries = file_tree::scan(&root, &self.collapsed);
+        self.tree_target = None;
+        self.tree_input = None;
+        self.tree_error = None;
         self.documents.clear();
         self.active = None;
         self.image_preview = None;
@@ -1593,6 +1615,23 @@ impl Workspace {
             }
             return;
         }
+        if let Some(input) = &self.tree_input
+            && input.view.read(cx).focus_handle(cx).is_focused(window)
+        {
+            match event.keystroke.key.as_str() {
+                "escape" => {
+                    cx.stop_propagation();
+                    self.close_tree_input(window, cx);
+                }
+                "enter" => {
+                    cx.stop_propagation();
+                    self.confirm_tree_input(window, cx);
+                }
+                "tab" => cx.stop_propagation(),
+                _ => {}
+            }
+            return;
+        }
         if !self.settings.vim_mode {
             return;
         }
@@ -1739,6 +1778,7 @@ impl Workspace {
 
     fn focus_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show_file_panel = true;
+        self.show_tree = true;
         self.left_panel = LeftPanel::Files;
         let active = self.active_view().and_then(|view| view.read(cx).path.clone());
         if let Some(index) = active.and_then(|path| self.entries.iter().position(|entry| entry.path == path)) {
@@ -1782,10 +1822,136 @@ impl Workspace {
             Key::Char('G') => self.move_tree_cursor(usize::MAX, cx),
             Key::Char('l') | Key::Enter => self.open_tree_entry(window, cx),
             Key::Char('h') => self.close_tree_folder(cx),
+            Key::Char('a') => self.open_tree_input(false, window, cx),
+            Key::Char('A') => self.open_tree_input(true, window, cx),
+            Key::Char('u') => self.prompt_add_files(window, cx),
             Key::Char(' ') => self.tree_leader = Some(String::new()),
             Key::Tab => self.focus_active(window, cx),
             // `q` does nothing in the nvim-tree config either.
             _ => {}
+        }
+        cx.notify();
+    }
+
+    /// The folder for a new entry: where the tree's cursor is, or the last clicked row.
+    fn creation_folder(&self, window: &Window) -> Option<PathBuf> {
+        let root = self.root.as_ref()?;
+        let selected = if self.tree_focus.is_focused(window) {
+            self.entries.get(self.tree_cursor).map(|entry| entry.path.as_path())
+        } else {
+            self.tree_target.as_deref()
+        };
+        Some(file_tree::creation_folder(selected, root))
+    }
+
+    fn open_tree_input(&mut self, folder: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(parent) = self.creation_folder(window) else {
+            return;
+        };
+        let back_to_tree = self.tree_focus.is_focused(window);
+        let view = cx.new(|cx| {
+            let mut view = EditorView::new("", None, cx);
+            view.set_plain();
+            view
+        });
+        let _observer = cx.observe(&view, |_, _, cx| cx.notify());
+        window.focus(&view.read(cx).focus_handle(cx), cx);
+        self.tree_input = Some(TreeInput { folder, parent, view, back_to_tree, _observer });
+        self.tree_error = None;
+        self.show_tree = true;
+        cx.notify();
+    }
+
+    fn close_tree_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(input) = self.tree_input.take() else {
+            return;
+        };
+        self.tree_error = None;
+        if input.back_to_tree {
+            window.focus(&self.tree_focus, cx);
+        } else {
+            self.focus_active(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Creates the entry and keeps the field open with the reason when that fails.
+    fn confirm_tree_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(input) = &self.tree_input else {
+            return;
+        };
+        let folder = input.folder;
+        let name = input.view.read(cx).state.buffer().to_string();
+        let created = file_tree::new_entry_path(&input.parent, &name).and_then(|path| {
+            if folder { file_tree::create_folder(&path) } else { file_tree::create_file(&path) }.map(|()| path)
+        });
+        match created {
+            Ok(path) => {
+                self.close_tree_input(window, cx);
+                self.reveal_new_entry(&path, cx);
+                if !folder && !is_image(&path) {
+                    self.open_file(path, window, cx);
+                }
+            }
+            Err(error) => {
+                self.tree_error = Some(error.into());
+                cx.notify();
+            }
+        }
+    }
+
+    /// Opens the folders down to a new entry and selects it.
+    fn reveal_new_entry(&mut self, path: &Path, cx: &mut Context<Self>) {
+        for ancestor in path.ancestors() {
+            self.collapsed.remove(ancestor);
+        }
+        self.refresh_from_disk(cx);
+        if let Some(index) = self.entries.iter().position(|entry| entry.path == path) {
+            self.tree_cursor = index;
+            self.tree_scroll.scroll_to_item(index);
+        }
+        self.tree_target = Some(path.to_path_buf());
+    }
+
+    /// Copies files from elsewhere into the project. Files with a name that the
+    /// folder already has stay out, so that nothing gets replaced.
+    fn prompt_add_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(folder) = self.creation_folder(window) else {
+            return;
+        };
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Add".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(sources))) = paths.await else {
+                return;
+            };
+            let target = folder.clone();
+            let report = cx.background_spawn(async move { file_tree::copy_into(&target, &sources) }).await;
+            this.update(cx, |this, cx| {
+                this.reveal_new_entry(&folder, cx);
+                let mut problems = report.failed;
+                if !report.existing.is_empty() {
+                    problems.push(format!("Already there, not copied: {}", report.existing.join(", ")));
+                }
+                this.tree_error = (!problems.is_empty()).then(|| problems.join("\n").into());
+                if report.copied > 0 {
+                    let files = if report.copied == 1 { "file" } else { "files" };
+                    this.set_status(format!("Added {} {files}", report.copied), cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn close_file_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_file_panel = false;
+        if self.tree_focus.is_focused(window) {
+            self.focus_active(window, cx);
         }
         cx.notify();
     }
@@ -2692,6 +2858,7 @@ impl Workspace {
                         style.border_1().border_color(theme::color(theme::CARET))
                     })
                     .on_click(cx.listener(move |this, _, window, cx| {
+                        this.tree_target = Some(path.clone());
                         if is_dir {
                             if !this.collapsed.remove(&path) {
                                 this.collapsed.insert(path.clone());
@@ -2779,7 +2946,7 @@ impl Workspace {
         title: &'static str,
         open: bool,
         cx: &mut Context<Self>,
-        toggle: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+        toggle: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> gpui::Stateful<gpui::Div> {
         div()
             .id(id)
@@ -2791,8 +2958,8 @@ impl Workspace {
             .px(px(10.))
             .font_weight(FontWeight::SEMIBOLD)
             .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| {
-                toggle(this, cx);
+            .on_click(cx.listener(move |this, _, window, cx| {
+                toggle(this, window, cx);
                 cx.notify();
             }))
             .child(Self::icon(
@@ -2800,32 +2967,141 @@ impl Workspace {
                 12.,
                 theme::UI_TEXT,
             ))
-            .child(title)
+            .child(div().flex_1().min_w_0().truncate().child(title))
+    }
+
+    /// A button in a panel header, where a click must not also fold the panel.
+    fn header_button(
+        &self,
+        id: &'static str,
+        name: &'static str,
+        cx: &mut Context<Self>,
+        handler: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .size(px(22.))
+            .rounded(px(4.))
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::color(theme::DIVIDER)))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                handler(this, window, cx);
+            }))
+            .child(Self::icon(name, 14., theme::UI_TEXT))
+    }
+
+    fn render_tree_input(&self, input: &TreeInput, cx: &mut Context<Self>) -> impl IntoElement {
+        let kind = if input.folder { "New folder" } else { "New file" };
+        let label = match input.parent.strip_prefix(self.root.as_deref().unwrap_or(Path::new(""))) {
+            Ok(relative) if !relative.as_os_str().is_empty() => format!("{kind} in {}", relative.display()),
+            _ => kind.to_string(),
+        };
+        div()
+            .flex()
+            .flex_none()
+            .flex_col()
+            .gap(px(4.))
+            .px(px(10.))
+            .pb(px(6.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .text_color(theme::color(theme::UI_MUTED))
+                    .child(div().flex_1().min_w_0().truncate().child(label))
+                    .child(self.header_button("tree-input-cancel", "close", cx, |this, window, cx| {
+                        this.close_tree_input(window, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .h(px(26.))
+                    .px(px(6.))
+                    .rounded(px(4.))
+                    .overflow_hidden()
+                    .bg(theme::color(theme::BG))
+                    .border_1()
+                    .border_color(theme::color(theme::DIVIDER))
+                    .child(input.view.clone()),
+            )
     }
 
     fn render_file_panel(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let show_outline = self.show_outline;
+        let show_tree = self.show_tree;
+        let has_project = self.root.is_some();
         div()
             .flex()
             .flex_none()
             .flex_col()
             .w(self.file_panel_width)
             .h_full()
-            .child(self.panel_header("tree-header", "File tree", true, cx, |_, _| {}))
-            .child(self.render_file_tree(window, cx))
-            .child(self.divider_horizontal(cx))
+            .child(
+                self.panel_header("tree-header", "File tree", show_tree, cx, |this, window, cx| {
+                    this.show_tree = !this.show_tree;
+                    if !this.show_tree && this.tree_focus.is_focused(window) {
+                        this.focus_active(window, cx);
+                    }
+                })
+                .overflow_hidden()
+                .pr(px(4.))
+                .when(has_project, |header| {
+                    header
+                        .child(self.header_button("tree-new-file", "file-plus", cx, |this, window, cx| {
+                            this.open_tree_input(false, window, cx);
+                        }))
+                        .child(self.header_button("tree-new-folder", "folder-plus", cx, |this, window, cx| {
+                            this.open_tree_input(true, window, cx);
+                        }))
+                        .child(self.header_button("tree-add-files", "upload", cx, |this, window, cx| {
+                            this.prompt_add_files(window, cx);
+                        }))
+                })
+                .child(self.header_button("tree-close", "close", cx, |this, window, cx| {
+                    this.close_file_panel(window, cx);
+                })),
+            )
+            .when(show_tree, |panel| {
+                panel
+                    .when_some(self.tree_input.as_ref(), |panel, input| panel.child(self.render_tree_input(input, cx)))
+                    .when_some(self.tree_error.clone(), |panel, error| {
+                        panel.child(
+                            div()
+                                .id("tree-error")
+                                .flex_none()
+                                .px(px(10.))
+                                .pb(px(6.))
+                                .cursor_pointer()
+                                .text_color(theme::color(theme::ERROR))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.tree_error = None;
+                                    cx.notify();
+                                }))
+                                .child(error),
+                        )
+                    })
+                    .child(self.render_file_tree(window, cx))
+                    .child(self.divider_horizontal(cx))
+            })
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .flex_none()
-                    .when(show_outline, |style| style.h(self.outline_height))
+                    .when(show_outline && show_tree, |style| style.h(self.outline_height))
+                    .when(show_outline && !show_tree, |style| style.flex_1().min_h_0())
                     .child(self.panel_header(
                         "outline-header",
                         "File outline",
                         show_outline,
                         cx,
-                        |this, _| this.show_outline = !this.show_outline,
+                        |this, _, _| this.show_outline = !this.show_outline,
                     ))
                     .when(show_outline, |element| element.child(self.render_outline(cx))),
             )

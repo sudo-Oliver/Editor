@@ -72,6 +72,10 @@ The buttons insert code in the language of the open file, LaTeX or Typst.
 
 After an insert, `Tab` moves to the next empty field. `Esc` or moving the cursor away ends this. In Vim mode, a button click switches to Insert mode.
 
+### Files
+
+The buttons in the file tree's header make a new file or folder, add files from elsewhere and close the panel. New entries go to the last clicked folder, or the folder of the last clicked file. Nothing gets replaced: a name that exists shows an error, and added files with such a name are left out. Clicking the header folds the tree, so that the outline gets its space.
+
 ### Packages
 
 LaTeX errors about a missing package get a button that adds `\\usepackage` to the preamble of the main file. After each build, the editor also looks through the whole project:
@@ -132,7 +136,7 @@ Vim mode is off by default. Turn it on with Settings, Editor, Keybindings. It ap
 
 - Modes: Normal, Insert, Visual, Visual Line and Command, shown in a status bar.
 - `Space w` saves, `Space x` closes the tab, `Space f` finds a file and `Space g` finds text in the project.
-- `Tab` moves between editor and file tree. In the tree, `j` and `k` move, `l` or `Enter` opens and `h` closes a folder.
+- `Tab` moves between editor and file tree. In the tree, `j` and `k` move, `l` or `Enter` opens and `h` closes a folder. `a` makes a new file, `A` a new folder and `u` adds files from elsewhere.
 - `]d` and `[d` jump between errors. `H` and `L` switch tabs.
 
 The question mark lists all keys while the mode is on. `/` searches literal text and ignores case unless the query has an uppercase letter. `Space g` reads files from disk, so unsaved edits do not count.
