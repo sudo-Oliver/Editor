@@ -5,39 +5,22 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::parse::Diagnostic;
+use crate::{
+    packages::{Fix, closest_package, package_for_command, package_for_environment},
+    parse::Diagnostic,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Explanation {
     pub title: String,
     pub hint: String,
+    /// What one click can do about it.
+    pub fix: Option<Fix>,
 }
 
 fn found(title: impl Into<String>, hint: impl Into<String>) -> Option<Explanation> {
-    Some(Explanation { title: title.into(), hint: hint.into() })
+    Some(Explanation { title: title.into(), hint: hint.into(), fix: None })
 }
-
-/// Commands that need a package, with the package that defines them.
-const PACKAGES: &[(&str, &str)] = &[
-    ("\\includegraphics", "graphicx"),
-    ("\\mathbb", "amssymb"),
-    ("\\mathfrak", "amssymb"),
-    ("\\text", "amsmath"),
-    ("\\eqref", "amsmath"),
-    ("\\href", "hyperref"),
-    ("\\url", "hyperref"),
-    ("\\textcolor", "xcolor"),
-    ("\\color", "xcolor"),
-    ("\\toprule", "booktabs"),
-    ("\\midrule", "booktabs"),
-    ("\\bottomrule", "booktabs"),
-    ("\\SI", "siunitx"),
-    ("\\si", "siunitx"),
-    ("\\cref", "cleveref"),
-    ("\\lstinline", "listings"),
-    ("\\tikz", "tikz"),
-    ("\\multirow", "multirow"),
-];
 
 /// Common commands used to spot typing mistakes.
 const COMMON_COMMANDS: &[&str] = &[
@@ -50,7 +33,7 @@ const COMMON_COMMANDS: &[&str] = &[
     "\\newpage", "\\hline", "\\bibliography", "\\bibliographystyle",
 ];
 
-fn edit_distance(left: &str, right: &str) -> usize {
+pub(crate) fn edit_distance(left: &str, right: &str) -> usize {
     let right: Vec<char> = right.chars().collect();
     let mut row: Vec<usize> = (0..=right.len()).collect();
     for (i, a) in left.chars().enumerate() {
@@ -107,6 +90,14 @@ fn explain_tool(message: &str) -> Option<Explanation> {
     )
 }
 
+fn needs_package(title: String, item: &str, package: &str) -> Option<Explanation> {
+    Some(Explanation {
+        title,
+        hint: format!("{item} needs a package. Add \\usepackage{{{package}}} before \\begin{{document}}."),
+        fix: Some(Fix::AddPackage(package.to_string())),
+    })
+}
+
 fn undefined_command(command: Option<&str>) -> Option<Explanation> {
     let Some(command) = command else {
         return found(
@@ -115,8 +106,8 @@ fn undefined_command(command: Option<&str>) -> Option<Explanation> {
         );
     };
     let title = format!("LaTeX does not know the command {command}");
-    if let Some((_, package)) = PACKAGES.iter().find(|(known, _)| *known == command) {
-        return found(title, format!("{command} needs a package. Add \\usepackage{{{package}}} before \\begin{{document}}."));
+    if let Some(package) = package_for_command(command) {
+        return needs_package(title, command, package);
     }
     if let Some(known) = closest_command(command) {
         return found(title, format!("Did you mean {known}? Check the spelling."));
@@ -209,8 +200,12 @@ fn explain_latex_error(error: &str) -> Option<Explanation> {
         return missing_file(quoted(error)?);
     }
     if let Some(name) = between(error, "Environment ", " undefined") {
+        let title = format!("LaTeX does not know the environment {name}");
+        if let Some(package) = package_for_environment(name) {
+            return needs_package(title, name, package);
+        }
         return found(
-            format!("LaTeX does not know the environment {name}"),
+            title,
             "Check the spelling. If it comes from a package, add \\usepackage{…} before \\begin{document}.",
         );
     }
@@ -249,6 +244,9 @@ fn explain_latex_error(error: &str) -> Option<Explanation> {
 
 fn missing_file(name: &str) -> Option<Explanation> {
     if let Some(package) = name.strip_suffix(".sty") {
+        if let Some(closest) = closest_package(package) {
+            return found(format!("The package {package} is not installed"), format!("Did you mean {closest}? Check the name in \\usepackage."));
+        }
         return found(
             format!("The package {package} is not installed"),
             "Check the name in \\usepackage. If the name is right, install the package with your TeX distribution.",
@@ -427,6 +425,27 @@ mod tests {
         let explained = explain(&with_context("Undefined control sequence.", "$\\mathbb")).unwrap();
         assert!(explained.title.contains("\\mathbb"));
         assert!(explained.hint.contains("\\usepackage{amssymb}"));
+        assert_eq!(explained.fix, Some(Fix::AddPackage("amssymb".to_string())));
+    }
+
+    #[test]
+    fn undefined_environment_suggests_the_package() {
+        let diagnostic = Diagnostic { message: "LaTeX Error: Environment align undefined.".into(), ..Default::default() };
+        let explained = explain(&diagnostic).unwrap();
+        assert!(explained.title.contains("align"), "{explained:?}");
+        assert_eq!(explained.fix, Some(Fix::AddPackage("amsmath".to_string())));
+    }
+
+    #[test]
+    fn unknown_environment_has_no_fix() {
+        let diagnostic = Diagnostic { message: "LaTeX Error: Environment foobar undefined.".into(), ..Default::default() };
+        assert_eq!(explain(&diagnostic).unwrap().fix, None);
+    }
+
+    #[test]
+    fn a_mistyped_package_gets_the_closest_name() {
+        let diagnostic = Diagnostic { message: "LaTeX Error: File `amsmth.sty' not found.".into(), ..Default::default() };
+        assert!(explain(&diagnostic).unwrap().hint.contains("Did you mean amsmath?"));
     }
 
     #[test]

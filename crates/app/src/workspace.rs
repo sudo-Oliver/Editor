@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use build::{BuildEvent, BuildManager, BuildOutcome, BuildRequest, Config, Diagnostic, Engine, Severity, Trigger, find_main};
+use build::{BuildEvent, BuildManager, BuildOutcome, BuildRequest, Config, Diagnostic, Engine, Fix, Severity, Trigger, find_main};
 use addon_api::{ActiveFile, DiagnosticInfo, Reply, Request, SearchHit};
 use editor_core::{
     Symbol,
@@ -38,6 +38,7 @@ use crate::{
     image_view::{ImageView, ImageViewEvent, include_snippet, is_image, relative_path},
     pdf_view::{PdfView, PdfViewEvent, ZOOM_STEP},
     picker::{self, Picker, PickerKind},
+    package_check::{self, PackageHint},
     problems::{self, Problem},
     settings::{self, Settings},
     shortcuts,
@@ -62,6 +63,7 @@ const OUTLINE_CHEVRON: f32 = 16.0;
 const FOLLOW_DEBOUNCE: Duration = Duration::from_millis(150);
 /// Oldest output is dropped beyond this size.
 const MAX_LOG_BYTES: usize = 2 << 20;
+const PACKAGE_CHECK_FILE_LIMIT: u64 = 4 << 20;
 const MAX_LOG_LINES_SHOWN: usize = 2000;
 const MAX_DIAGNOSTICS_SHOWN: usize = 200;
 /// Beyond this many errors the later ones are echoes of the first, and marking
@@ -198,6 +200,8 @@ pub struct Workspace {
     /// The active document and the number of documents when the active view last
     /// got the names of the others.
     symbols_version: (usize, usize),
+    package_hints: Vec<PackageHint>,
+    package_check_task: Option<Task<()>>,
     show_file_panel: bool,
     left_panel: LeftPanel,
     git_panel: Entity<GitPanel>,
@@ -328,6 +332,8 @@ impl Workspace {
             outline: Vec::new(),
             outline_version: (usize::MAX, 0),
             symbols_version: (usize::MAX, 0),
+            package_hints: Vec::new(),
+            package_check_task: None,
             show_file_panel: true,
             left_panel: LeftPanel::Files,
             git_panel,
@@ -1168,6 +1174,7 @@ impl Workspace {
         self.error_cursor = None;
         self.error_card_dismissed = false;
         self.apply_marks(cx);
+        self.check_packages(cx);
         let (success, diagnostics) = (outcome.success, self.diagnostic_infos());
         self.reply_to_compile_waiters(|| Ok(Reply::Compiled { success, diagnostics: diagnostics.clone() }), cx);
         let same_document = self.pdf_main == self.last_main;
@@ -1212,6 +1219,139 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Looks for missing and unused packages in the whole project, off the main
+    /// thread. A result is dropped when a document has changed in the meantime,
+    /// because the next build brings a new one.
+    fn check_packages(&mut self, cx: &mut Context<Self>) {
+        let (Some(root), Some(main)) = (self.root.clone(), self.last_main.clone()) else {
+            return;
+        };
+        if !self.settings.package_hints || Language::from_path(&main) != Language::Latex {
+            self.package_check_task = None;
+            self.show_package_hints(Vec::new(), cx);
+            return;
+        }
+        let open: Vec<(PathBuf, String, u64)> = self
+            .documents
+            .iter()
+            .filter_map(|document| {
+                let view = document.view.read(cx);
+                Some((view.path.clone()?, view.state.buffer().to_string(), view.state.version()))
+            })
+            .collect();
+        self.package_check_task = Some(cx.spawn(async move |this, cx| {
+            let versions: Vec<(PathBuf, u64)> = open.iter().map(|(path, _, version)| (path.clone(), *version)).collect();
+            let hints = cx
+                .background_spawn(async move {
+                    let mut sources: Vec<(PathBuf, String)> = Vec::new();
+                    let mut has_own_style_files = false;
+                    for entry in file_tree::scan(&root, &HashSet::new()) {
+                        let extension = entry.path.extension().and_then(|extension| extension.to_str());
+                        has_own_style_files |= !entry.is_dir && matches!(extension, Some("sty" | "cls"));
+                        if entry.is_dir || !matches!(extension, Some("tex" | "latex")) {
+                            continue;
+                        }
+                        if let Some((_, text, _)) = open.iter().find(|(path, ..)| *path == entry.path) {
+                            sources.push((entry.path, text.clone()));
+                        } else if std::fs::metadata(&entry.path).is_ok_and(|metadata| metadata.len() <= PACKAGE_CHECK_FILE_LIMIT)
+                            && let Ok(text) = std::fs::read_to_string(&entry.path)
+                        {
+                            sources.push((entry.path, text));
+                        }
+                    }
+                    package_check::hints(&main, &sources, has_own_style_files)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                let unchanged = versions.iter().all(|(path, version)| {
+                    this.documents.iter().all(|document| {
+                        let view = document.view.read(cx);
+                        view.path.as_ref() != Some(path) || view.state.version() == *version
+                    })
+                });
+                if unchanged {
+                    this.show_package_hints(hints, cx);
+                }
+            })
+            .ok();
+        }));
+    }
+
+    fn show_package_hints(&mut self, hints: Vec<PackageHint>, cx: &mut Context<Self>) {
+        for document in &self.documents {
+            document.view.update(cx, |view, cx| {
+                let marks = hints
+                    .iter()
+                    .filter(|hint| view.path.as_deref() == Some(hint.path.as_path()))
+                    .map(|hint| Mark { range: hint.range.clone(), severity: MarkSeverity::Hint, message: hint.message.clone() })
+                    .collect();
+                view.set_hint_marks(marks, cx);
+            });
+        }
+        self.package_hints = hints;
+        cx.notify();
+    }
+
+    /// Makes the edit of `fix`, with undo. A new package goes to the main file, and
+    /// a removal to the file that loads the package.
+    fn apply_fix(&mut self, fix: &Fix, path: Option<&Path>, cx: &mut Context<Self>) {
+        let Some(path) = path.map(Path::to_path_buf).or_else(|| self.last_main.clone()) else {
+            return;
+        };
+        if !self.documents.iter().any(|document| document.view.read(cx).path.as_deref() == Some(path.as_path())) {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                return self.set_status(format!("Cannot read {}.", path.display()), cx);
+            };
+            self.add_document(path.clone(), &text, cx);
+        }
+        let Some(view) = self.documents.iter().map(|document| document.view.clone()).find(|view| view.read(cx).path.as_deref() == Some(path.as_path())) else {
+            return;
+        };
+        let text = view.read(cx).state.buffer().to_string();
+        let Some((range, new_text)) = package_check::edit_for(fix, &text) else {
+            return self.set_status(format!("Cannot apply this: {}.", fix.label()), cx);
+        };
+        view.update(cx, |view, cx| view.edit_from_outside(range, &new_text, cx));
+        // The hint is done, and the next build checks again.
+        let mut hints = std::mem::take(&mut self.package_hints);
+        hints.retain(|hint| hint.fix != *fix);
+        self.show_package_hints(hints, cx);
+        let done = match fix {
+            Fix::AddPackage(package) => format!("Added {package}"),
+            Fix::RemovePackage(package) => format!("Removed {package}"),
+        };
+        self.set_status(done, cx);
+    }
+
+    /// The package hint on the line of the cursor.
+    fn cursor_hint(&self, cx: &App) -> Option<&PackageHint> {
+        let view = self.active_view()?;
+        let view = view.read(cx);
+        let message = view.hint_at_cursor()?;
+        self.package_hints.iter().find(|hint| hint.message == message && view.path.as_ref() == Some(&hint.path))
+    }
+
+    /// Applies the package fix on the line of the cursor.
+    fn quick_fix(&mut self, cx: &mut Context<Self>) {
+        let Some(view) = self.active_view() else {
+            return;
+        };
+        let hint = self.cursor_hint(cx).cloned();
+        let view = view.read(cx);
+        let path = view.path.clone();
+        let (line, _) = view.cursor_position();
+        let fix = hint.map(|hint| (hint.fix, Some(hint.path))).or_else(|| {
+            self.diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.line == Some(line) && diagnostic.file == path)
+                .find_map(|diagnostic| Some((build::explain(diagnostic)?.fix?, None)))
+        });
+        match fix {
+            Some((fix, path)) => self.apply_fix(&fix, path.as_deref(), cx),
+            None => self.set_status("No package fix on this line.", cx),
+        }
+    }
+
     /// Turns diagnostics into squiggles in the open documents.
     fn apply_marks(&mut self, cx: &mut Context<Self>) {
         let errors = self.error_count();
@@ -1222,7 +1362,9 @@ impl Workspace {
                 };
                 let buffer = view.state.buffer();
                 let shown = if errors > MAX_ERRORS_MARKED { 1 } else { self.diagnostics.len() };
-                let marks = self
+                // The editor's own marks follow edits and get replaced by the next check.
+                let hints: Vec<Mark> = view.state.marks().iter().filter(|mark| mark.severity == MarkSeverity::Hint).cloned().collect();
+                let compiler_marks: Vec<Mark> = self
                     .diagnostics
                     .iter()
                     .take(shown)
@@ -1261,7 +1403,8 @@ impl Workspace {
                         })
                     })
                     .collect();
-                view.set_marks(marks, cx);
+                // Hints come first, so that a compiler error on the same text draws on top.
+                view.set_marks(hints.into_iter().chain(compiler_marks).collect(), cx);
             });
         }
     }
@@ -1544,6 +1687,7 @@ impl Workspace {
             Effect::FindFiles => self.open_picker(PickerKind::Files, window, cx),
             Effect::FindText => self.open_picker(PickerKind::Text, window, cx),
             Effect::LookupDoi => self.lookup_doi(cx),
+            Effect::QuickFix => self.quick_fix(cx),
             Effect::ShowError => {
                 if self.problems.is_empty() {
                     self.set_status("No errors.", cx);
@@ -3026,7 +3170,26 @@ impl Workspace {
             .child(self.render_tabs(cx))
             .child(self.render_toolbar(cx))
             .child(div().flex_1().min_h_0().child(body))
+            .when_some(self.cursor_hint(cx).cloned(), |element, hint| element.child(self.render_hint_strip(&hint, cx)))
             .when(self.error_count() > 0, |element| element.child(self.render_error_strip(cx)))
+    }
+
+    /// Says what the quiet underline on the cursor's line means.
+    fn render_hint_strip(&self, hint: &PackageHint, cx: &mut Context<Self>) -> impl IntoElement {
+        let (fix, path) = (hint.fix.clone(), hint.path.clone());
+        div()
+            .id("hint-strip")
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(8.))
+            .h(px(28.))
+            .px(px(10.))
+            .bg(theme::color(theme::DIVIDER))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| this.apply_fix(&fix, Some(&path), cx)))
+            .child(div().flex_1().min_w_0().truncate().child(hint.message.clone()))
+            .child(div().flex_none().font_weight(FontWeight::SEMIBOLD).child(hint.fix.label()))
     }
 
     /// Stays below the editor, so the error is visible while fixing it.
@@ -3282,6 +3445,9 @@ impl Workspace {
                     .flex()
                     .flex_wrap()
                     .gap(px(6.))
+                    .when_some(problem.fix.clone(), |element, fix| {
+                        element.child(self.panel_button("apply-fix", fix.label(), true, cx, move |this, _, cx| this.apply_fix(&fix, None, cx)))
+                    })
                     .when(problem.location.is_some(), |element| {
                         element.child(self.panel_button("go-to-error", "Go to line", true, cx, |this, window, cx| {
                             this.go_to_diagnostic(0, window, cx);
@@ -3429,6 +3595,34 @@ impl Workspace {
                         .text_color(theme::color(theme::UI_MUTED))
                         .child(format!("{} more are not shown.", self.diagnostics.len() - MAX_DIAGNOSTICS_SHOWN)),
                 )
+            })
+            .when(!self.package_hints.is_empty(), |element| {
+                element
+                    .child(div().mt(px(10.)).mb(px(4.)).font_weight(FontWeight::SEMIBOLD).child("Packages"))
+                    .children(self.package_hints.iter().enumerate().map(|(index, hint)| {
+                        let (fix, path) = (hint.fix.clone(), hint.path.clone());
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(6.))
+                            .mb(px(4.))
+                            .child(hint.message.clone())
+                            .child(
+                                div()
+                                    .id(("package-fix", index))
+                                    .flex_none()
+                                    .px(px(10.))
+                                    .py(px(4.))
+                                    .rounded(px(4.))
+                                    .cursor_pointer()
+                                    .bg(theme::color(theme::DIVIDER))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .on_click(cx.listener(move |this, _, _, cx| this.apply_fix(&fix, Some(&path), cx)))
+                                    .child(hint.fix.label()),
+                            )
+                    }))
             })
             .child(div().mt(px(8.)).child(self.panel_button(
                 "raw-log",
@@ -3584,6 +3778,15 @@ impl Workspace {
                 "Shows commands and project names while typing a command, environment or reference. Tab accepts.",
                 self.toggle_switch("auto-suggestions", self.settings.auto_suggestions, true, cx, |this, window, cx| {
                     this.update_settings(|settings| settings.auto_suggestions = !settings.auto_suggestions, window, cx);
+                }),
+            )
+            .into_any_element(),
+            Self::setting_row(
+                "Package hints",
+                "Underlines LaTeX packages that are missing or seem unused. Fix them from the log panel or with the shortcut.",
+                self.toggle_switch("package-hints", self.settings.package_hints, true, cx, |this, window, cx| {
+                    this.update_settings(|settings| settings.package_hints = !settings.package_hints, window, cx);
+                    this.check_packages(cx);
                 }),
             )
             .into_any_element(),
@@ -4200,6 +4403,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &OpenFolder, window, cx| this.prompt_open_folder(window, cx)))
             .on_action(cx.listener(|this, _: &Save, _, cx| this.save_active(cx)))
             .on_action(cx.listener(|this, _: &LookupDoi, _, cx| this.lookup_doi(cx)))
+            .on_action(cx.listener(|this, _: &QuickFix, _, cx| this.quick_fix(cx)))
             .on_action(cx.listener(|this, _: &InsertCitation, window, cx| {
                 if matches!(this.active_language(cx), Some(Language::Latex | Language::Typst)) && this.dialog_panel(cx).is_none() {
                     this.open_picker(PickerKind::Citations, window, cx);

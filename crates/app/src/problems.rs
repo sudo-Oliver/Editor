@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use build::{Diagnostic, Severity};
+use build::{Diagnostic, Fix, Severity};
 
 /// Characters of source shown around the error.
 const EXCERPT_WIDTH: usize = 56;
@@ -23,6 +23,7 @@ pub struct Problem {
     pub excerpt: Vec<ExcerptLine>,
     /// Characters before the marker and the marker's width, within the target line.
     pub marker: Option<(usize, usize)>,
+    pub fix: Option<Fix>,
 }
 
 /// Errors come first, in the order the compiler found them. Only the first
@@ -38,6 +39,7 @@ pub fn problems(diagnostics: &[Diagnostic]) -> Vec<Problem> {
                 .flatten()
                 .collect::<Vec<_>>()
                 .join("\n");
+            let fix = explanation.as_ref().and_then(|explanation| explanation.fix.clone());
             let mut problem = Problem {
                 compiler_message: explanation.as_ref().map(|_| diagnostic.message.clone()),
                 title: explanation.map_or_else(|| diagnostic.message.clone(), |explanation| explanation.title),
@@ -45,6 +47,7 @@ pub fn problems(diagnostics: &[Diagnostic]) -> Vec<Problem> {
                 location: location(diagnostic),
                 excerpt: Vec::new(),
                 marker: None,
+                fix,
             };
             if index == 0
                 && diagnostic.severity == Severity::Error

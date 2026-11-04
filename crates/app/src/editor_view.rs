@@ -239,6 +239,25 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Replaces the editor's own marks. Compiler marks stay.
+    pub fn set_hint_marks(&mut self, hints: Vec<Mark>, cx: &mut Context<Self>) {
+        // Hints come first, so that a compiler error on the same text draws on top.
+        let mut marks = hints;
+        marks.extend(self.state.marks().iter().filter(|mark| mark.severity != MarkSeverity::Hint).cloned());
+        self.set_marks(marks, cx);
+    }
+
+    /// The message of an editor mark on the line of the cursor.
+    pub fn hint_at_cursor(&self) -> Option<String> {
+        let buffer = self.state.buffer();
+        let line = buffer.offset_to_line(self.state.selections().primary().head);
+        self.state
+            .marks()
+            .iter()
+            .find(|mark| mark.severity == MarkSeverity::Hint && buffer.offset_to_line(mark.range.start) == line)
+            .map(|mark| mark.message.clone())
+    }
+
     pub fn set_auto_suggestions(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.auto_suggestions = enabled;
         if !enabled {
@@ -1489,6 +1508,7 @@ impl EditorView {
                     let color = match mark.severity {
                         MarkSeverity::Error => theme::ERROR,
                         MarkSeverity::Warning => theme::WARNING,
+                        MarkSeverity::Hint => theme::UI_MUTED,
                     };
                     squiggles.push((point(text_left + left, baseline), right - left, color));
                 }
