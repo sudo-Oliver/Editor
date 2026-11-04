@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 
 const MANIFEST: &str = "addon.toml";
 /// Marks an add-on as turned on. New ones start turned off.
-const ENABLED_MARKER: &str = ".enabled";
+pub const ENABLED_MARKER: &str = ".enabled";
 /// How long a program gets to exit by itself after its stdin closes.
 const EXIT_GRACE: Duration = Duration::from_millis(500);
 const MAX_READ_BYTES: u64 = 8 << 20;
@@ -84,11 +84,15 @@ pub fn load_all(directory: &Path) -> (Vec<Installed>, Vec<String>) {
     (installed, errors)
 }
 
+pub fn read_manifest(folder: &Path) -> Result<Manifest, String> {
+    let text = fs::read_to_string(folder.join(MANIFEST)).map_err(|error| format!("No {MANIFEST} in this folder: {error}"))?;
+    parse_manifest(&text)
+}
+
 /// Copies an add-on folder into `directory`, in place of an older version.
 /// It stays turned off until the user turns it on.
 pub fn install_from(source: &Path, directory: &Path) -> Result<Manifest, String> {
-    let text = fs::read_to_string(source.join(MANIFEST)).map_err(|error| format!("No {MANIFEST} in this folder: {error}"))?;
-    let manifest = parse_manifest(&text)?;
+    let manifest = read_manifest(source)?;
     let target = directory.join(&manifest.id);
     if source.canonicalize().ok() == target.canonicalize().ok() {
         return Err(format!("{} is already installed from this folder.", manifest.name));
