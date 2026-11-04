@@ -2,6 +2,7 @@ mod actions;
 mod addon_panel;
 mod addons;
 mod assets;
+mod completion;
 mod editor_view;
 mod file_tree;
 mod git_panel;

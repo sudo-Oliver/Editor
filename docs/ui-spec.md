@@ -60,6 +60,13 @@ The toolbar follows the file type. LaTeX and Typst show undo, redo, bold, italic
 the symbol palette, the table grid, figure and citation. Markdown keeps undo, redo, bold,
 italic and link. Other files and the image preview keep undo and redo.
 
+## Suggestion popup
+
+A small list opens below the start of the replaced text, at most 8 rows of name and detail on the
+panel color. It appears only at a trigger (`\\`, `\\begin{`, `\\ref{`, `#`, `@`), not in prose. Its
+keys apply only while it shows, so `Tab` keeps its other meanings otherwise: indent or next field
+while inserting, and file tree in Vim's Normal mode.
+
 ## Git panel
 
 The second rail button swaps the file tree and outline for the panel, at the same width. From
