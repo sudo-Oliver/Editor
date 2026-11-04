@@ -98,6 +98,8 @@ There are no signatures. The checksum protects the download but does not say who
 
 An add-on can supply entries for the citation picker. In LaTeX, typing `\cite{` or a relative such as `\autocite[p. 3]{` opens the picker when entries exist. Insert citation and Cmd+Shift+C open it in LaTeX and Typst.
 
+An add-on with the `lookup_doi` permission can cite from a DOI: Cmd+Shift+D, Insert > Citation from a DOI, or `Space r` in Vim mode. The editor passes on a DOI from the selection or clipboard and draws the dialog of the add-on. With the cursor in a file that takes no citation, the key goes to the clipboard.
+
 The crate `addon_api` describes the protocol: one JSON message per line over stdin and stdout, with the panel sent as a tree of nodes that the editor draws.
 
 ## Settings

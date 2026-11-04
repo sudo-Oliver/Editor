@@ -77,6 +77,10 @@ permissions, Install and Refresh. Its text says that downloads are checked but n
 appears on the installed add-on when the catalog holds another version. Installing never turns an
 add-on on.
 
+## DOI dialog
+
+An add-on with the `lookup_doi` permission draws a dialog over the top of the window, opened with Cmd+Shift+D, Insert > Citation from a DOI, or `Space r` in Vim mode. Enter presses its default button, and Esc closes it and drops an answer still on its way. A dialog without a default button, as for a retracted work, ignores Enter.
+
 ## Citation picker
 
 `\cite{` and its relatives open the picker in LaTeX when entries exist. Backspace after a pick does not
