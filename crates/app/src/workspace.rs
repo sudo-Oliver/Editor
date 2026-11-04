@@ -589,8 +589,14 @@ impl Workspace {
             return;
         };
         match view.update(cx, |view, cx| view.save(cx)) {
-            Ok(true) if self.config.trigger == Trigger::Save => self.recompile(cx),
-            Ok(_) => {}
+            Ok(saved) => {
+                if saved {
+                    self.notify_addons_saved(&view, cx);
+                }
+                if saved && self.config.trigger == Trigger::Save {
+                    self.recompile(cx);
+                }
+            }
             Err(error) => self.set_status(format!("Cannot save: {error}"), cx),
         }
     }
@@ -663,6 +669,7 @@ impl Workspace {
             let AddonPanelEvent::Request { id, request } = event;
             this.handle_addon_request(panel, *id, request.clone(), cx);
         });
+        panel.update(cx, |panel, cx| panel.activate(cx));
         AddonEntry { panel, _subscription: subscription }
     }
 
@@ -776,6 +783,7 @@ impl Workspace {
             Request::ActiveFile => Ok(Reply::Active { file: self.active_file_info(cx) }),
             Request::EditFile { path, old, new } => self.addon_edit(&add_on, &path, &old, &new, cx).map(|()| Reply::Done),
             Request::CreateFile { path, text } => self.addon_create(&add_on, &path, &text, cx).map(|()| Reply::Done),
+            Request::WriteFile { path, text } => self.addon_write(&path, &text, cx).map(|()| Reply::Done),
             Request::BeginEdits => {
                 self.tracked_edits.insert(add_on, TrackedEdits::default());
                 Ok(Reply::Done)
@@ -890,6 +898,32 @@ impl Workspace {
         Ok(())
     }
 
+    fn addon_write(&mut self, relative: &str, text: &str, cx: &mut Context<Self>) -> Result<(), String> {
+        let path = self.addon_file(relative)?;
+        let document = self.document_at(&path, cx).map(|index| self.documents[index].view.clone());
+        if document.as_ref().is_some_and(|view| view.read(cx).state.is_dirty()) {
+            return Err(format!("{relative} has unsaved changes."));
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| format!("Cannot write {relative}: {error}"))?;
+        }
+        std::fs::write(&path, text).map_err(|error| format!("Cannot write {relative}: {error}"))?;
+        if let Some(view) = document {
+            view.update(cx, |view, cx| view.reload_from_disk(cx));
+        }
+        self.refresh_from_disk(cx);
+        Ok(())
+    }
+
+    fn notify_addons_saved(&self, view: &Entity<EditorView>, cx: &mut Context<Self>) {
+        let Some(path) = view.read(cx).path.as_deref().map(|path| self.relative_to_project(path)) else {
+            return;
+        };
+        for entry in &self.addon_panels {
+            entry.panel.read(cx).notify_saved(&path);
+        }
+    }
+
     /// Puts back the text from before the first edit, as one step that undo can
     /// reverse. Edits by the user in those files since then go with it.
     fn discard_addon_edits(&mut self, add_on: &str, cx: &mut Context<Self>) {
@@ -922,9 +956,16 @@ impl Workspace {
     pub(crate) fn save_all(&mut self, cx: &mut Context<Self>) -> bool {
         for index in 0..self.documents.len() {
             let view = self.documents[index].view.clone();
-            if let Err(error) = view.update(cx, |view, cx| view.save(cx)) {
-                self.set_status(format!("Cannot save: {error}"), cx);
-                return false;
+            match view.update(cx, |view, cx| view.save(cx)) {
+                Ok(saved) => {
+                    if saved {
+                        self.notify_addons_saved(&view, cx);
+                    }
+                }
+                Err(error) => {
+                    self.set_status(format!("Cannot save: {error}"), cx);
+                    return false;
+                }
             }
         }
         true

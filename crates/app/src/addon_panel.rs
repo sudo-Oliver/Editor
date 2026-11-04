@@ -1,9 +1,10 @@
 //! Draws the panel of an add-on and passes messages between it and the workspace.
-//! The program starts when the panel first shows, not before.
+//! The program starts when the panel first shows, or with the project if the
+//! manifest asks for that.
 
 use std::{collections::HashMap, path::PathBuf};
 
-use addon_api::{API_VERSION, AddonMessage, HostMessage, Node, Reply, Request};
+use addon_api::{API_VERSION, Activation, AddonMessage, CitationEntry, HostMessage, Node, Permission, Reply, Request};
 use gpui::{
     AnyElement, App, Context, ElementId, Entity, EventEmitter, Focusable, FontWeight, Render, ScrollHandle, SharedString,
     Task, Window, div, prelude::*, px,
@@ -17,6 +18,8 @@ use crate::{
 };
 
 const INPUT_HEIGHT: f32 = 62.0;
+const CHECK_SIZE: f32 = 12.0;
+const CHECK_INDENT: f32 = 14.0;
 
 pub enum AddonPanelEvent {
     Request { id: u64, request: Request },
@@ -35,6 +38,7 @@ pub struct AddonPanel {
     view: Node,
     inputs: HashMap<String, Entity<EditorView>>,
     scrolls: HashMap<String, ScrollHandle>,
+    citations: Vec<CitationEntry>,
 }
 
 impl EventEmitter<AddonPanelEvent> for AddonPanel {}
@@ -52,6 +56,35 @@ impl AddonPanel {
             view: Node::default(),
             inputs: HashMap::new(),
             scrolls: HashMap::new(),
+            citations: Vec::new(),
+        }
+    }
+
+    fn starts_with_project(&self) -> bool {
+        self.add_on.manifest.activation == Activation::Project && self.root.is_some()
+    }
+
+    /// Starts the program now if it should not wait for the panel to show.
+    pub fn activate(&mut self, cx: &mut Context<Self>) {
+        if self.starts_with_project() && self.process.is_none() && self.stopped.is_none() {
+            self.start(cx);
+        }
+    }
+
+    pub fn citations(&self) -> &[CitationEntry] {
+        &self.citations
+    }
+
+    /// Tells the add-on about a saved file, if it runs with the project.
+    pub fn notify_saved(&self, path: &str) {
+        if self.add_on.manifest.activation == Activation::Project {
+            self.send(HostMessage::Saved { path: path.to_string() });
+        }
+    }
+
+    pub fn notify_citation_picked(&self, key: &str) {
+        if self.citations.iter().any(|entry| entry.key == key) {
+            self.send(HostMessage::CitationPicked { key: key.to_string() });
         }
     }
 
@@ -68,8 +101,9 @@ impl AddonPanel {
         self.stop();
         self.stopped = None;
         self.view = Node::default();
+        self.citations.clear();
         self.sync_view(cx);
-        if self.visible {
+        if self.visible || self.starts_with_project() {
             self.start(cx);
         }
         cx.notify();
@@ -127,9 +161,15 @@ impl AddonPanel {
                 }
                 return;
             }
+            ProcessEvent::Message(AddonMessage::SetCitations { entries }) => {
+                if self.add_on.manifest.permissions.contains(&Permission::Citations) {
+                    self.citations = entries;
+                }
+            }
             ProcessEvent::Invalid(error) => self.invalid = Some(error),
             ProcessEvent::Exited(reason) => {
                 self.process = None;
+                self.citations.clear();
                 self.stopped = Some(reason);
             }
         }
@@ -147,7 +187,9 @@ impl AddonPanel {
     }
 
     fn scroll_to_end(&self) {
-        for scroll in self.scrolls.values() {
+        let mut following = Vec::new();
+        collect_following(&self.view, &mut following);
+        for scroll in following.iter().filter_map(|id| self.scrolls.get(*id)) {
             scroll.scroll_to_bottom();
         }
     }
@@ -217,7 +259,7 @@ impl AddonPanel {
                 .gap(px(6.))
                 .children(children.iter().map(|child| self.render_node(child, cx)).collect::<Vec<_>>())
                 .into_any_element(),
-            Node::Scroll { id, children } => {
+            Node::Scroll { id, children, .. } => {
                 let mut scroll = div()
                     .id(SharedString::from(id.clone()))
                     .flex()
@@ -320,6 +362,32 @@ impl AddonPanel {
                         .child(option.clone())
                 }))
                 .into_any_element(),
+            Node::Check { id, label, checked, indent } => {
+                let check = id.clone();
+                div()
+                    .id(SharedString::from(id.clone()))
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(px(6.))
+                    .pl(px(*indent as f32 * CHECK_INDENT))
+                    .py(px(1.))
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::color(theme::PANEL)))
+                    .on_click(cx.listener(move |this, _, _, _| this.send(HostMessage::Click { id: check.clone() })))
+                    .child(
+                        div()
+                            .flex_none()
+                            .size(px(CHECK_SIZE))
+                            .rounded(px(3.))
+                            .border_1()
+                            .border_color(theme::color(if *checked { theme::GREEN } else { theme::UI_MUTED }))
+                            .when(*checked, |style| style.bg(theme::color(theme::GREEN))),
+                    )
+                    .child(label.clone())
+                    .into_any_element()
+            }
             Node::Divider => div().flex_none().h(px(1.)).bg(theme::color(theme::PANEL)).into_any_element(),
         }
     }
@@ -341,12 +409,27 @@ fn append(node: &mut Node, target: &str, addition: &str) -> bool {
 fn collect_ids(node: &Node, inputs: &mut Vec<String>, scrolls: &mut Vec<String>) {
     match node {
         Node::Input { id, .. } => inputs.push(id.clone()),
-        Node::Scroll { id, children } => {
+        Node::Scroll { id, children, .. } => {
             scrolls.push(id.clone());
             children.iter().for_each(|child| collect_ids(child, inputs, scrolls));
         }
         Node::Column { children } | Node::Row { children } => {
             children.iter().for_each(|child| collect_ids(child, inputs, scrolls));
+        }
+        _ => {}
+    }
+}
+
+fn collect_following<'a>(node: &'a Node, following: &mut Vec<&'a str>) {
+    match node {
+        Node::Scroll { id, children, follow } => {
+            if *follow {
+                following.push(id);
+            }
+            children.iter().for_each(|child| collect_following(child, following));
+        }
+        Node::Column { children } | Node::Row { children } => {
+            children.iter().for_each(|child| collect_following(child, following));
         }
         _ => {}
     }
@@ -418,7 +501,7 @@ mod tests {
     #[test]
     fn append_finds_nested_text() {
         let mut view = Node::Column {
-            children: vec![Node::Scroll { id: "s".to_string(), children: vec![text("a", "x"), text("b", "y")] }],
+            children: vec![Node::Scroll { id: "s".to_string(), children: vec![text("a", "x"), text("b", "y")], follow: true }],
         };
         assert!(append(&mut view, "b", "z"));
         assert!(!append(&mut view, "missing", "z"));
@@ -445,12 +528,25 @@ mod tests {
     fn ids_are_collected_at_any_depth() {
         let view = Node::Column {
             children: vec![
-                Node::Scroll { id: "s".to_string(), children: vec![Node::Input { id: "i".to_string(), placeholder: String::new() }] },
+                Node::Scroll {
+                    id: "s".to_string(),
+                    children: vec![Node::Input { id: "i".to_string(), placeholder: String::new() }],
+                    follow: true,
+                },
             ],
         };
         let (mut inputs, mut scrolls) = (Vec::new(), Vec::new());
         collect_ids(&view, &mut inputs, &mut scrolls);
         assert_eq!((inputs, scrolls), (vec!["i".to_string()], vec!["s".to_string()]));
         assert!(contains_scroll(&view));
+    }
+
+    #[test]
+    fn only_following_scrolls_jump_to_the_end() {
+        let scroll = |id: &str, follow| Node::Scroll { id: id.to_string(), children: Vec::new(), follow };
+        let view = Node::Column { children: vec![scroll("chat", true), scroll("list", false)] };
+        let mut following = Vec::new();
+        collect_following(&view, &mut following);
+        assert_eq!(following, ["chat"]);
     }
 }

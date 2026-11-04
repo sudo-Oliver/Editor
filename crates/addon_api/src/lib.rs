@@ -17,6 +17,7 @@ pub enum Permission {
     EditDocuments,
     Compile,
     Secrets,
+    Citations,
 }
 
 impl Permission {
@@ -26,8 +27,20 @@ impl Permission {
             Self::EditDocuments => "Change documents",
             Self::Compile => "Save and compile",
             Self::Secrets => "Keep secrets in the system keychain",
+            Self::Citations => "Offer citations",
         }
     }
+}
+
+/// When the program of an add-on starts.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Activation {
+    /// When its panel first shows.
+    #[default]
+    Panel,
+    /// As soon as a project is open.
+    Project,
 }
 
 /// `addon.toml`.
@@ -38,7 +51,11 @@ pub struct Manifest {
     pub name: String,
     pub version: String,
     pub author: String,
+    #[serde(default)]
+    pub description: String,
     pub api: u32,
+    #[serde(default)]
+    pub activation: Activation,
     /// Relative to the folder of the add-on.
     pub program: String,
     /// An SVG file, relative to the folder of the add-on.
@@ -54,7 +71,13 @@ pub enum Node {
     Column { children: Vec<Node> },
     Row { children: Vec<Node> },
     /// A column that scrolls and fills the free height. New text keeps its end in view.
-    Scroll { id: String, children: Vec<Node> },
+    Scroll {
+        id: String,
+        children: Vec<Node>,
+        /// Turn this off for lists, which should stay where the user scrolled to.
+        #[serde(default = "enabled")]
+        follow: bool,
+    },
     /// `id` lets `AddonMessage::Append` add to the text later.
     Text {
         #[serde(default)]
@@ -90,6 +113,15 @@ pub enum Node {
         options: Vec<String>,
         selected: usize,
     },
+    /// A box that sends `HostMessage::Click` and waits for a new view to change.
+    Check {
+        id: String,
+        label: String,
+        checked: bool,
+        /// Levels of a tree.
+        #[serde(default)]
+        indent: u32,
+    },
     Divider,
 }
 
@@ -113,6 +145,15 @@ pub enum AddonMessage {
     Append { id: String, text: String },
     /// The editor answers with `HostMessage::Reply` and the same `id`.
     Request { id: u64, request: Request },
+    /// Replaces what this add-on offers in the citation picker.
+    SetCitations { entries: Vec<CitationEntry> },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct CitationEntry {
+    pub key: String,
+    /// Shown beside the key and searched with it.
+    pub detail: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -129,6 +170,9 @@ pub enum Request {
     EditFile { path: String, old: String, new: String },
     /// Creates the file and opens it with this unsaved text.
     CreateFile { path: String, text: String },
+    /// Replaces a whole file on disk, and its document if open. Fails when that
+    /// document has unsaved changes.
+    WriteFile { path: String, text: String },
     /// Saves all documents and compiles. The reply comes when the build ends.
     Compile,
     /// Starts a group of edits that `DiscardEdits` can take back.
@@ -145,7 +189,7 @@ impl Request {
             Self::ListFiles | Self::ReadFile { .. } | Self::Search { .. } | Self::Diagnostics | Self::ActiveFile => {
                 Permission::ReadProject
             }
-            Self::EditFile { .. } | Self::CreateFile { .. } | Self::BeginEdits | Self::DiscardEdits => {
+            Self::EditFile { .. } | Self::CreateFile { .. } | Self::WriteFile { .. } | Self::BeginEdits | Self::DiscardEdits => {
                 Permission::EditDocuments
             }
             Self::Compile => Permission::Compile,
@@ -202,6 +246,10 @@ pub enum HostMessage {
     /// A button with `submits` was clicked.
     Submit { id: String, text: String },
     Select { id: String, selected: usize },
+    /// A document was saved. Only for add-ons with `Activation::Project`.
+    Saved { path: String },
+    /// The user chose an entry that this add-on offered.
+    CitationPicked { key: String },
 }
 
 #[cfg(test)]
@@ -225,6 +273,20 @@ mod tests {
             children[1],
             Node::Button { id: "b".to_string(), label: "Go".to_string(), primary: false, enabled: true, submits: None }
         );
+    }
+
+    #[test]
+    fn manifest_defaults_to_starting_with_the_panel() {
+        let manifest: Manifest =
+            toml::from_str("id = \"a\"\nname = \"A\"\nversion = \"1\"\nauthor = \"B\"\napi = 1\nprogram = \"a\"\n").unwrap();
+        assert_eq!(manifest.activation, Activation::Panel);
+        assert_eq!(manifest.description, "");
+    }
+
+    #[test]
+    fn scroll_follows_unless_told_otherwise() {
+        let scroll: Node = serde_json::from_str(r#"{"type":"scroll","id":"s","children":[]}"#).unwrap();
+        assert!(matches!(scroll, Node::Scroll { follow: true, .. }));
     }
 
     #[test]
