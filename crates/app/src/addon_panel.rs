@@ -20,9 +20,14 @@ use crate::{
 const INPUT_HEIGHT: f32 = 62.0;
 const CHECK_SIZE: f32 = 12.0;
 const CHECK_INDENT: f32 = 14.0;
+const SUGGESTION_LIMIT: usize = 300;
 
 pub enum AddonPanelEvent {
     Request { id: u64, request: Request },
+    /// The dialog opened, closed or changed, and the workspace draws it.
+    DialogChanged,
+    /// The program ended before it answered the shortcut.
+    LookupFailed(String),
 }
 
 pub struct AddonPanel {
@@ -36,6 +41,9 @@ pub struct AddonPanel {
     /// The last broken message, which the add-on should not have sent.
     invalid: Option<String>,
     view: Node,
+    dialog: Option<Node>,
+    /// The shortcut went out and no dialog came back yet.
+    dialog_asked: bool,
     inputs: HashMap<String, Entity<EditorView>>,
     scrolls: HashMap<String, ScrollHandle>,
     citations: Vec<CitationEntry>,
@@ -54,6 +62,8 @@ impl AddonPanel {
             stopped: None,
             invalid: None,
             view: Node::default(),
+            dialog: None,
+            dialog_asked: false,
             inputs: HashMap::new(),
             scrolls: HashMap::new(),
             citations: Vec::new(),
@@ -88,6 +98,58 @@ impl AddonPanel {
         }
     }
 
+    pub fn looks_up_dois(&self) -> bool {
+        self.add_on.manifest.permissions.contains(&Permission::LookupDoi)
+    }
+
+    /// Asks the add-on to open its dialog. Fails with the reason when it does not run.
+    pub fn lookup_doi(&mut self, suggestion: String, cx: &mut Context<Self>) -> Result<(), String> {
+        if self.process.is_none() {
+            self.start(cx);
+        }
+        if self.process.is_none() {
+            return Err(self.stopped.clone().unwrap_or_else(|| format!("{} does not run.", self.add_on.manifest.name)));
+        }
+        self.dialog_asked = true;
+        self.send(HostMessage::LookupDoi { suggestion });
+        Ok(())
+    }
+
+    pub fn has_dialog(&self) -> bool {
+        self.dialog.is_some()
+    }
+
+    pub fn close_dialog(&mut self, cx: &mut Context<Self>) {
+        if self.dialog.take().is_some() {
+            self.send(HostMessage::DialogClosed);
+            self.sync_view(cx);
+            cx.notify();
+        }
+    }
+
+    /// `Enter` in the dialog. An input method that composes keeps it.
+    pub fn confirm_dialog(&mut self, cx: &mut Context<Self>) {
+        if self.inputs.values().any(|input| input.read(cx).is_composing()) {
+            return;
+        }
+        let button = self.dialog.as_ref().and_then(default_button).map(|(id, submits)| (id.to_string(), submits.map(str::to_string)));
+        if let Some((id, submits)) = button {
+            self.click(&id, submits.as_deref(), cx);
+        }
+    }
+
+    /// What should hold the focus while the dialog shows.
+    pub fn dialog_input(&self, cx: &App) -> Option<gpui::FocusHandle> {
+        let mut inputs = Vec::new();
+        collect_ids(self.dialog.as_ref()?, &mut inputs, &mut Vec::new());
+        inputs.first().and_then(|id| self.inputs.get(id)).map(|input| input.read(cx).focus_handle(cx))
+    }
+
+    pub fn render_dialog(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let dialog = self.dialog.clone()?;
+        Some(self.render_node(&dialog, cx))
+    }
+
     pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
         self.visible = visible;
         if visible && self.process.is_none() && self.stopped.is_none() {
@@ -101,6 +163,8 @@ impl AddonPanel {
         self.stop();
         self.stopped = None;
         self.view = Node::default();
+        self.dialog = None;
+        cx.emit(AddonPanelEvent::DialogChanged);
         self.citations.clear();
         self.sync_view(cx);
         if self.visible || self.starts_with_project() {
@@ -166,10 +230,23 @@ impl AddonPanel {
                     self.citations = entries;
                 }
             }
+            ProcessEvent::Message(AddonMessage::SetDialog { view }) => {
+                if self.looks_up_dois() {
+                    self.dialog_asked = false;
+                    self.dialog = view;
+                    self.sync_view(cx);
+                    cx.emit(AddonPanelEvent::DialogChanged);
+                }
+            }
             ProcessEvent::Invalid(error) => self.invalid = Some(error),
             ProcessEvent::Exited(reason) => {
+                if std::mem::take(&mut self.dialog_asked) {
+                    cx.emit(AddonPanelEvent::LookupFailed(format!("{} stopped: {reason}", self.add_on.manifest.name)));
+                }
                 self.process = None;
                 self.citations.clear();
+                self.dialog = None;
+                cx.emit(AddonPanelEvent::DialogChanged);
                 self.stopped = Some(reason);
             }
         }
@@ -199,12 +276,16 @@ impl AddonPanel {
     fn sync_view(&mut self, cx: &mut Context<Self>) {
         let (mut inputs, mut scrolls) = (Vec::new(), Vec::new());
         collect_ids(&self.view, &mut inputs, &mut scrolls);
+        if let Some(dialog) = &self.dialog {
+            collect_ids(dialog, &mut inputs, &mut scrolls);
+        }
         self.inputs.retain(|id, _| inputs.contains(id));
         self.scrolls.retain(|id, _| scrolls.contains(id));
         for id in inputs {
+            let value = self.dialog.iter().chain([&self.view]).find_map(|node| input_value(node, &id)).unwrap_or_default().to_string();
             self.inputs.entry(id).or_insert_with(|| {
                 let input = cx.new(|cx| {
-                    let mut view = EditorView::new("", None, cx);
+                    let mut view = EditorView::new(&value, None, cx);
                     view.set_plain();
                     view
                 });
@@ -310,7 +391,7 @@ impl AddonPanel {
                     .child(label.clone())
                     .into_any_element()
             }
-            Node::Input { id, placeholder } => {
+            Node::Input { id, placeholder, .. } => {
                 let input = self.inputs.get(id);
                 let empty = input.is_none_or(|input| input.read(cx).state.buffer().is_empty());
                 div()
@@ -388,6 +469,9 @@ impl AddonPanel {
                     .child(label.clone())
                     .into_any_element()
             }
+            Node::Alert { text } => {
+                div().flex_none().p(px(8.)).rounded(px(4.)).bg(theme::color(theme::ERROR_PANEL)).font_weight(FontWeight::SEMIBOLD).child(text.clone()).into_any_element()
+            }
             Node::Divider => div().flex_none().h(px(1.)).bg(theme::color(theme::PANEL)).into_any_element(),
         }
     }
@@ -418,6 +502,40 @@ fn collect_ids(node: &Node, inputs: &mut Vec<String>, scrolls: &mut Vec<String>)
         }
         _ => {}
     }
+}
+
+fn input_value<'a>(node: &'a Node, target: &str) -> Option<&'a str> {
+    match node {
+        Node::Input { id, value, .. } if id == target => Some(value),
+        Node::Column { children } | Node::Row { children } | Node::Scroll { children, .. } => {
+            children.iter().find_map(|child| input_value(child, target))
+        }
+        _ => None,
+    }
+}
+
+fn default_button(node: &Node) -> Option<(&str, Option<&str>)> {
+    match node {
+        Node::Button { id, primary: true, enabled: true, submits, .. } => Some((id, submits.as_deref())),
+        Node::Column { children } | Node::Row { children } | Node::Scroll { children, .. } => {
+            children.iter().find_map(default_button)
+        }
+        _ => None,
+    }
+}
+
+/// The selection or clipboard, if an add-on may see it as a DOI or arXiv id. Other
+/// text on the clipboard stays with the editor.
+pub fn doi_suggestion(text: &str) -> Option<String> {
+    let text = text.trim();
+    let lower = text.to_lowercase();
+    let is_arxiv_id = |word: &str| {
+        word.split_once('.').is_some_and(|(left, right)| {
+            left.len() == 4 && left.chars().all(|ch| ch.is_ascii_digit()) && right.len() >= 4 && right.chars().take(4).all(|ch| ch.is_ascii_digit())
+        })
+    };
+    let fits = text.len() <= SUGGESTION_LIMIT && !text.contains(char::is_whitespace);
+    (fits && (lower.contains("10.") && lower.contains('/') || lower.contains("arxiv") || is_arxiv_id(&lower))).then(|| text.to_string())
 }
 
 fn collect_following<'a>(node: &'a Node, following: &mut Vec<&'a str>) {
@@ -499,6 +617,26 @@ mod tests {
     }
 
     #[test]
+    fn only_what_looks_like_an_id_reaches_the_add_on() {
+        for text in ["10.1145/3442188.3445922", " https://doi.org/10.1038/x\n", "1706.03762v5", "arXiv:hep-th/9901001"] {
+            assert_eq!(doi_suggestion(text).as_deref(), Some(text.trim()));
+        }
+        for text in ["", "password123", "sk-ant-abc", "a sentence with 10.1/x in it", &"10.1/".repeat(100)] {
+            assert_eq!(doi_suggestion(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn enter_finds_the_first_enabled_primary_button() {
+        let button = |id: &str, primary, enabled| Node::Button { id: id.to_string(), label: id.to_string(), primary, enabled, submits: None };
+        let view = Node::Column {
+            children: vec![Node::Row { children: vec![button("a", false, true), button("b", true, false), button("c", true, true)] }],
+        };
+        assert_eq!(default_button(&view), Some(("c", None)));
+        assert_eq!(default_button(&button("a", false, true)), None);
+    }
+
+    #[test]
     fn append_finds_nested_text() {
         let mut view = Node::Column {
             children: vec![Node::Scroll { id: "s".to_string(), children: vec![text("a", "x"), text("b", "y")], follow: true }],
@@ -530,7 +668,7 @@ mod tests {
             children: vec![
                 Node::Scroll {
                     id: "s".to_string(),
-                    children: vec![Node::Input { id: "i".to_string(), placeholder: String::new() }],
+                    children: vec![Node::Input { id: "i".to_string(), placeholder: String::new(), value: String::new() }],
                     follow: true,
                 },
             ],

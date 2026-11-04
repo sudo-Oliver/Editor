@@ -40,6 +40,7 @@ pub fn sections(vim_mode: bool) -> Vec<Section> {
                 (modified("I"), "Italic"),
                 (modified("D"), "Select next occurrence"),
                 (modified("Shift+C"), "Insert citation"),
+                (modified("Shift+D"), "Cite from a DOI"),
             ],
         },
         Section {
@@ -65,6 +66,7 @@ pub fn sections(vim_mode: bool) -> Vec<Section> {
                     ("Space ef", "Show file in tree"),
                     ("Space p", "Toggle PDF preview"),
                     ("Space d", "Show error"),
+                    ("Space r", "Cite from a DOI"),
                     ("] d  [ d", "Next and previous error"),
                     ("Tab", "Switch between editor and tree"),
                     ("H  L", "Previous and next tab"),

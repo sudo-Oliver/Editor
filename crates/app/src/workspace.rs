@@ -18,7 +18,7 @@ use editor_core::{
     vim::{self, Effect, Key, Leader, Mode},
 };
 use gpui::{
-    AnyElement, Anchor, App, ClickEvent, Context, CursorStyle, Entity, FocusHandle, Focusable, FontWeight, Keystroke,
+    AnyElement, Anchor, App, ClickEvent, ClipboardItem, Context, CursorStyle, Entity, FocusHandle, Focusable, FontWeight, Keystroke,
     KeystrokeEvent, MouseButton, MouseMoveEvent, PathPromptOptions, Pixels, Point, Render, ScrollHandle, SharedString,
     EntityId, Subscription, Task, Window, anchored, black, deferred, div, point, prelude::*, px, svg,
 };
@@ -27,7 +27,7 @@ use synctex::SyncTex;
 
 use crate::{
     actions::*,
-    addon_panel::{AddonPanel, AddonPanelEvent},
+    addon_panel::{AddonPanel, AddonPanelEvent, doi_suggestion},
     addons::{self, Installed},
     marketplace::{self, CatalogEntry},
     editor_view::{EditorEvent, EditorView, FormatKind},
@@ -200,6 +200,9 @@ pub struct Workspace {
     _git_subscription: Subscription,
     installed_addons: Vec<Installed>,
     addon_panels: Vec<AddonEntry>,
+    addon_dialog_focus: FocusHandle,
+    addon_dialog_changed: bool,
+    addon_dialog_open: bool,
     catalog: CatalogState,
     /// The id of the add-on being downloaded.
     installing: Option<String>,
@@ -326,6 +329,9 @@ impl Workspace {
             _git_subscription: git_subscription,
             installed_addons: Vec::new(),
             addon_panels: Vec::new(),
+            addon_dialog_focus: cx.focus_handle(),
+            addon_dialog_changed: false,
+            addon_dialog_open: false,
             catalog: CatalogState::Idle,
             installing: None,
             tracked_edits: HashMap::new(),
@@ -689,8 +695,14 @@ impl Workspace {
         let root = self.root.clone();
         let panel = cx.new(|_| AddonPanel::new(add_on, root));
         let subscription = cx.subscribe(&panel, |this, panel, event, cx| {
-            let AddonPanelEvent::Request { id, request } = event;
-            this.handle_addon_request(panel, *id, request.clone(), cx);
+            match event {
+                AddonPanelEvent::Request { id, request } => this.handle_addon_request(panel, *id, request.clone(), cx),
+                AddonPanelEvent::DialogChanged => {
+                    this.addon_dialog_changed = true;
+                    cx.notify();
+                }
+                AddonPanelEvent::LookupFailed(reason) => this.set_status(reason.clone(), cx),
+            }
         });
         panel.update(cx, |panel, cx| panel.activate(cx));
         AddonEntry { panel, _subscription: subscription }
@@ -854,6 +866,7 @@ impl Workspace {
             Request::EditFile { path, old, new } => self.addon_edit(&add_on, &path, &old, &new, cx).map(|()| Reply::Done),
             Request::CreateFile { path, text } => self.addon_create(&add_on, &path, &text, cx).map(|()| Reply::Done),
             Request::WriteFile { path, text } => self.addon_write(&path, &text, cx).map(|()| Reply::Done),
+            Request::InsertCitation { key } => Ok(Reply::Text { text: self.insert_citation(&key, cx) }),
             Request::BeginEdits => {
                 self.tracked_edits.insert(add_on, TrackedEdits::default());
                 Ok(Reply::Done)
@@ -1414,6 +1427,20 @@ impl Workspace {
             self.picker_key(&event.keystroke, window, cx);
             return;
         }
+        if let Some(panel) = self.dialog_panel(cx) {
+            match event.keystroke.key.as_str() {
+                "escape" => {
+                    cx.stop_propagation();
+                    self.close_addon_dialog(window, cx);
+                }
+                "enter" => {
+                    cx.stop_propagation();
+                    panel.update(cx, |panel, cx| panel.confirm_dialog(cx));
+                }
+                _ => {}
+            }
+            return;
+        }
         if !self.settings.vim_mode {
             return;
         }
@@ -1504,6 +1531,7 @@ impl Workspace {
             Effect::TogglePreview => self.show_preview = !self.show_preview,
             Effect::FindFiles => self.open_picker(PickerKind::Files, window, cx),
             Effect::FindText => self.open_picker(PickerKind::Text, window, cx),
+            Effect::LookupDoi => self.lookup_doi(cx),
             Effect::ShowError => {
                 if self.problems.is_empty() {
                     self.set_status("No errors.", cx);
@@ -1792,15 +1820,7 @@ impl Workspace {
                 for entry in &self.addon_panels {
                     entry.panel.read(cx).notify_citation_picked(&item.label);
                 }
-                if let Some(closing) = self.needs_closing_brace(cx) {
-                    self.insert_snippet(&snippets::citation_key(&item.label, closing), false, cx);
-                    // The next thing to type is the sentence, not another key.
-                    if !closing {
-                        self.with_active(cx, |view, cx| view.step_forward(cx));
-                    }
-                } else if let Some(language) = self.active_language(cx) {
-                    self.insert_snippet(&snippets::citation(language, &item.label), false, cx);
-                }
+                self.insert_citation(&item.label, cx);
                 return;
             }
         }
@@ -1808,6 +1828,114 @@ impl Workspace {
         if let (Some((line, column)), Some(view)) = (item.position, self.active_view()) {
             view.update(cx, |view, cx| view.go_to_line(line, column, window, cx));
         }
+    }
+
+    /// Writes a citation at the cursor, where the document takes one, and else
+    /// puts the key on the clipboard. Says which.
+    fn insert_citation(&mut self, key: &str, cx: &mut Context<Self>) -> String {
+        if let Some(closing) = self.needs_closing_brace(cx) {
+            self.insert_snippet(&snippets::citation_key(key, closing), false, cx);
+            // The next thing to type is the sentence, not another key.
+            if !closing {
+                self.with_active(cx, |view, cx| view.step_forward(cx));
+            }
+            return format!("Cited {key} at the cursor.");
+        }
+        match self.active_language(cx) {
+            Some(language @ (Language::Latex | Language::Typst)) => {
+                self.insert_snippet(&snippets::citation(language, key), false, cx);
+                format!("Cited {key} at the cursor.")
+            }
+            _ => {
+                cx.write_to_clipboard(ClipboardItem::new_string(key.to_string()));
+                format!("{key} is on the clipboard.")
+            }
+        }
+    }
+
+    fn dialog_panel(&self, cx: &App) -> Option<Entity<AddonPanel>> {
+        self.addon_panels.iter().map(|entry| &entry.panel).find(|panel| panel.read(cx).has_dialog()).cloned()
+    }
+
+    fn lookup_doi(&mut self, cx: &mut Context<Self>) {
+        if self.dialog_panel(cx).is_some() {
+            return;
+        }
+        let Some(panel) = self.addon_panels.iter().map(|entry| entry.panel.clone()).find(|panel| panel.read(cx).looks_up_dois()) else {
+            return self.set_status("Turn on an add-on that looks up DOIs, such as Zotero, in the Add-ons panel.", cx);
+        };
+        if self.root.is_none() {
+            return self.set_status("Open a project to look up a DOI.", cx);
+        }
+        let selection = self.active_view().and_then(|view| view.read(cx).state.selected_text());
+        let clipboard = cx.read_from_clipboard().and_then(|item| item.text());
+        let suggestion = [selection, clipboard].into_iter().flatten().find_map(|text| doi_suggestion(&text)).unwrap_or_default();
+        if let Err(reason) = panel.update(cx, |panel, cx| panel.lookup_doi(suggestion, cx)) {
+            self.set_status(reason, cx);
+        }
+    }
+
+    fn close_addon_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(panel) = self.dialog_panel(cx) {
+            panel.update(cx, |panel, cx| panel.close_dialog(cx));
+            self.addon_dialog_changed = false;
+            self.addon_dialog_open = false;
+            self.focus_active(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// The dialog is drawn here, and only here is the window at hand to move the focus.
+    fn settle_addon_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let panel = self.dialog_panel(cx);
+        let open = panel.is_some();
+        if std::mem::take(&mut self.addon_dialog_changed) || open != self.addon_dialog_open {
+            match panel.map(|panel| panel.read(cx).dialog_input(cx)) {
+                Some(Some(input)) => window.focus(&input, cx),
+                Some(None) => window.focus(&self.addon_dialog_focus, cx),
+                None if self.addon_dialog_open => self.focus_active(window, cx),
+                None => {}
+            }
+        }
+        self.addon_dialog_open = open;
+    }
+
+    fn render_addon_dialog(&mut self, panel: Entity<AddonPanel>, cx: &mut Context<Self>) -> AnyElement {
+        let content = panel.update(cx, |panel, cx| panel.render_dialog(cx));
+        div()
+            .id("addon-dialog-backdrop")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .justify_center()
+            .items_start()
+            .pt(px(TOP_BAR_HEIGHT + 40.))
+            .bg(black().opacity(0.4))
+            .occlude()
+            .track_focus(&self.addon_dialog_focus)
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.close_addon_dialog(window, cx)))
+            .child(
+                div()
+                    .id("addon-dialog")
+                    .occlude()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .w(px(PICKER_WIDTH))
+                    .max_h(gpui::relative(0.8))
+                    .h_auto()
+                    .p(px(12.))
+                    .rounded(px(8.))
+                    .overflow_hidden()
+                    .bg(theme::color(theme::BG))
+                    .border_1()
+                    .border_color(theme::color(theme::DIVIDER))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .children(content),
+            )
+            .into_any_element()
     }
 
     fn offered_citations(&self, cx: &App) -> Vec<(String, String)> {
@@ -2036,6 +2164,7 @@ impl Workspace {
                 entry("Redo", "⇧⌘Z", |this, _, cx| this.with_active(cx, |view, cx| view.redo_edit(cx))),
             ],
             Menu::Insert => vec![
+                entry("Citation from a DOI", "", |this, _, cx| this.lookup_doi(cx)),
                 entry("Inline math", "", |this, _, cx| {
                     this.with_active(cx, |view, cx| view.format(FormatKind::Math, cx))
                 }),
@@ -3982,6 +4111,8 @@ fn byte_column(text: &str, column: usize) -> usize {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.refresh_outline(cx);
+        self.settle_addon_dialog(window, cx);
+        let addon_dialog = self.dialog_panel(cx).map(|panel| self.render_addon_dialog(panel, cx));
         self.tree_cursor = self.tree_cursor.min(self.entries.len().saturating_sub(1));
         let dragging = self.dragging;
         let show_preview = self.show_preview;
@@ -4024,8 +4155,9 @@ impl Render for Workspace {
             )
             .on_action(cx.listener(|this, _: &OpenFolder, window, cx| this.prompt_open_folder(window, cx)))
             .on_action(cx.listener(|this, _: &Save, _, cx| this.save_active(cx)))
+            .on_action(cx.listener(|this, _: &LookupDoi, _, cx| this.lookup_doi(cx)))
             .on_action(cx.listener(|this, _: &InsertCitation, window, cx| {
-                if matches!(this.active_language(cx), Some(Language::Latex | Language::Typst)) {
+                if matches!(this.active_language(cx), Some(Language::Latex | Language::Typst)) && this.dialog_panel(cx).is_none() {
                     this.open_picker(PickerKind::Citations, window, cx);
                 }
             }))
@@ -4099,6 +4231,7 @@ impl Render for Workspace {
             .children(self.render_status_bar(cx))
             .when_some(self.dialog, |element, dialog| element.child(self.render_dialog(dialog, cx)))
             .when_some(self.picker.as_ref(), |element, picker| element.child(self.render_picker(picker, cx)))
+            .when_some(addon_dialog, |element, dialog| element.child(dialog))
             // Below the menus, which are deferred, and above everything else.
             .when(self.open_menu.is_some(), |element| {
                 element.child(
