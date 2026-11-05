@@ -101,6 +101,10 @@ permissions, Install and Refresh. Its text says that downloads are checked but n
 appears on the installed add-on when the catalog holds another version. Installing never turns an
 add-on on.
 
+## Add-on dropdowns
+
+A dropdown is a quiet button with the chosen option and a chevron. Its list opens upward, 200 wide, in the panel color with a divider border, and marks the chosen option with a check. Arrows or `j` and `k` move, Enter chooses, and Esc or a click elsewhere closes it and gives the focus back.
+
 ## DOI dialog
 
 An add-on with the `lookup_doi` permission draws a dialog over the top of the window, opened with Cmd+Shift+D, Insert > Citation from a DOI, or `Space r` in Vim mode. Enter presses its default button, and Esc closes it and drops an answer still on its way. A dialog without a default button, as for a retracted work, ignores Enter.

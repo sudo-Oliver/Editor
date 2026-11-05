@@ -4312,7 +4312,7 @@ impl Workspace {
                 let manifest = &add_on.manifest;
                 let (for_toggle, for_remove) = (add_on.clone(), add_on.clone());
                 let enabled = add_on.enabled;
-                let update = catalog.iter().find(|entry| entry.id == manifest.id && entry.version != manifest.version).cloned();
+                let update = catalog.iter().find(|entry| entry.id == manifest.id && marketplace::is_newer(&entry.version, &manifest.version)).cloned();
                 div()
                     .flex()
                     .flex_col()
