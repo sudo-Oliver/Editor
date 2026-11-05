@@ -3,6 +3,8 @@
 
 use std::ops::Range;
 
+use ropey::RopeSlice;
+
 use crate::{buffer::Buffer, selection::Selection, state::EditorState};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -858,6 +860,8 @@ impl Vim {
                 self.highlight = true;
                 let forward = search.forward != reverse;
                 let mut at = from;
+                // The hits repeat in a circle, so a huge count takes no more steps.
+                let times = if times > 1 { search.steps_for(buffer, times) } else { times };
                 for _ in 0..times {
                     match search.next_after(buffer, at, forward) {
                         Some(hit) => at = hit,
@@ -1229,6 +1233,24 @@ impl Search {
         find_literal(text, &self.query, self.whole_word)
     }
 
+    /// Rules out most lines without a copy of the text. Only ASCII is that simple:
+    /// other characters can have a lowercase form in ASCII, like the Kelvin sign.
+    fn may_match(&self, line: RopeSlice) -> bool {
+        let Some(first) = self.query.chars().next().filter(char::is_ascii) else {
+            return true;
+        };
+        let (lower, upper) = (first.to_ascii_lowercase() as u8, first.to_ascii_uppercase() as u8);
+        line.chunks().any(|chunk| !chunk.is_ascii() || chunk.bytes().any(|byte| byte == lower || byte == upper))
+    }
+
+    fn steps_for(&self, buffer: &Buffer, times: usize) -> usize {
+        let hits: usize = (0..buffer.line_count())
+            .filter(|line| self.may_match(buffer.rope().line(*line)))
+            .map(|line| self.matches_in_line(&buffer.line_text(line)).len())
+            .sum();
+        (times - 1) % hits.max(1) + 1
+    }
+
     /// The next hit after `from`, wrapping around the document.
     fn next_after(&self, buffer: &Buffer, from: usize, forward: bool) -> Option<usize> {
         let lines = buffer.line_count();
@@ -1236,6 +1258,9 @@ impl Search {
         let start = |line: usize, range: &Range<usize>| buffer.line_start(line) + range.start;
         for step in 0..=lines {
             let index = if forward { (line + step) % lines } else { (line + lines - step % lines) % lines };
+            if !self.may_match(buffer.rope().line(index)) {
+                continue;
+            }
             let hits = self.matches_in_line(&buffer.line_text(index));
             let hit = if forward {
                 hits.iter().find(|hit| step > 0 || hit.start > column)
@@ -1497,31 +1522,43 @@ fn pair_of(ch: u8) -> Option<(u8, u8, bool)> {
 fn match_bracket(buffer: &Buffer, from: usize) -> Option<usize> {
     let line = buffer.offset_to_line(from);
     let end = buffer.line_end(line);
-    let text = buffer.to_string();
-    let bytes = text.as_bytes();
-    let position = (from..end).find(|index| pair_of(bytes[*index]).is_some())?;
-    let (open, close, opening) = pair_of(bytes[position])?;
-    let mut depth = 0usize;
+    let position = (from..end).find(|index| pair_of(buffer.rope().byte(*index)).is_some())?;
+    let (open, close, opening) = pair_of(buffer.rope().byte(position))?;
     if opening {
-        for (index, byte) in bytes.iter().enumerate().skip(position) {
-            if *byte == open {
-                depth += 1;
-            } else if *byte == close {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(index);
-                }
+        closing_after(buffer, position, open, close)
+    } else {
+        opening_before(buffer, position, open, close)
+    }
+}
+
+/// The bracket that closes the one at `start`, without looking further than it is.
+fn closing_after(buffer: &Buffer, start: usize, open: u8, close: u8) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, byte) in buffer.rope().bytes_at(start).enumerate() {
+        if byte == open {
+            depth += 1;
+        } else if byte == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(start + index);
             }
         }
-    } else {
-        for index in (0..=position).rev() {
-            if bytes[index] == close {
-                depth += 1;
-            } else if bytes[index] == open {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(index);
-                }
+    }
+    None
+}
+
+/// The bracket around `end` that is still open there, going backwards from it.
+fn opening_before(buffer: &Buffer, end: usize, open: u8, close: u8) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut index = end;
+    for byte in buffer.rope().bytes_at(end).reversed() {
+        index -= 1;
+        if byte == close {
+            depth += 1;
+        } else if byte == open {
+            depth -= 1;
+            if depth == 0 {
+                return Some(index);
             }
         }
     }
@@ -1610,38 +1647,13 @@ fn word_object(buffer: &Buffer, cursor: usize, big: bool, around: bool) -> Optio
 }
 
 fn pair_object(buffer: &Buffer, cursor: usize, open: u8, close: u8, around: bool) -> Option<Range<usize>> {
-    let text = buffer.to_string();
-    let bytes = text.as_bytes();
-    let mut start = None;
-    if bytes.get(cursor) == Some(&open) {
-        start = Some(cursor);
+    let start = if buffer.rope().get_byte(cursor) == Some(open) {
+        cursor
     } else {
-        let mut depth = 0usize;
-        for index in (0..cursor).rev() {
-            if bytes[index] == close {
-                depth += 1;
-            } else if bytes[index] == open {
-                if depth == 0 {
-                    start = Some(index);
-                    break;
-                }
-                depth -= 1;
-            }
-        }
-    }
-    let start = start?;
-    let mut depth = 0usize;
-    for (index, byte) in bytes.iter().enumerate().skip(start) {
-        if *byte == open {
-            depth += 1;
-        } else if *byte == close {
-            depth -= 1;
-            if depth == 0 {
-                return Some(if around { start..index + 1 } else { start + 1..index });
-            }
-        }
-    }
-    None
+        opening_before(buffer, cursor, open, close)?
+    };
+    let end = closing_after(buffer, start, open, close)?;
+    Some(if around { start..end + 1 } else { start + 1..end })
 }
 
 fn quote_object(buffer: &Buffer, cursor: usize, quote: char, around: bool) -> Option<Range<usize>> {
@@ -2100,6 +2112,46 @@ mod tests {
         fixture.vim.record_insert(Key::Char('x'));
         fixture.keys("<esc>j.");
         assert_eq!(fixture.text(), "ax\nbx");
+    }
+
+    #[test]
+    fn brackets_are_found_across_rope_chunks() {
+        // Long enough that the rope splits it, with characters of several bytes.
+        let filler = "äöü text ".repeat(800);
+        let text = format!("start ({filler}(inner){filler}) end {{ x }}");
+        let open = text.find('(').unwrap();
+        let close = text.rfind(')').unwrap();
+        let buffer = Buffer::new(&text);
+        assert_eq!(match_bracket(&buffer, open), Some(close));
+        assert_eq!(match_bracket(&buffer, close), Some(open));
+        assert_eq!(match_bracket(&buffer, 0), Some(close));
+        let middle = text.len() / 4;
+        let middle = (middle..).find(|index| text.is_char_boundary(*index)).unwrap();
+        assert_eq!(pair_object(&buffer, middle, b'(', b')', true), Some(open..close + 1));
+        assert_eq!(pair_object(&buffer, middle, b'(', b')', false), Some(open + 1..close));
+        assert_eq!(pair_object(&buffer, open, b'(', b')', true), Some(open..close + 1));
+        // Outside of the brackets.
+        assert_eq!(pair_object(&buffer, 1, b'(', b')', true), None);
+        assert_eq!(pair_object(&buffer, text.len(), b'{', b'}', true), None);
+        // No partner.
+        let buffer = Buffer::new("a ( b");
+        assert_eq!(match_bracket(&buffer, 0), None);
+        let buffer = Buffer::new("a ) b");
+        assert_eq!(match_bracket(&buffer, 0), None);
+    }
+
+    #[test]
+    fn search_counts_go_round_and_filter_keeps_all_hits() {
+        // Three hits, so this count is one step, and it has to return at once.
+        check("|Kelvin K\nnothing\nkelvin", "/k<cr>", "Kelvin |K\nnothing\nkelvin");
+        check("|Kelvin K\nnothing\nkelvin", "/k<cr>300000001n", "Kelvin K\nnothing\n|kelvin");
+        // The lowercase of the Kelvin sign is k, which only the slow path knows.
+        check("|abc\nnope\na\u{212a}c", "/k<cr>", "abc\nnope\na|\u{212a}c");
+        let search = |query: &str| Search { query: query.to_string(), forward: true, whole_word: false };
+        let rope = |text: &str| ropey::Rope::from_str(text);
+        assert!(!search("k").may_match(rope("abc").slice(..)));
+        assert!(search("k").may_match(rope("aKc").slice(..)));
+        assert!(search("\u{212a}").may_match(rope("abc").slice(..)));
     }
 
     #[test]
