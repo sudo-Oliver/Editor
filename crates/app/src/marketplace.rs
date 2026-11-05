@@ -132,6 +132,23 @@ fn run_tar(command: &mut Command) -> Result<std::process::Output, String> {
     if output.status.success() { Ok(output) } else { Err(format!("Cannot unpack the download: {}", failure(&output))) }
 }
 
+/// Whether `candidate` is a later version than `installed`, part by part, so that
+/// 0.10 follows 0.9 and 1.0 equals 1.0.0. A version that is not made of numbers
+/// never counts as later, because nobody can say what it follows.
+pub fn is_newer(candidate: &str, installed: &str) -> bool {
+    let parts = |version: &str| version.split('.').map(|part| part.parse::<u64>().ok()).collect::<Option<Vec<u64>>>();
+    let (Some(candidate), Some(installed)) = (parts(candidate), parts(installed)) else {
+        return false;
+    };
+    for index in 0..candidate.len().max(installed.len()) {
+        let (new, old) = (candidate.get(index).unwrap_or(&0), installed.get(index).unwrap_or(&0));
+        if new != old {
+            return new > old;
+        }
+    }
+    false
+}
+
 /// An update stays on only when it asks for nothing new.
 pub fn stays_enabled(previous: &[Permission], next: &[Permission]) -> bool {
     next.iter().all(|permission| previous.contains(permission))
@@ -249,6 +266,16 @@ mod tests {
         assert!(stays_enabled(&[read, edit], &[read]));
         assert!(stays_enabled(&[read], &[read]));
         assert!(!stays_enabled(&[read], &[read, edit]));
+    }
+
+    #[test]
+    fn only_later_versions_count_as_updates() {
+        assert!(is_newer("0.3.0", "0.2.0"));
+        assert!(is_newer("0.10.0", "0.9.0"));
+        assert!(is_newer("2", "1.9"));
+        assert!(!is_newer("0.2.0", "0.3.0"));
+        assert!(!is_newer("1.0", "1.0.0"));
+        assert!(!is_newer("1.0-beta", "0.9"));
     }
 
     #[test]

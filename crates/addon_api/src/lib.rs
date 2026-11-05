@@ -118,6 +118,13 @@ pub enum Node {
         options: Vec<String>,
         selected: usize,
     },
+    /// A button that shows the chosen option and opens a list of them. Choosing one
+    /// sends `HostMessage::Select`, the same as `Select`.
+    Dropdown {
+        id: String,
+        options: Vec<DropdownOption>,
+        selected: usize,
+    },
     /// A box that sends `HostMessage::Click` and waits for a new view to change.
     Check {
         id: String,
@@ -140,6 +147,14 @@ impl Default for Node {
     fn default() -> Self {
         Self::Column { children: Vec::new() }
     }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct DropdownOption {
+    pub label: String,
+    /// A second, muted line in the open list.
+    #[serde(default)]
+    pub description: String,
 }
 
 /// Lines from the add-on.

@@ -4,14 +4,14 @@
 
 use std::{collections::HashMap, path::PathBuf};
 
-use addon_api::{API_VERSION, Activation, AddonMessage, CitationEntry, HostMessage, Node, Permission, Reply, Request};
+use addon_api::{API_VERSION, Activation, AddonMessage, CitationEntry, DropdownOption, HostMessage, Node, Permission, Reply, Request};
 use gpui::{
-    AnyElement, App, Context, ElementId, Entity, EventEmitter, Focusable, FontWeight, Render, ScrollHandle, SharedString,
-    Task, Window, div, prelude::*, px,
+    Anchor, AnyElement, App, Context, ElementId, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, KeyDownEvent, MouseButton,
+    Pixels, Render, ScrollHandle, SharedString, Size, Task, Window, anchored, deferred, div, point, prelude::*, px, size,
 };
 
 use crate::{
-    actions::Recompile,
+    actions::{CloseMenu, Recompile},
     addons::{AddonProcess, Installed, ProcessEvent},
     editor_view::EditorView,
     theme,
@@ -21,6 +21,17 @@ const INPUT_HEIGHT: f32 = 62.0;
 const CHECK_SIZE: f32 = 12.0;
 const CHECK_INDENT: f32 = 14.0;
 const SUGGESTION_LIMIT: usize = 300;
+const DROPDOWN_WIDTH: f32 = 200.0;
+
+/// The list of a `Node::Dropdown` while it shows.
+struct OpenDropdown {
+    id: String,
+    /// The row that Enter would choose.
+    highlighted: usize,
+    focus: FocusHandle,
+    /// Gets the focus back, so that typing goes on where it was.
+    previous: Option<FocusHandle>,
+}
 
 pub enum AddonPanelEvent {
     Request { id: u64, request: Request },
@@ -47,6 +58,8 @@ pub struct AddonPanel {
     inputs: HashMap<String, Entity<EditorView>>,
     scrolls: HashMap<String, ScrollHandle>,
     citations: Vec<CitationEntry>,
+    open_dropdown: Option<OpenDropdown>,
+    viewport: Size<Pixels>,
 }
 
 impl EventEmitter<AddonPanelEvent> for AddonPanel {}
@@ -67,6 +80,8 @@ impl AddonPanel {
             inputs: HashMap::new(),
             scrolls: HashMap::new(),
             citations: Vec::new(),
+            open_dropdown: None,
+            viewport: size(px(0.), px(0.)),
         }
     }
 
@@ -300,6 +315,138 @@ impl AddonPanel {
 
     pub fn contains_focus(&self, window: &Window, cx: &App) -> bool {
         self.inputs.values().any(|input| input.read(cx).focus_handle(cx).is_focused(window))
+            || self.open_dropdown.as_ref().is_some_and(|open| open.focus.is_focused(window))
+    }
+
+    fn close_dropdown(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(previous) = self.open_dropdown.take().and_then(|open| open.previous) {
+            window.focus(&previous, cx);
+        }
+        cx.notify();
+    }
+
+    fn choose_dropdown_option(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.open_dropdown.as_ref().map(|open| open.id.clone()) {
+            self.send(HostMessage::Select { id, selected: index });
+        }
+        self.close_dropdown(window, cx);
+    }
+
+    fn dropdown_key(&mut self, event: &KeyDownEvent, count: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(open) = self.open_dropdown.as_mut() else {
+            return;
+        };
+        match event.keystroke.key.as_str() {
+            "down" | "j" => open.highlighted = (open.highlighted + 1) % count,
+            "up" | "k" => open.highlighted = (open.highlighted + count - 1) % count,
+            "enter" => {
+                let index = open.highlighted;
+                return self.choose_dropdown_option(index, window, cx);
+            }
+            "escape" => return self.close_dropdown(window, cx),
+            _ => return,
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn render_dropdown(&self, id: &str, options: &[DropdownOption], selected: usize, cx: &mut Context<Self>) -> AnyElement {
+        let dropdown = id.to_string();
+        let open = self.open_dropdown.as_ref().filter(|open| open.id == id);
+        let label = options.get(selected).map_or_else(String::new, |option| option.label.clone());
+        div()
+            .id(SharedString::from(format!("dropdown-{id}")))
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(4.))
+            .px(px(8.))
+            .py(px(2.))
+            .rounded(px(6.))
+            .cursor_pointer()
+            .when(open.is_some(), |style| style.bg(theme::color(theme::PANEL)))
+            .hover(|style| style.bg(theme::color(theme::PANEL)))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                let focus = cx.focus_handle();
+                let previous = window.focused(cx);
+                window.focus(&focus, cx);
+                this.open_dropdown = Some(OpenDropdown { id: dropdown.clone(), highlighted: selected, focus, previous });
+                cx.notify();
+            }))
+            .child(label)
+            .child(
+                gpui::svg()
+                    .path("icons/chevron-down.svg")
+                    .size(px(12.))
+                    .flex_none()
+                    .text_color(theme::color(theme::UI_MUTED)),
+            )
+            .children(open.map(|open| self.render_dropdown_list(open, options, selected, cx)))
+            .into_any_element()
+    }
+
+    /// The list opens upward from the button, since dropdowns sit low in a panel.
+    /// The backdrop takes a click elsewhere, so that it only closes the list.
+    fn render_dropdown_list(&self, open: &OpenDropdown, options: &[DropdownOption], selected: usize, cx: &mut Context<Self>) -> AnyElement {
+        let count = options.len().max(1);
+        let backdrop = anchored().position(point(px(0.), px(0.))).child(
+            div()
+                .id("dropdown-backdrop")
+                .w(self.viewport.width)
+                .h(self.viewport.height)
+                .occlude()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.close_dropdown(window, cx)))
+                .on_mouse_down(MouseButton::Right, cx.listener(|this, _, window, cx| this.close_dropdown(window, cx))),
+        );
+        let list = anchored().anchor(Anchor::BottomLeft).snap_to_window_with_margin(px(8.)).child(
+            div()
+                .id("dropdown-list")
+                .track_focus(&open.focus)
+                .flex()
+                .flex_col()
+                .w(px(DROPDOWN_WIDTH))
+                .mb(px(4.))
+                .p(px(4.))
+                .gap(px(2.))
+                .rounded(px(8.))
+                .border_1()
+                .border_color(theme::color(theme::DIVIDER))
+                .bg(theme::color(theme::PANEL))
+                .shadow_lg()
+                .occlude()
+                .on_action(cx.listener(|this, _: &CloseMenu, window, cx| this.close_dropdown(window, cx)))
+                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| this.dropdown_key(event, count, window, cx)))
+                .children(options.iter().enumerate().map(|(index, option)| {
+                    div()
+                        .id(("dropdown-option", index))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.))
+                        .px(px(8.))
+                        .py(px(4.))
+                        .rounded(px(4.))
+                        .cursor_pointer()
+                        .when(index == open.highlighted, |style| style.bg(theme::color(theme::DIVIDER)))
+                        .hover(|style| style.bg(theme::color(theme::DIVIDER)))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.choose_dropdown_option(index, window, cx);
+                        }))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .min_w_0()
+                                .child(option.label.clone())
+                                .when(!option.description.is_empty(), |element| {
+                                    element.child(div().text_color(theme::color(theme::UI_MUTED)).child(option.description.clone()))
+                                }),
+                        )
+                        .when(index == selected, |element| element.child(div().flex_none().text_color(theme::color(theme::CARET)).child("✓")))
+                })),
+        );
+        div().child(deferred(backdrop).with_priority(1)).child(deferred(list).with_priority(2)).into_any_element()
     }
 
     fn click(&mut self, id: &str, submits: Option<&str>, cx: &mut Context<Self>) {
@@ -443,6 +590,7 @@ impl AddonPanel {
                         .child(option.clone())
                 }))
                 .into_any_element(),
+            Node::Dropdown { id, options, selected } => self.render_dropdown(id, options, *selected, cx),
             Node::Check { id, label, checked, indent } => {
                 let check = id.clone();
                 div()
@@ -501,6 +649,16 @@ fn collect_ids(node: &Node, inputs: &mut Vec<String>, scrolls: &mut Vec<String>)
             children.iter().for_each(|child| collect_ids(child, inputs, scrolls));
         }
         _ => {}
+    }
+}
+
+fn contains_dropdown(node: &Node, target: &str) -> bool {
+    match node {
+        Node::Dropdown { id, .. } => id == target,
+        Node::Column { children } | Node::Row { children } | Node::Scroll { children, .. } => {
+            children.iter().any(|child| contains_dropdown(child, target))
+        }
+        _ => false,
     }
 }
 
@@ -573,7 +731,11 @@ fn button_submitting<'a>(node: &'a Node, input: &str) -> Option<&'a str> {
 
 impl Render for AddonPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let _ = window;
+        self.viewport = window.viewport_size();
+        // The add-on can take the dropdown away while its list shows.
+        if self.open_dropdown.as_ref().is_some_and(|open| !contains_dropdown(&self.view, &open.id)) {
+            self.close_dropdown(window, cx);
+        }
         let view = self.render_node(&self.view.clone(), cx);
         let failure = self.stopped.clone().map(|reason| format!("{} stopped. {reason}", self.add_on.manifest.name));
         let invalid = self.invalid.clone().map(|error| format!("The add-on sent a broken message: {error}"));
