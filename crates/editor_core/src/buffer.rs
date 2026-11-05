@@ -41,7 +41,7 @@ impl Buffer {
 
     /// Returns the zero-based line and the byte column inside this line.
     pub fn offset_to_point(&self, offset: usize) -> (usize, usize) {
-        let offset = offset.min(self.len());
+        let offset = self.clip(offset);
         let line = self.rope.byte_to_line(offset);
         (line, offset - self.rope.line_to_byte(line))
     }
@@ -100,7 +100,13 @@ impl Buffer {
     /// Moves `offset` back to the nearest character boundary.
     pub fn clip(&self, offset: usize) -> usize {
         let offset = offset.min(self.len());
-        self.rope.char_to_byte(self.rope.byte_to_char(offset))
+        let clipped = self.rope.char_to_byte(self.rope.byte_to_char(offset));
+        // Between `\r` and `\n` lies no visible position, and slicing a line there panics.
+        if clipped > 0 && clipped < self.len() && self.byte_at(clipped - 1) == b'\r' && self.byte_at(clipped) == b'\n' {
+            clipped - 1
+        } else {
+            clipped
+        }
     }
 
     pub fn replace(&mut self, range: Range<usize>, text: &str) {
@@ -260,6 +266,17 @@ fn char_kind(ch: char) -> CharKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_position_lies_inside_a_windows_line_ending() {
+        let buffer = Buffer::new("ab\r\n\r\ncd");
+        assert_eq!(buffer.clip(3), 2);
+        assert_eq!(buffer.offset_to_point(3), (0, 2));
+        assert_eq!(buffer.offset_to_point(5), (1, 0));
+        assert_eq!(buffer.clip(4), 4);
+        assert_eq!(buffer.word_range(3), buffer.word_range(2));
+        assert_eq!(buffer.previous_word_start(3), buffer.previous_word_start(2));
+    }
 
     #[test]
     fn lines_hide_line_endings() {
