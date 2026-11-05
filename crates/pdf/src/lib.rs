@@ -2,7 +2,6 @@
 
 mod content;
 
-use content::PageFrame;
 pub use content::{LinkTarget, PageChar, PageContent, PageLink, Rect};
 
 use std::{
@@ -87,7 +86,6 @@ impl PdfWorker {
 
 fn run(pdfium: Pdfium, commands: mpsc::Receiver<Command>, events: UnboundedSender<PdfEvent>) {
     let mut document: Option<(u64, PdfDocument)> = None;
-    let mut frames: Vec<PageFrame> = Vec::new();
     let mut queue: VecDeque<PageRequest> = VecDeque::new();
     let mut pending: Option<Command> = None;
     loop {
@@ -114,12 +112,7 @@ fn run(pdfium: Pdfium, commands: mpsc::Receiver<Command>, events: UnboundedSende
                 document = None;
                 match pdfium.load_pdf_from_byte_vec(bytes, None) {
                     Ok(loaded) => {
-                        let pages: Vec<(f32, f32)> = loaded
-                            .pages()
-                            .iter()
-                            .map(|page| (page.width().value, page.height().value))
-                            .collect();
-                        frames = loaded.pages().iter().filter_map(|page| PageFrame::of(&page).ok()).collect();
+                        let pages = page_sizes(&loaded);
                         document = Some((generation, loaded));
                         events.send(PdfEvent::Loaded { generation, pages }).ok();
                     }
@@ -139,27 +132,31 @@ fn run(pdfium: Pdfium, commands: mpsc::Receiver<Command>, events: UnboundedSende
                 if let Some((current, document)) = &document
                     && *current == generation
                 {
-                    send_content(document, generation, page, &frames, &events);
+                    send_content(document, generation, page, &events);
                 }
             }
         }
     }
 }
 
+/// Asks for the sizes without opening the pages, which takes a thousandth of the time.
+fn page_sizes(document: &PdfDocument) -> Vec<(f32, f32)> {
+    let pages = document.pages();
+    (0..pages.len())
+        .map(|index| pages.page_size(index).map_or((0.0, 0.0), |size| (size.width().value, size.height().value)))
+        .collect()
+}
+
 fn send_content(
     document: &PdfDocument,
     generation: u64,
     page: usize,
-    frames: &[PageFrame],
     events: &UnboundedSender<PdfEvent>,
 ) {
     let content = u16::try_from(page)
         .map_err(|_| PdfiumError::PageIndexOutOfBounds)
         .and_then(|index| document.pages().get(index))
-        .and_then(|loaded| {
-            let frame = frames.get(page).ok_or(PdfiumError::PageIndexOutOfBounds)?;
-            content::extract(&loaded, frame, frames)
-        })
+        .and_then(|loaded| content::extract(&loaded, document))
         // A page without readable text still shows, it only cannot be selected.
         .unwrap_or_default();
     events.send(PdfEvent::PageContent { generation, page, content }).ok();
@@ -207,5 +204,30 @@ fn render_page(
                 })
                 .ok();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ROTATED_AND_CROPPED: &[u8] = b"%PDF-1.4
+1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj
+2 0 obj<</Type/Pages/Kids[3 0 R 4 0 R]/Count 2>>endobj
+3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 100]/Rotate 90>>endobj
+4 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 300 400]/CropBox[0 0 150 120]>>endobj
+trailer<</Root 1 0 R>>";
+
+    #[test]
+    fn sizes_match_the_opened_pages() {
+        let library = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vendor/pdfium/lib");
+        let Ok(bindings) = Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(&library)) else {
+            return;
+        };
+        let pdfium = Pdfium::new(bindings);
+        let document = pdfium.load_pdf_from_byte_slice(ROTATED_AND_CROPPED, None).unwrap();
+        let opened: Vec<(f32, f32)> = document.pages().iter().map(|page| (page.width().value, page.height().value)).collect();
+        assert_eq!(page_sizes(&document), opened);
+        assert_eq!(opened, [(100.0, 200.0), (150.0, 120.0)]);
     }
 }

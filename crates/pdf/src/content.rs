@@ -95,8 +95,9 @@ pub struct PageContent {
     pub links: Box<[PageLink]>,
 }
 
-/// `frames` holds every page, because link targets can be on any page.
-pub(crate) fn extract(page: &PdfPage, frame: &PageFrame, frames: &[PageFrame]) -> Result<PageContent, PdfiumError> {
+/// `document` is here because link targets can be on any page.
+pub(crate) fn extract(page: &PdfPage, document: &PdfDocument) -> Result<PageContent, PdfiumError> {
+    let frame = PageFrame::of(page)?;
     let text = page.text()?;
     let chars: Box<[PageChar]> = text
         .chars()
@@ -112,27 +113,28 @@ pub(crate) fn extract(page: &PdfPage, frame: &PageFrame, frames: &[PageFrame]) -
         .filter_map(|link| {
             Some(PageLink {
                 rect: frame.rect(&link.rect().ok()?),
-                target: link_target(&link, frames)?,
+                target: link_target(&link, document)?,
             })
         })
         .collect();
     Ok(PageContent { chars, links })
 }
 
-fn link_target(link: &PdfLink, frames: &[PageFrame]) -> Option<LinkTarget> {
+fn link_target(link: &PdfLink, document: &PdfDocument) -> Option<LinkTarget> {
     if let Some(destination) = link.destination() {
-        return page_target(&destination, frames);
+        return page_target(&destination, document);
     }
     match link.action()? {
-        PdfAction::LocalDestination(action) => page_target(&action.destination().ok()?, frames),
+        PdfAction::LocalDestination(action) => page_target(&action.destination().ok()?, document),
         PdfAction::Uri(action) => Some(LinkTarget::Uri(action.uri().ok()?)),
         _ => None,
     }
 }
 
-fn page_target(destination: &PdfDestination, frames: &[PageFrame]) -> Option<LinkTarget> {
-    let page = usize::from(destination.page_index().ok()?);
-    let frame = frames.get(page)?;
+fn page_target(destination: &PdfDestination, document: &PdfDocument) -> Option<LinkTarget> {
+    let index = destination.page_index().ok()?;
+    let page = usize::from(index);
+    let frame = PageFrame::of(&document.pages().get(index).ok()?).ok()?;
     let (x, y) = match destination.view_settings().ok()? {
         PdfDestinationViewSettings::SpecificCoordinatesAndZoom(x, y, _) => (x, y),
         PdfDestinationViewSettings::FitPageHorizontallyToWindow(y) => (None, y),
