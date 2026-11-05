@@ -1,4 +1,11 @@
-use std::{ops::Range, path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    hash::{DefaultHasher, Hasher},
+    io,
+    ops::Range,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
 
 use editor_core::{
     EditorState, HighlightKind, Language, Mark, MarkSeverity, Motion, Selection, Symbol,
@@ -97,6 +104,8 @@ impl Rows {
 pub struct EditorView {
     pub state: EditorState,
     pub path: Option<PathBuf>,
+    /// The file as this document last read or wrote it.
+    disk_hash: u64,
     focus_handle: FocusHandle,
     scroll_y: Pixels,
     rows: Rows,
@@ -128,6 +137,32 @@ impl Focusable for EditorView {
     }
 }
 
+/// Another program changed the file since this document last read or wrote it.
+#[derive(Debug)]
+pub struct SaveConflict;
+
+impl std::fmt::Display for SaveConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the file changed on disk")
+    }
+}
+
+impl std::error::Error for SaveConflict {}
+
+pub fn is_save_conflict(error: &io::Error) -> bool {
+    error.get_ref().is_some_and(|inner| inner.is::<SaveConflict>())
+}
+
+fn content_hash(bytes: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    hasher.write(bytes);
+    hasher.finish()
+}
+
+fn is_conflict(disk: &[u8], known: u64, mine: &[u8]) -> bool {
+    content_hash(disk) != known && disk != mine
+}
+
 impl EditorView {
     pub fn new(text: &str, path: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
         let language = path
@@ -136,6 +171,7 @@ impl EditorView {
         let mut view = Self {
             state: EditorState::new(text, language),
             path,
+            disk_hash: content_hash(text.as_bytes()),
             focus_handle: cx.focus_handle(),
             scroll_y: px(0.),
             rows: Rows::default(),
@@ -196,10 +232,48 @@ impl EditorView {
         if !self.state.is_dirty() {
             return Ok(false);
         }
-        crate::atomic::write(path, self.state.buffer().to_string().as_bytes())?;
+        let text = self.state.buffer().to_string();
+        // A file that went away or cannot be read has nothing to protect here.
+        if std::fs::read(path).is_ok_and(|disk| is_conflict(&disk, self.disk_hash, text.as_bytes())) {
+            return Err(io::Error::other(SaveConflict));
+        }
+        self.write_text(&text, cx)?;
+        Ok(true)
+    }
+
+    /// Replaces the file even though it changed on disk.
+    pub fn save_anyway(&mut self, cx: &mut Context<Self>) -> io::Result<()> {
+        let text = self.state.buffer().to_string();
+        self.write_text(&text, cx)
+    }
+
+    fn write_text(&mut self, text: &str, cx: &mut Context<Self>) -> io::Result<()> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        crate::atomic::write(path, text.as_bytes())?;
+        self.disk_hash = content_hash(text.as_bytes());
         self.state.mark_saved();
         cx.notify();
-        Ok(true)
+        Ok(())
+    }
+
+    /// Writes this text somewhere else. The document and its file stay as they are.
+    pub fn save_copy(&self, target: &Path) -> io::Result<()> {
+        crate::atomic::write(target, self.state.buffer().to_string().as_bytes())
+    }
+
+    /// Takes the file from disk and drops local edits, which undo can bring back.
+    pub fn load_from_disk(&mut self, cx: &mut Context<Self>) -> io::Result<()> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        let text = std::fs::read_to_string(path)?;
+        self.disk_hash = content_hash(text.as_bytes());
+        self.state.reload(&text);
+        self.schedule_parse(cx);
+        cx.notify();
+        Ok(())
     }
 
     /// Reloads the text after an external change, unless local edits would be lost.
@@ -222,6 +296,7 @@ impl EditorView {
         if self.state.is_dirty() || self.state.version() != version {
             return;
         }
+        self.disk_hash = content_hash(text.as_bytes());
         if text != self.state.buffer().to_string() {
             self.state.reload(text);
             self.schedule_parse(cx);
@@ -312,7 +387,7 @@ impl EditorView {
     pub fn cursor_position(&self) -> (usize, usize) {
         let buffer = self.state.buffer();
         let (line, column) = buffer.offset_to_point(self.cursor_offset());
-        (line + 1, buffer.line_text(line)[..column].chars().count() + 1)
+        (line + 1, buffer.line_text(line).get(..column).map_or(column, |text| text.chars().count()) + 1)
     }
 
     pub fn vim_record_insert(&mut self, key: Key) {
@@ -1584,5 +1659,18 @@ impl EditorView {
             squiggles,
             marked,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_real_outside_change_is_a_conflict() {
+        let known = content_hash(b"read");
+        assert!(!is_conflict(b"read", known, b"mine"));
+        assert!(!is_conflict(b"mine", known, b"mine"));
+        assert!(is_conflict(b"theirs", known, b"mine"));
     }
 }

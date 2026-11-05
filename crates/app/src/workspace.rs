@@ -34,7 +34,7 @@ use crate::{
     addon_panel::{AddonPanel, AddonPanelEvent, doi_suggestion},
     addons::{self, Installed},
     marketplace::{self, CatalogEntry},
-    editor_view::{EditorEvent, EditorView, FormatKind},
+    editor_view::{EditorEvent, EditorView, FormatKind, is_save_conflict},
     export::{self, DraftFormat, PdfState},
     file_tree::{self, TreeEntry},
     git_panel::{self, GitPanel, GitPanelEvent},
@@ -44,6 +44,7 @@ use crate::{
     picker::{self, Picker, PickerKind},
     package_check::{self, PackageHint},
     problems::{self, Problem},
+    recovery,
     settings::{self, Settings},
     shortcuts,
     snippets,
@@ -51,6 +52,7 @@ use crate::{
     theme,
 };
 
+const RECOVERY_DELAY: Duration = Duration::from_secs(3);
 const TOP_BAR_HEIGHT: f32 = 40.0;
 const RAIL_WIDTH: f32 = 40.0;
 const DIVIDER_WIDTH: f32 = 7.0;
@@ -324,6 +326,11 @@ pub struct Workspace {
     symbols_version: (usize, usize),
     package_hints: Vec<PackageHint>,
     package_check_task: Option<Task<()>>,
+    conflict_task: Option<Task<()>>,
+    recovery_task: Option<Task<()>>,
+    recovery_offer_task: Option<Task<()>>,
+    /// Documents with a recovery copy and the version the copy holds.
+    recovered: HashMap<PathBuf, u64>,
     show_file_panel: bool,
     left_panel: LeftPanel,
     git_panel: Entity<GitPanel>,
@@ -436,6 +443,11 @@ impl Workspace {
         // Edits live in memory only, so closing must not lose them.
         let quit_subscription = cx.on_app_quit(|this, cx| {
             this.save_all(cx);
+            this.forget_saved_recovery(cx);
+            this.build.shut_down();
+            for addon in &this.addon_panels {
+                addon.panel.update(cx, |panel, _| panel.shut_down());
+            }
             async {}
         });
         let workspace_handle = cx.entity().downgrade();
@@ -469,6 +481,10 @@ impl Workspace {
             symbols_version: (usize::MAX, 0),
             package_hints: Vec::new(),
             package_check_task: None,
+            conflict_task: None,
+            recovery_task: None,
+            recovery_offer_task: None,
+            recovered: HashMap::new(),
             show_file_panel: true,
             left_panel: LeftPanel::Files,
             git_panel,
@@ -562,6 +578,10 @@ impl Workspace {
     }
 
     fn open_root(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        // The open documents go away here, so unsaved text must reach the disk first.
+        if !self.save_all(cx) {
+            return;
+        }
         self.cancel_refresh();
         self.entries = file_tree::scan(&root, &self.collapsed);
         self.tree_target = None;
@@ -603,6 +623,8 @@ impl Workspace {
             self.open_file(path, window, cx);
             self.recompile(cx);
         }
+        self.forget_saved_recovery(cx);
+        self.offer_recovery(root, window, cx);
         cx.notify();
     }
 
@@ -749,6 +771,7 @@ impl Workspace {
         });
         let subscription = cx.subscribe(&view, |this, view, event, cx| match event {
             EditorEvent::Edited => {
+                this.schedule_recovery(cx);
                 this.schedule_type_build(cx);
                 this.check_citation_trigger(&view, cx);
                 cx.notify();
@@ -878,12 +901,199 @@ impl Workspace {
 
     fn close_document(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let view = self.documents[index].view.clone();
-        if let Err(error) = view.update(cx, |view, cx| view.save(cx)) {
-            self.status = Some(format!("Cannot save: {error}").into());
-            cx.notify();
+        match view.update(cx, |view, cx| view.save(cx)) {
+            Ok(_) => self.remove_document(index, window, cx),
+            Err(error) if is_save_conflict(&error) => self.ask_about_conflict(view, true, window, cx),
+            Err(error) => self.set_status(format!("Cannot save: {error}"), cx),
+        }
+        self.forget_saved_recovery(cx);
+    }
+
+    /// Lets the author decide, since either version could be the one that matters.
+    fn ask_about_conflict(&mut self, view: Entity<EditorView>, close: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.conflict_task.is_some() {
             return;
         }
-        self.remove_document(index, window, cx);
+        let title = view.read(cx).title();
+        self.conflict_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let message = format!("{title} changed on disk");
+            let detail = "Another program changed this file after you last opened or saved it.";
+            let answers = ["Keep my version", "Load from disk", "Save a copy", "Cancel"];
+            let answer = ask(&this, cx, PromptLevel::Warning, &message, detail, &answers).await;
+            let result = match answer {
+                Some(0) => view.update(cx, |view, cx| view.save_anyway(cx)).map(|()| true),
+                Some(1) => view.update(cx, |view, cx| view.load_from_disk(cx)).map(|()| true),
+                Some(2) => Self::save_conflict_copy(&this, &view, cx).await,
+                _ => Ok(false),
+            };
+            this.update_in(cx, |this, window, cx| {
+                this.conflict_task = None;
+                match result {
+                    Ok(true) => {
+                        this.notify_addons_saved(&view, cx);
+                        if close && let Some(index) = this.documents.iter().position(|document| document.view == view) {
+                            this.remove_document(index, window, cx);
+                        } else if this.config.trigger == Trigger::Save {
+                            this.recompile(cx);
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => this.set_status(format!("Cannot save: {error}"), cx),
+                }
+                this.forget_saved_recovery(cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// My text goes to a new file, and the document shows what is on disk. Both stay.
+    async fn save_conflict_copy(
+        this: &WeakEntity<Self>,
+        view: &Entity<EditorView>,
+        cx: &mut AsyncWindowContext,
+    ) -> std::io::Result<bool> {
+        let Some(path) = view.read_with(cx, |view, _| view.path.clone()) else {
+            return Ok(false);
+        };
+        let directory = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+        let name = match path.extension() {
+            Some(extension) => format!("{stem} copy.{}", extension.to_string_lossy()),
+            None => format!("{stem} copy"),
+        };
+        let Ok(answer) = this.update(cx, |_, cx| cx.prompt_for_new_path(&directory, Some(&name))) else {
+            return Ok(false);
+        };
+        let Ok(Ok(Some(target))) = answer.await else {
+            return Ok(false);
+        };
+        view.update(cx, |view, cx| view.save_copy(&target).and_then(|()| view.load_from_disk(cx)).map(|()| true))
+    }
+
+    /// Copies unsaved text a few seconds after the last pause, and does nothing
+    /// while nobody types.
+    fn schedule_recovery(&mut self, cx: &mut Context<Self>) {
+        if self.recovery_task.is_some() {
+            return;
+        }
+        let Some(directory) = recovery::directory() else {
+            return;
+        };
+        self.recovery_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(RECOVERY_DELAY).await;
+            let Ok(unsaved) = this.update(cx, |this, cx| this.take_unsaved(cx)) else {
+                return;
+            };
+            cx.background_spawn(async move {
+                for (path, buffer) in unsaved {
+                    recovery::write(&directory, &path, &buffer.to_string()).ok();
+                }
+            })
+            .await;
+            this.update(cx, |this, cx| {
+                this.recovery_task = None;
+                this.forget_saved_recovery(cx);
+                // Typing during the write needs another copy.
+                if this.documents.iter().any(|document| this.needs_recovery_copy(&document.view, cx)) {
+                    this.schedule_recovery(cx);
+                }
+            })
+            .ok();
+        }));
+    }
+
+    fn needs_recovery_copy(&self, view: &Entity<EditorView>, cx: &App) -> bool {
+        let view = view.read(cx);
+        view.state.is_dirty()
+            && view.path.as_ref().is_some_and(|path| self.recovered.get(path) != Some(&view.state.version()))
+    }
+
+    /// The text to copy. Cloning a buffer is cheap, and the text is built elsewhere.
+    fn take_unsaved(&mut self, cx: &App) -> Vec<(PathBuf, editor_core::Buffer)> {
+        let mut unsaved = Vec::new();
+        for document in &self.documents {
+            if self.needs_recovery_copy(&document.view, cx) {
+                let view = document.view.read(cx);
+                let path = view.path.clone().expect("only documents with a path need a copy");
+                self.recovered.insert(path.clone(), view.state.version());
+                unsaved.push((path, view.state.buffer().clone()));
+            }
+        }
+        unsaved
+    }
+
+    /// Removes copies of text that is safe on disk now.
+    fn forget_saved_recovery(&mut self, cx: &App) {
+        if self.recovered.is_empty() {
+            return;
+        }
+        let Some(directory) = recovery::directory() else {
+            return;
+        };
+        let documents = &self.documents;
+        self.recovered.retain(|path, _| {
+            let unsaved = documents.iter().map(|document| document.view.read(cx)).any(|view| {
+                view.path.as_ref() == Some(path) && view.state.is_dirty()
+            });
+            if !unsaved {
+                recovery::remove(&directory, path);
+            }
+            unsaved
+        });
+    }
+
+    fn offer_recovery(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(directory) = recovery::directory() else {
+            return;
+        };
+        self.recovery_offer_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let found = directory.clone();
+            let snapshots = cx.background_spawn(async move { recovery::pending(&found, &root) }).await;
+            if snapshots.is_empty() {
+                return;
+            }
+            let names: Vec<String> = snapshots
+                .iter()
+                .map(|snapshot| snapshot.path.file_name().unwrap_or_default().to_string_lossy().into_owned())
+                .collect();
+            let detail = format!("The editor ended without saving {}.", names.join(", "));
+            let answers = ["Recover", "Discard", "Decide later"];
+            match ask(&this, cx, PromptLevel::Warning, "Recover unsaved changes?", &detail, &answers).await {
+                Some(0) => {
+                    this.update_in(cx, |this, window, cx| this.restore_snapshots(snapshots, window, cx)).ok();
+                }
+                Some(1) => {
+                    for snapshot in &snapshots {
+                        recovery::remove(&directory, &snapshot.path);
+                    }
+                }
+                _ => {}
+            }
+        }));
+    }
+
+    /// The text comes back as unsaved edits, so that undo shows what is on disk.
+    fn restore_snapshots(&mut self, snapshots: Vec<recovery::Snapshot>, window: &mut Window, cx: &mut Context<Self>) {
+        for snapshot in snapshots {
+            if !snapshot.path.exists() {
+                let written = snapshot.path.parent().map_or(Ok(()), std::fs::create_dir_all);
+                if let Err(error) = written.and_then(|()| crate::atomic::write(&snapshot.path, b"")) {
+                    self.set_status(format!("Cannot recover {}: {error}", snapshot.path.display()), cx);
+                    continue;
+                }
+            }
+            self.open_file(snapshot.path.clone(), window, cx);
+            let Some(index) = self.document_at(&snapshot.path, cx) else {
+                continue;
+            };
+            let view = self.documents[index].view.clone();
+            view.update(cx, |view, cx| {
+                let everything = 0..view.state.buffer().len();
+                view.edit_from_outside(everything, &snapshot.text, cx);
+            });
+            // Its copy goes away with the next save, like any other.
+            self.recovered.insert(snapshot.path, 0);
+        }
     }
 
     fn remove_document(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -923,7 +1133,7 @@ impl Workspace {
         }
     }
 
-    fn save_active(&mut self, cx: &mut Context<Self>) {
+    fn save_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(view) = self.active_view() else {
             return;
         };
@@ -936,8 +1146,10 @@ impl Workspace {
                     self.recompile(cx);
                 }
             }
+            Err(error) if is_save_conflict(&error) => self.ask_about_conflict(view, false, window, cx),
             Err(error) => self.set_status(format!("Cannot save: {error}"), cx),
         }
+        self.forget_saved_recovery(cx);
     }
 
     fn set_status(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
@@ -1348,6 +1560,7 @@ impl Workspace {
 
     /// The compilers read files, so every open document is saved first.
     pub(crate) fn save_all(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut all_saved = true;
         for index in 0..self.documents.len() {
             let view = self.documents[index].view.clone();
             match view.update(cx, |view, cx| view.save(cx)) {
@@ -1356,13 +1569,20 @@ impl Workspace {
                         self.notify_addons_saved(&view, cx);
                     }
                 }
+                // The other documents still get saved. This one waits for a decision.
+                Err(error) if is_save_conflict(&error) => {
+                    let title = view.read(cx).title();
+                    self.set_status(format!("{title} changed on disk and was not saved. Save it to decide."), cx);
+                    all_saved = false;
+                }
                 Err(error) => {
                     self.set_status(format!("Cannot save: {error}"), cx);
-                    return false;
+                    all_saved = false;
                 }
             }
         }
-        true
+        self.forget_saved_recovery(cx);
+        all_saved
     }
 
     fn recompile(&mut self, cx: &mut Context<Self>) {
@@ -1978,7 +2198,7 @@ impl Workspace {
         match effect {
             // The editor handles these two itself.
             Effect::Yank(_) | Effect::Scroll(_) => {}
-            Effect::Save => self.save_active(cx),
+            Effect::Save => self.save_active(window, cx),
             Effect::Close | Effect::SaveAndClose => {
                 if let Some(index) = self.active {
                     self.close_document(index, window, cx);
@@ -3197,7 +3417,7 @@ impl Workspace {
                 entry("Markdown draft…", "", |this, window, cx| this.download_draft(DraftFormat::Markdown, window, cx)),
                 menu_separator(),
                 entry("Open folder…", "⌘O", |this, window, cx| this.prompt_open_folder(window, cx)),
-                entry("Save", "⌘S", |this, _, cx| this.save_active(cx)),
+                entry("Save", "⌘S", |this, window, cx| this.save_active(window, cx)),
                 entry("Recompile", "⌘↩", |this, _, cx| this.recompile(cx)),
             ],
             Menu::Edit => vec![
@@ -5460,7 +5680,7 @@ impl Render for Workspace {
                 }),
             )
             .on_action(cx.listener(|this, _: &OpenFolder, window, cx| this.prompt_open_folder(window, cx)))
-            .on_action(cx.listener(|this, _: &Save, _, cx| this.save_active(cx)))
+            .on_action(cx.listener(|this, _: &Save, window, cx| this.save_active(window, cx)))
             .on_action(cx.listener(|this, _: &NewFile, window, cx| {
                 if this.dialog.is_none() {
                     this.open_tree_input(false, window, cx);

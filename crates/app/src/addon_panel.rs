@@ -22,6 +22,7 @@ const CHECK_SIZE: f32 = 12.0;
 const CHECK_INDENT: f32 = 14.0;
 const SUGGESTION_LIMIT: usize = 300;
 const DROPDOWN_WIDTH: f32 = 200.0;
+const MAX_APPENDED_BYTES: usize = 8 * 1024 * 1024;
 
 /// The list of a `Node::Dropdown` while it shows.
 struct OpenDropdown {
@@ -316,6 +317,12 @@ impl AddonPanel {
     pub fn contains_focus(&self, window: &Window, cx: &App) -> bool {
         self.inputs.values().any(|input| input.read(cx).focus_handle(cx).is_focused(window))
             || self.open_dropdown.as_ref().is_some_and(|open| open.focus.is_focused(window))
+    }
+
+    pub fn shut_down(&mut self) {
+        if let Some(process) = &mut self.process {
+            process.shut_down();
+        }
     }
 
     fn close_dropdown(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -632,6 +639,11 @@ fn append(node: &mut Node, target: &str, addition: &str) -> bool {
         }
         Node::Text { id: Some(id), text, .. } | Node::Code { id: Some(id), text } if id == target => {
             text.push_str(addition);
+            // An add-on can stream for as long as it runs, and only the end stays useful.
+            if text.len() > MAX_APPENDED_BYTES * 2 {
+                let cut = text.ceil_char_boundary(text.len() - MAX_APPENDED_BYTES);
+                text.drain(..cut);
+            }
             true
         }
         _ => false,
