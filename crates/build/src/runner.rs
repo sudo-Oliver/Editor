@@ -1,12 +1,15 @@
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicI32, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader},
     process::Command,
     runtime::Handle,
     sync::{Mutex, mpsc, oneshot},
@@ -22,6 +25,12 @@ use crate::{
 const OUTPUT_DIRECTORY: &str = ".build";
 const MAX_LATEX_RUNS: usize = 3;
 const KILL_GRACE: Duration = Duration::from_millis(500);
+/// How long the pipes may stay open after the compiler has ended.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
+const RUN_TIME_LIMIT: Duration = Duration::from_secs(15 * 60);
+const EVENT_CAPACITY: usize = 1024;
+const MAX_LINE_BYTES: u64 = 64 * 1024;
+const OUTPUT_TAIL_BYTES: usize = 1024 * 1024;
 /// Files LaTeX carries between runs. A failed or stopped run can leave them
 /// broken, and the next run then fails on them. The PDF is not in this list.
 const LATEX_STATE_EXTENSIONS: &[&str] = &[
@@ -62,6 +71,8 @@ pub struct BuildManager {
     runtime: Handle,
     serial: Arc<Mutex<()>>,
     cancel: StdMutex<Option<oneshot::Sender<()>>>,
+    /// The process group of the running program, or 0.
+    group: Arc<AtomicI32>,
 }
 
 impl Default for BuildManager {
@@ -85,29 +96,32 @@ impl BuildManager {
             runtime: handle,
             serial: Arc::new(Mutex::new(())),
             cancel: StdMutex::new(None),
+            group: Arc::new(AtomicI32::new(0)),
         }
     }
 
-    pub fn start(&self, request: BuildRequest) -> mpsc::UnboundedReceiver<BuildEvent> {
+    pub fn start(&self, request: BuildRequest) -> mpsc::Receiver<BuildEvent> {
         self.cancel();
-        let (events, receiver) = mpsc::unbounded_channel();
+        // A full channel makes the compiler wait, so that a runaway one cannot flood the app.
+        let (events, receiver) = mpsc::channel(EVENT_CAPACITY);
         let (cancel, mut cancelled) = oneshot::channel();
         *self.cancel.lock().expect("the cancel lock is not poisoned") = Some(cancel);
         let serial = self.serial.clone();
+        let group = self.group.clone();
         self.runtime.spawn(async move {
             let _guard = tokio::select! {
                 guard = serial.lock() => guard,
                 _ = &mut cancelled => {
-                    events.send(BuildEvent::Cancelled).ok();
+                    events.send(BuildEvent::Cancelled).await.ok();
                     return;
                 }
             };
-            events.send(BuildEvent::Started).ok();
-            let event = match build(&request, &events, &mut cancelled).await {
+            events.send(BuildEvent::Started).await.ok();
+            let event = match build(&request, &events, &mut cancelled, &group).await {
                 Some(outcome) => BuildEvent::Finished(outcome),
                 None => BuildEvent::Cancelled,
             };
-            events.send(event).ok();
+            events.send(event).await.ok();
         });
         receiver
     }
@@ -116,6 +130,16 @@ impl BuildManager {
         let cancel = self.cancel.lock().expect("the cancel lock is not poisoned").take();
         if let Some(cancel) = cancel {
             cancel.send(()).ok();
+        }
+    }
+
+    /// Ends the running program at once, because the app is about to exit and the
+    /// build thread with it.
+    pub fn shut_down(&self) {
+        self.cancel();
+        let group = self.group.swap(0, Ordering::SeqCst);
+        if group > 0 {
+            signal_group(Some(group), libc::SIGKILL);
         }
     }
 }
@@ -133,8 +157,9 @@ struct RunResult {
 
 async fn build(
     request: &BuildRequest,
-    events: &mpsc::UnboundedSender<BuildEvent>,
+    events: &mpsc::Sender<BuildEvent>,
     cancelled: &mut oneshot::Receiver<()>,
+    group: &AtomicI32,
 ) -> Option<BuildOutcome> {
     let started = Instant::now();
     let started_at = SystemTime::now();
@@ -175,7 +200,7 @@ async fn build(
         let mut runs = 0;
         let run = loop {
             runs += 1;
-            let run = run_process(&invocation, &cwd, events, cancelled).await?;
+            let run = run_process(&invocation, &cwd, events, cancelled, group).await?;
             let rerun = reruns_by_hand
                 && runs < MAX_LATEX_RUNS
                 && std::fs::read_to_string(&log_path).is_ok_and(|log| log.contains("Rerun to get"));
@@ -358,8 +383,9 @@ fn mirror_directories(source: &Path, target: &Path) {
 async fn run_process(
     invocation: &Invocation,
     cwd: &Path,
-    events: &mpsc::UnboundedSender<BuildEvent>,
+    events: &mpsc::Sender<BuildEvent>,
     cancelled: &mut oneshot::Receiver<()>,
+    running_group: &AtomicI32,
 ) -> Option<RunResult> {
     let program = find_tool(invocation.tool)?;
     let mut command = Command::new(program);
@@ -383,30 +409,61 @@ async fn run_process(
         }
     };
     let group = child.id().map(|id| id as libc::pid_t);
+    running_group.store(group.unwrap_or(0), Ordering::SeqCst);
     let stdout = child.stdout.take().expect("stdout is piped");
     let stderr = child.stderr.take().expect("stderr is piped");
     let out_task = tokio::spawn(forward_lines(stdout, events.clone()));
     let err_task = tokio::spawn(forward_lines(stderr, events.clone()));
 
+    let (out_abort, err_abort) = (out_task.abort_handle(), err_task.abort_handle());
     let status = tokio::select! {
         status = child.wait() => status,
         _ = &mut *cancelled => {
-            signal_group(group, libc::SIGTERM);
-            if tokio::time::timeout(KILL_GRACE, child.wait()).await.is_err() {
-                signal_group(group, libc::SIGKILL);
-                child.wait().await.ok();
-            }
-            out_task.abort();
-            err_task.abort();
+            stop_group(group, &mut child).await;
+            out_abort.abort();
+            err_abort.abort();
+            running_group.store(0, Ordering::SeqCst);
             return None;
         }
+        _ = tokio::time::sleep(RUN_TIME_LIMIT) => {
+            stop_group(group, &mut child).await;
+            out_abort.abort();
+            err_abort.abort();
+            running_group.store(0, Ordering::SeqCst);
+            return Some(RunResult {
+                success: false,
+                stderr: format!("{} ran for {} minutes and was stopped.", invocation.tool, RUN_TIME_LIMIT.as_secs() / 60),
+            });
+        }
     };
-    out_task.await.ok();
-    let stderr = err_task.await.unwrap_or_default();
+    // A program left behind can hold the pipes open for as long as it likes, and
+    // waiting for it would block every later build.
+    let drained = async {
+        out_task.await.ok();
+        err_task.await.unwrap_or_default()
+    };
+    let stderr = match tokio::time::timeout(DRAIN_GRACE, drained).await {
+        Ok(stderr) => stderr,
+        Err(_) => {
+            signal_group(group, libc::SIGKILL);
+            out_abort.abort();
+            err_abort.abort();
+            String::new()
+        }
+    };
+    running_group.store(0, Ordering::SeqCst);
     Some(RunResult {
         success: status.is_ok_and(|status| status.success()),
         stderr,
     })
+}
+
+async fn stop_group(group: Option<libc::pid_t>, child: &mut tokio::process::Child) {
+    signal_group(group, libc::SIGTERM);
+    if tokio::time::timeout(KILL_GRACE, child.wait()).await.is_err() {
+        signal_group(group, libc::SIGKILL);
+        child.wait().await.ok();
+    }
 }
 
 fn signal_group(group: Option<libc::pid_t>, signal: libc::c_int) {
@@ -420,22 +477,31 @@ fn signal_group(group: Option<libc::pid_t>, signal: libc::c_int) {
 
 async fn forward_lines(
     stream: impl AsyncRead + Unpin,
-    events: mpsc::UnboundedSender<BuildEvent>,
+    events: mpsc::Sender<BuildEvent>,
 ) -> String {
     let mut reader = BufReader::new(stream);
     let mut collected = String::new();
     let mut bytes = Vec::new();
     loop {
         bytes.clear();
-        match reader.read_until(b'\n', &mut bytes).await {
+        match (&mut reader).take(MAX_LINE_BYTES).read_until(b'\n', &mut bytes).await {
             Ok(0) | Err(_) => return collected,
             Ok(_) => {
                 // TeX can print bytes that are not UTF-8.
                 let line = String::from_utf8_lossy(&bytes);
                 collected.push_str(&line);
-                events.send(BuildEvent::Output(line.into_owned())).ok();
+                keep_tail(&mut collected);
+                events.send(BuildEvent::Output(line.into_owned())).await.ok();
             }
         }
+    }
+}
+
+/// Keeps the end of the output. Cutting only at twice the size keeps this cheap.
+fn keep_tail(text: &mut String) {
+    if text.len() > OUTPUT_TAIL_BYTES * 2 {
+        let cut = text.ceil_char_boundary(text.len() - OUTPUT_TAIL_BYTES);
+        text.drain(..cut);
     }
 }
 
@@ -443,7 +509,7 @@ async fn forward_lines(
 mod tests {
     use super::*;
 
-    async fn finish(mut receiver: mpsc::UnboundedReceiver<BuildEvent>) -> BuildEvent {
+    async fn finish(mut receiver: mpsc::Receiver<BuildEvent>) -> BuildEvent {
         let mut last = None;
         while let Some(event) = receiver.recv().await {
             last = Some(event);
@@ -453,10 +519,38 @@ mod tests {
 
     fn block_on<T>(future: impl Future<Output = T>) -> T {
         tokio::runtime::Builder::new_current_thread()
-            .enable_time()
+            .enable_all()
             .build()
             .unwrap()
             .block_on(future)
+    }
+
+    #[test]
+    fn a_program_left_behind_does_not_block_the_build() {
+        let invocation = Invocation {
+            tool: "sh",
+            args: vec!["-c".to_string(), "sleep 60 & echo done; exit 0".to_string()],
+            env: Vec::new(),
+        };
+        let (events, mut receiver) = mpsc::channel(EVENT_CAPACITY);
+        let (_cancel, mut cancelled) = oneshot::channel();
+        let group = AtomicI32::new(0);
+        let directory = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        let result = block_on(run_process(&invocation, directory.path(), &events, &mut cancelled, &group)).unwrap();
+        assert!(result.success);
+        assert!(started.elapsed() < Duration::from_secs(20));
+        assert_eq!(group.load(Ordering::SeqCst), 0);
+        receiver.close();
+    }
+
+    #[test]
+    fn output_keeps_only_its_end() {
+        let mut text = "ä".repeat(OUTPUT_TAIL_BYTES * 2);
+        text.push('z');
+        keep_tail(&mut text);
+        assert!(text.len() <= OUTPUT_TAIL_BYTES + 1);
+        assert!(text.ends_with('z'));
     }
 
     #[test]
