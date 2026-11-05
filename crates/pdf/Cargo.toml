@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-pdfium-render = "0.8"
+pdfium-render = { version = "0.8", default-features = false, features = ["pdfium_latest", "thread_safe"] }
 tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
