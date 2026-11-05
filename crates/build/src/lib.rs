@@ -4,6 +4,7 @@ mod config;
 mod explain;
 mod packages;
 mod parse;
+mod preamble;
 mod runner;
 mod tools;
 

@@ -19,6 +19,7 @@ use crate::{
     config::Engine,
     explain,
     parse::{self, Diagnostic, Severity},
+    preamble::{self, Preamble, State},
     tools::{child_path, find_tool},
 };
 
@@ -147,7 +148,7 @@ impl BuildManager {
 struct Invocation {
     tool: &'static str,
     args: Vec<String>,
-    env: Vec<(&'static str, &'static str)>,
+    env: Vec<(&'static str, String)>,
 }
 
 struct RunResult {
@@ -180,9 +181,9 @@ async fn build(
     .to_string_lossy()
     .into_owned();
 
-    let invocation = invocation(request.engine, &input, &stem);
-    if find_tool(invocation.tool).is_none() {
-        return Some(failure(format!("{} is not installed.", invocation.tool), started));
+    let plain = invocation(request.engine, &input, &stem, None);
+    if find_tool(plain.tool).is_none() {
+        return Some(failure(format!("{} is not installed.", plain.tool), started));
     }
     if matches!(request.engine, Engine::PdfLatex | Engine::LuaLatex) {
         // `\include{dir/file}` writes its .aux below the output directory.
@@ -191,12 +192,23 @@ async fn build(
 
     let is_latex = matches!(request.engine, Engine::PdfLatex | Engine::LuaLatex);
     let log_path = output_directory.join(format!("{stem}.log"));
-    let reruns_by_hand = invocation.tool == "pdflatex" || invocation.tool == "lualatex";
+    let reruns_by_hand = plain.tool == "pdflatex" || plain.tool == "lualatex";
     let mut cleaned = request.clean;
+    if request.clean {
+        preamble::remove_formats(&output_directory, None);
+    }
+    let mut format = if request.engine == Engine::PdfLatex && !request.clean {
+        prepare_format(&cwd, &output_directory, &request.main, &input, events, cancelled, group).await?
+    } else {
+        None
+    };
+    let mut format_dropped = None;
     let (run, mut diagnostics) = loop {
         if is_latex && cleaned {
             remove_latex_state(&output_directory);
         }
+        let name = format.as_ref().map(Preamble::name);
+        let invocation = invocation(request.engine, &input, &stem, name.as_deref());
         let mut runs = 0;
         let run = loop {
             runs += 1;
@@ -217,6 +229,14 @@ async fn build(
                 parse::parse_latex_log(&String::from_utf8_lossy(&log), &cwd)
             }
         };
+        // An untested format could be what is wrong, and one normal run decides that.
+        if let Some(used) = format.take_if(|used| {
+            let log = std::fs::read_to_string(&log_path).ok();
+            !run.success && (used.state() != State::Trusted || preamble::format_failed(log.as_deref()))
+        }) {
+            format_dropped = Some(used);
+            continue;
+        }
         // LaTeX reads its own files at \\begin and \\end{document}, so an earlier run
         // that left them broken shows up there. One run without them decides.
         let state_is_broken = diagnostics.iter().any(|diagnostic| {
@@ -230,6 +250,14 @@ async fn build(
         }
         break (run, diagnostics);
     };
+    if run.success {
+        if let Some(format) = &format {
+            format.mark_trusted();
+        }
+        if let Some(format) = &format_dropped {
+            format.mark_unsuitable();
+        }
+    }
     if is_latex || request.engine == Engine::Tectonic {
         explain::locate(&mut diagnostics, &request.main);
     }
@@ -294,7 +322,7 @@ fn failure(message: String, started: Instant) -> BuildOutcome {
     }
 }
 
-fn invocation(engine: Engine, input: &str, stem: &str) -> Invocation {
+fn invocation(engine: Engine, input: &str, stem: &str, format: Option<&str>) -> Invocation {
     let strings = |args: &[&str]| args.iter().map(ToString::to_string).collect::<Vec<_>>();
     let pdf = format!("{OUTPUT_DIRECTORY}/{stem}.pdf");
     match engine {
@@ -313,26 +341,88 @@ fn invocation(engine: Engine, input: &str, stem: &str) -> Invocation {
             args: strings(&[input, "-o", &pdf, "--pdf-engine=typst"]),
             env: Vec::new(),
         },
-        Engine::PdfLatex | Engine::LuaLatex => latex_invocation(engine, input),
+        Engine::PdfLatex | Engine::LuaLatex => latex_invocation(engine, input, format),
     }
 }
 
-fn latex_invocation(engine: Engine, input: &str) -> Invocation {
+/// Builds the format if the preamble has earned one. `None` inside means a normal run,
+/// and only a cancelled build ends up as `None` outside.
+async fn prepare_format(
+    cwd: &Path,
+    output_directory: &Path,
+    main: &Path,
+    input: &str,
+    events: &mpsc::Sender<BuildEvent>,
+    cancelled: &mut oneshot::Receiver<()>,
+    group: &AtomicI32,
+) -> Option<Option<Preamble>> {
+    let (Some(preamble), Some(compiler)) = (Preamble::of(main, output_directory), find_tool("pdflatex")) else {
+        return Some(None);
+    };
+    match preamble.state() {
+        State::New => {
+            preamble.mark_seen();
+            Some(None)
+        }
+        State::Unsuitable => Some(None),
+        State::Untested | State::Trusted => Some(Some(preamble)),
+        State::Wanted => {
+            preamble.remove_others();
+            let name = preamble.name();
+            let args = [
+                "-ini",
+                "-interaction=nonstopmode",
+                "-no-shell-escape",
+                "-recorder",
+                &format!("-output-directory={OUTPUT_DIRECTORY}"),
+                &format!("-jobname={name}"),
+                "&pdflatex",
+                "mylatex.ltx",
+                input,
+            ];
+            let build = Invocation {
+                tool: "pdflatex",
+                args: args.iter().map(ToString::to_string).collect(),
+                env: Vec::new(),
+            };
+            let started = SystemTime::now();
+            let run = run_process(&build, cwd, events, cancelled, group).await?;
+            if run.success && preamble.finish_format(cwd, main, &compiler, started) {
+                Some(Some(preamble))
+            } else {
+                preamble.mark_unsuitable();
+                Some(None)
+            }
+        }
+    }
+}
+
+fn latex_invocation(engine: Engine, input: &str, format: Option<&str>) -> Invocation {
     // A long line limit keeps file names and messages in the log on one line.
     // The limit is set per program, because BibTeX aborts on a value this high.
-    let env = vec![("max_print_line_pdflatex", "100000"), ("max_print_line_lualatex", "100000")];
+    let mut env = vec![("max_print_line_pdflatex", "100000".to_string()), ("max_print_line_lualatex", "100000".to_string())];
+    if format.is_some() {
+        // The trailing colon keeps the normal search path.
+        env.push(("TEXFORMATS", format!("{OUTPUT_DIRECTORY}:")));
+    }
     let common = ["-interaction=nonstopmode", "-file-line-error", "-synctex=1", "-no-shell-escape"];
     if find_tool("latexmk").is_some() {
         // -norc ignores latexmkrc files, which can run arbitrary commands from a project.
         let mode = if engine == Engine::LuaLatex { "-lualatex" } else { "-pdf" };
         let mut args = vec!["-norc".to_string(), mode.to_string()];
         args.extend(common.iter().map(ToString::to_string));
+        if let Some(format) = format {
+            args.push(format!("-pdflatex=pdflatex %O \"&{format}\" %S"));
+        }
         args.push(format!("-outdir={OUTPUT_DIRECTORY}"));
         args.push(input.to_string());
         return Invocation { tool: "latexmk", args, env };
     }
     let mut args: Vec<String> = common.iter().map(ToString::to_string).collect();
     args.push(format!("-output-directory={OUTPUT_DIRECTORY}"));
+    if let Some(format) = format {
+        args.push(format!("&{format}"));
+    }
     args.push(input.to_string());
     Invocation {
         tool: if engine == Engine::LuaLatex { "lualatex" } else { "pdflatex" },
@@ -393,7 +483,7 @@ async fn run_process(
         .args(&invocation.args)
         .current_dir(cwd)
         .env("PATH", child_path())
-        .envs(invocation.env.iter().copied())
+        .envs(invocation.env.iter().map(|(name, value)| (*name, value.as_str())))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -689,6 +779,77 @@ mod tests {
         };
         let outcome = build_file("main.tex", source, Engine::PdfLatex, false, corrupt);
         assert!(outcome.success, "{:?}", outcome.diagnostics);
+    }
+
+    fn latex_project_builds(root: &Path, main: &Path, times: usize) -> Vec<BuildOutcome> {
+        let manager = BuildManager::new();
+        let request = BuildRequest { root: root.to_path_buf(), main: main.to_path_buf(), engine: Engine::PdfLatex, clean: false };
+        (0..times)
+            .map(|_| match block_on(finish(manager.start(request.clone()))) {
+                BuildEvent::Finished(outcome) => outcome,
+                _ => panic!("the build did not finish"),
+            })
+            .collect()
+    }
+
+    fn format_files(root: &Path) -> usize {
+        std::fs::read_dir(root.join(".build"))
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".fmt"))
+            .count()
+    }
+
+    #[test]
+    fn a_repeated_preamble_gets_a_format_and_errors_stay_real() {
+        if find_tool("pdflatex").is_none() || find_tool("kpsewhich").is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let main = root.join("main.tex");
+        std::fs::write(&main, "\\documentclass{article}\n\\begin{document}\nx\n\\end{document}\n").unwrap();
+
+        let outcomes = latex_project_builds(&root, &main, 3);
+        assert!(outcomes.iter().all(|outcome| outcome.success && outcome.pdf.is_some()));
+        assert_eq!(format_files(&root), 1);
+
+        // A typo in the text is reported as such and does not cost the format.
+        std::fs::write(&main, "\\documentclass{article}\n\\begin{document}\n\\undefinedthing\n\\end{document}\n").unwrap();
+        let outcome = latex_project_builds(&root, &main, 1).remove(0);
+        assert!(!outcome.success);
+        assert!(outcome.diagnostics.iter().any(|diagnostic| diagnostic.line == Some(3)), "{:?}", outcome.diagnostics);
+        assert_eq!(format_files(&root), 1);
+    }
+
+    #[test]
+    fn an_index_keeps_its_entries_with_a_format() {
+        if find_tool("pdflatex").is_none() || find_tool("kpsewhich").is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let main = root.join("main.tex");
+        std::fs::write(&main, "\\documentclass{article}\n\\makeindex\n\\begin{document}\nx\\index{x}\n\\end{document}\n").unwrap();
+        let outcomes = latex_project_builds(&root, &main, 3);
+        assert!(outcomes.iter().all(|outcome| outcome.success));
+        assert!(std::fs::read_to_string(root.join(".build/main.idx")).unwrap().contains("indexentry{x}"));
+    }
+
+    #[test]
+    fn a_package_that_opens_a_file_keeps_it_with_a_format() {
+        if find_tool("pdflatex").is_none() || find_tool("kpsewhich").is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let main = root.join("main.tex");
+        std::fs::write(root.join("local.sty"), "\\newwrite\\extra\n\\immediate\\openout\\extra=extra.txt\n").unwrap();
+        std::fs::write(&main, "\\documentclass{article}\n\\usepackage{local}\n\\begin{document}\nx\\immediate\\write\\extra{hello}\n\\end{document}\n").unwrap();
+        let outcomes = latex_project_builds(&root, &main, 3);
+        assert!(outcomes.iter().all(|outcome| outcome.success));
+        assert_eq!(format_files(&root), 1);
+        assert!(std::fs::read_to_string(root.join(".build/extra.txt")).unwrap().contains("hello"));
     }
 
     #[test]

@@ -377,6 +377,8 @@ pub struct Workspace {
     preview_state: PreviewState,
     /// LaTeX state from a failed or stopped run must not reach the next run.
     clean_next_build: bool,
+    /// A change arrived during a build, so one more build follows it.
+    build_queued: bool,
     engine: Option<Engine>,
     synctex: Option<SyncTex>,
     sync_on_click: bool,
@@ -523,6 +525,7 @@ impl Workspace {
             error_card_dismissed: false,
             preview_state: PreviewState::Current,
             clean_next_build: false,
+            build_queued: false,
             engine: None,
             synctex: None,
             sync_on_click: true,
@@ -934,7 +937,7 @@ impl Workspace {
                         if close && let Some(index) = this.documents.iter().position(|document| document.view == view) {
                             this.remove_document(index, window, cx);
                         } else if this.config.trigger == Trigger::Save {
-                            this.recompile(cx);
+                            this.build_when_free(cx);
                         }
                     }
                     Ok(false) => {}
@@ -1143,7 +1146,7 @@ impl Workspace {
                     self.notify_addons_saved(&view, cx);
                 }
                 if saved && self.config.trigger == Trigger::Save {
-                    self.recompile(cx);
+                    self.build_when_free(cx);
                 }
             }
             Err(error) if is_save_conflict(&error) => self.ask_about_conflict(view, false, window, cx),
@@ -1605,8 +1608,10 @@ impl Workspace {
         };
         self.engine = Some(engine);
         self.last_main = Some(main.clone());
-        // Starting over stops a running build, which can leave broken files behind.
-        let clean = std::mem::take(&mut self.clean_next_build) || self.building;
+        self.build_queued = false;
+        // The runner recovers from broken files by itself, and the files make the next
+        // run much faster, so only a request from the author deletes them.
+        let clean = std::mem::take(&mut self.clean_next_build);
         self.building = true;
         self.build_log.clear();
         self.status = Some(format!("Compiling with {}…", engine.label()).into());
@@ -1646,8 +1651,28 @@ impl Workspace {
         let delay = Duration::from_millis(self.config.debounce_ms);
         self.debounce_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(delay).await;
-            this.update(cx, |this, cx| this.recompile(cx)).ok();
+            this.update(cx, |this, cx| this.build_when_free(cx)).ok();
         }));
+    }
+
+    /// For builds nobody asked for by hand. Stopping a run for every pause in typing
+    /// would mean that a long document never gets a new preview.
+    fn build_when_free(&mut self, cx: &mut Context<Self>) {
+        if self.building {
+            self.build_queued = true;
+        } else {
+            self.recompile(cx);
+        }
+    }
+
+    /// `latexmk` repeats the old failure while no file changed, also if a package
+    /// has been installed since. Asking again by hand means starting over then.
+    fn recompile_by_hand(&mut self, cx: &mut Context<Self>) {
+        let unchanged = !self.documents.iter().any(|document| document.view.read(cx).state.is_dirty());
+        if unchanged && !self.last_build_succeeded && !self.building {
+            self.clean_next_build = true;
+        }
+        self.recompile(cx);
     }
 
     fn handle_build_event(&mut self, event: BuildEvent, cx: &mut Context<Self>) {
@@ -1668,7 +1693,7 @@ impl Workspace {
             }
             BuildEvent::Cancelled => {
                 self.building = false;
-                self.clean_next_build = true;
+                self.build_queued = false;
                 self.set_status("Build stopped.", cx);
                 self.reply_to_compile_waiters(|| Err("The build was stopped.".to_string()), cx);
             }
@@ -1686,7 +1711,6 @@ impl Workspace {
             )
             .into(),
         );
-        self.clean_next_build = !outcome.success;
         self.last_build_succeeded = outcome.success;
         self.diagnostics = outcome.diagnostics;
         self.diagnostics.sort_by_key(|diagnostic| diagnostic.severity != Severity::Error);
@@ -1736,6 +1760,9 @@ impl Workspace {
                 .ok();
             })
         });
+        if std::mem::take(&mut self.build_queued) {
+            self.recompile(cx);
+        }
         cx.notify();
     }
 
@@ -3418,7 +3445,7 @@ impl Workspace {
                 menu_separator(),
                 entry("Open folder…", "⌘O", |this, window, cx| this.prompt_open_folder(window, cx)),
                 entry("Save", "⌘S", |this, window, cx| this.save_active(window, cx)),
-                entry("Recompile", "⌘↩", |this, _, cx| this.recompile(cx)),
+                entry("Recompile", "⌘↩", |this, _, cx| this.recompile_by_hand(cx)),
             ],
             Menu::Edit => vec![
                 entry("Undo", "⌘Z", |this, _, cx| this.with_active(cx, |view, cx| view.undo_edit(cx))),
@@ -3464,7 +3491,7 @@ impl Workspace {
                 let engine = self.config.engine;
                 let debounce = self.config.debounce_ms;
                 vec![
-                    entry("Recompile", "⌘↩", |this, _, cx| this.recompile(cx)),
+                    entry("Recompile", "⌘↩", |this, _, cx| this.recompile_by_hand(cx)),
                     entry("Recompile from scratch", "", |this, _, cx| this.recompile_from_scratch(cx)),
                     entry("Stop build", "", |this, _, _| this.build.cancel()),
                     entry(check(trigger == Trigger::Save, "Compile on save"), "", |this, _, cx| {
@@ -4533,7 +4560,7 @@ impl Workspace {
                                     .id("recompile")
                                     .px(px(14.))
                                     .cursor_pointer()
-                                    .on_click(cx.listener(|this, _, _, cx| this.recompile(cx)))
+                                    .on_click(cx.listener(|this, _, _, cx| this.recompile_by_hand(cx)))
                                     .child(if self.building { "Compiling…" } else { "Recompile" }),
                             )
                             .child(
@@ -5693,7 +5720,7 @@ impl Render for Workspace {
                     this.open_picker(PickerKind::Citations, window, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &Recompile, _, cx| this.recompile(cx)))
+            .on_action(cx.listener(|this, _: &Recompile, _, cx| this.recompile_by_hand(cx)))
             .on_action(cx.listener(|this, _: &GoToTab1, window, cx| this.go_to_tab(0, window, cx)))
             .on_action(cx.listener(|this, _: &GoToTab2, window, cx| this.go_to_tab(1, window, cx)))
             .on_action(cx.listener(|this, _: &GoToTab3, window, cx| this.go_to_tab(2, window, cx)))
