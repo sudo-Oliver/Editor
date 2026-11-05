@@ -55,6 +55,7 @@ actions!(
 actions!(
     workspace,
     [
+        NewFile,
         OpenFolder,
         Save,
         InsertCitation,
@@ -144,6 +145,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-shift-d", LookupDoi, None),
         KeyBinding::new("secondary-.", QuickFix, None),
         KeyBinding::new("secondary-enter", Recompile, None),
+        KeyBinding::new("secondary-n", NewFile, None),
         KeyBinding::new("secondary-o", OpenFolder, None),
         KeyBinding::new("secondary-w", CloseTab, None),
         KeyBinding::new("secondary-1", GoToTab1, None),

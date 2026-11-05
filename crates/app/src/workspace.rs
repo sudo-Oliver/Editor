@@ -18,11 +18,12 @@ use editor_core::{
     Language, Mark, MarkSeverity,
     snippet::Snippet,
     vim::{self, Effect, Key, Leader, Mode},
+    word_count::{self, WordCount},
 };
 use gpui::{
-    AnyElement, Anchor, App, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Entity, FocusHandle, Focusable, FontWeight, Keystroke,
+    AnyElement, Anchor, App, AsyncWindowContext, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Entity, FocusHandle, Focusable, FontWeight, Keystroke,
     KeystrokeEvent, MouseButton, MouseMoveEvent, PathPromptOptions, Pixels, Point, Render, ScrollHandle, SharedString,
-    EntityId, Subscription, Task, Window, anchored, black, canvas, deferred, div, fill, point, prelude::*, px, size, svg,
+    EntityId, PromptLevel, Subscription, Task, WeakEntity, Window, anchored, black, canvas, deferred, div, fill, point, prelude::*, px, size, svg,
 };
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use synctex::SyncTex;
@@ -33,6 +34,7 @@ use crate::{
     addons::{self, Installed},
     marketplace::{self, CatalogEntry},
     editor_view::{EditorEvent, EditorView, FormatKind},
+    export::{self, DraftFormat, PdfState},
     file_tree::{self, TreeEntry},
     git_panel::{self, GitPanel, GitPanelEvent},
     outline::{self, OutlineItem},
@@ -137,6 +139,7 @@ struct TreeInput {
 enum Dialog {
     Settings(SettingsPage),
     Shortcuts,
+    WordCount,
 }
 
 /// How the PDF on screen relates to the last build.
@@ -153,7 +156,15 @@ enum PreviewState {
 
 type MenuHandler = Rc<dyn Fn(&mut Workspace, &mut Window, &mut Context<Workspace>)>;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MenuEntryKind {
+    Action,
+    Heading,
+    Separator,
+}
+
 struct MenuEntry {
+    kind: MenuEntryKind,
     label: String,
     shortcut: &'static str,
     handler: MenuHandler,
@@ -165,10 +176,61 @@ fn entry(
     handler: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
 ) -> MenuEntry {
     MenuEntry {
+        kind: MenuEntryKind::Action,
         label: label.into(),
         shortcut,
         handler: Rc::new(handler),
     }
+}
+
+fn menu_heading(label: &str) -> MenuEntry {
+    MenuEntry { kind: MenuEntryKind::Heading, ..entry(label, "", |_, _, _| {}) }
+}
+
+fn menu_separator() -> MenuEntry {
+    MenuEntry { kind: MenuEntryKind::Separator, ..entry("", "", |_, _, _| {}) }
+}
+
+struct PdfSnapshot {
+    root: PathBuf,
+    pdf: PathBuf,
+    building: bool,
+    unsaved: bool,
+    has_errors: bool,
+    last_good: bool,
+    warnings: Vec<String>,
+}
+
+const REPORT_LIST_LIMIT: usize = 10;
+
+fn shortened_list(items: &[String]) -> String {
+    let mut lines: Vec<String> = items.iter().take(REPORT_LIST_LIMIT).cloned().collect();
+    if items.len() > REPORT_LIST_LIMIT {
+        lines.push(format!("and {} more", items.len() - REPORT_LIST_LIMIT));
+    }
+    lines.join("\n")
+}
+
+async fn ask(
+    this: &WeakEntity<Workspace>,
+    cx: &mut AsyncWindowContext,
+    level: PromptLevel,
+    message: &str,
+    detail: &str,
+    answers: &[&str],
+) -> Option<usize> {
+    let answer = this.update_in(cx, |_, window, cx| window.prompt(level, message, Some(detail), answers, cx)).ok()?;
+    answer.await.ok()
+}
+
+fn show_status(this: &WeakEntity<Workspace>, cx: &mut AsyncWindowContext, message: &str) {
+    let message = message.to_string();
+    this.update(cx, |this, cx| this.set_status(message, cx)).ok();
+}
+
+async fn fail_export(this: &WeakEntity<Workspace>, cx: &mut AsyncWindowContext, error: &str) {
+    show_status(this, cx, "Export failed. Nothing was written.");
+    ask(this, cx, PromptLevel::Critical, "The export failed", error, &["OK"]).await;
 }
 
 struct OpenDocument {
@@ -316,6 +378,11 @@ pub struct Workspace {
     /// Shown instead of the editor. The tabs stay as they are.
     images: Vec<ImagePreview>,
     shown_image: Option<usize>,
+    /// Exports run one at a time, from the first dialog to the last.
+    export_running: bool,
+    last_build_succeeded: bool,
+    word_count: Option<Result<WordCount, String>>,
+    word_count_task: Option<Task<()>>,
     last_pdf: Option<PathBuf>,
     last_main: Option<PathBuf>,
     /// The main file of the PDF on screen.
@@ -444,6 +511,10 @@ impl Workspace {
             follow_task: None,
             images: Vec::new(),
             shown_image: None,
+            export_running: false,
+            last_build_succeeded: false,
+            word_count: None,
+            word_count_task: None,
             last_pdf: None,
             last_main: None,
             pdf_main: None,
@@ -1335,6 +1406,7 @@ impl Workspace {
             .into(),
         );
         self.clean_next_build = !outcome.success;
+        self.last_build_succeeded = outcome.success;
         self.diagnostics = outcome.diagnostics;
         self.diagnostics.sort_by_key(|diagnostic| diagnostic.severity != Severity::Error);
         self.problems = problems::problems(&self.diagnostics);
@@ -1928,6 +2000,392 @@ impl Workspace {
         }
     }
 
+    // File menu
+
+    /// Copies the open file beside itself, with unsaved changes, and opens the copy.
+    fn make_copy(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let source = match (self.image_preview(), self.active_view()) {
+            (Some(preview), _) => Some((preview.view.read(cx).path().to_path_buf(), None)),
+            (None, Some(view)) => {
+                let view = view.read(cx);
+                view.path.clone().map(|path| (path, Some(view.state.buffer().to_string())))
+            }
+            (None, None) => None,
+        };
+        let Some((path, text)) = source else {
+            self.set_status("Open a file to copy it.", cx);
+            return;
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let copied = cx.background_spawn(async move { file_tree::make_copy(&path, text.as_deref()) }).await;
+            this.update_in(cx, |this, window, cx| match copied {
+                Ok(copy) => {
+                    this.reveal_new_entry(&copy, cx);
+                    this.open_file(copy, window, cx);
+                }
+                Err(error) => this.set_status(format!("Cannot copy: {error}"), cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn show_version_history(&mut self, cx: &mut Context<Self>) {
+        self.show_file_panel = true;
+        self.left_panel = LeftPanel::Git;
+        self.git_panel.update(cx, |panel, cx| panel.show_history_section(cx));
+        cx.notify();
+    }
+
+    fn show_word_count(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self.root.clone() else {
+            self.set_status("Open a folder first.", cx);
+            return;
+        };
+        let active = self.active_view().and_then(|view| view.read(cx).path.clone());
+        let Some(main) = build::find_main(&root, &self.config, active.as_deref()) else {
+            self.set_status("This file type has no word count.", cx);
+            return;
+        };
+        let open: Vec<(PathBuf, String)> = self
+            .documents
+            .iter()
+            .filter_map(|document| {
+                let view = document.view.read(cx);
+                Some((view.path.clone()?, view.state.buffer().to_string()))
+            })
+            .collect();
+        // LaTeX runs in the main file's folder, and Typst resolves `/` from the project.
+        let base = if Language::from_path(&main) == Language::Typst {
+            root
+        } else {
+            main.parent().unwrap_or(&root).to_path_buf()
+        };
+        self.word_count = None;
+        self.open_dialog(Dialog::WordCount, window, cx);
+        self.word_count_task = Some(cx.spawn(async move |this, cx| {
+            let counted = cx
+                .background_spawn(async move {
+                    let open: HashMap<PathBuf, String> =
+                        open.into_iter().filter_map(|(path, text)| Some((path.canonicalize().ok()?, text))).collect();
+                    let mut read = |path: &Path| {
+                        path.canonicalize()
+                            .ok()
+                            .and_then(|path| open.get(&path).cloned().or_else(|| std::fs::read_to_string(&path).ok()))
+                    };
+                    let text = read(&main).ok_or_else(|| format!("Cannot read {}", main.display()))?;
+                    Ok(word_count::count_words(&main, &text, &base, &mut read))
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.word_count = Some(counted);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn render_word_count(&self) -> Vec<AnyElement> {
+        let note = |text: String| div().text_color(theme::color(theme::UI_MUTED)).mt(px(12.)).child(text).into_any_element();
+        let row = |label: String, value: usize, strong: bool| {
+            div()
+                .flex()
+                .flex_none()
+                .justify_between()
+                .gap(px(24.))
+                .py(px(2.))
+                .when(strong, |element| element.font_weight(FontWeight::SEMIBOLD))
+                .child(div().min_w_0().truncate().child(label))
+                .child(div().flex_none().child(value.to_string()))
+                .into_any_element()
+        };
+        let counted = match &self.word_count {
+            None => return vec![div().child("Counting…").into_any_element()],
+            Some(Err(error)) => return vec![div().child(error.clone()).into_any_element()],
+            Some(Ok(counted)) => counted,
+        };
+        let mut rows = vec![
+            row("Total words".to_string(), counted.total(), true),
+            row("Text".to_string(), counted.body, false),
+            row("Headings".to_string(), counted.headings, false),
+            row("Captions".to_string(), counted.captions, false),
+            row("Inline formulas".to_string(), counted.inline_math, false),
+            row("Display formulas".to_string(), counted.display_math, false),
+        ];
+        if !counted.missing.is_empty() {
+            rows.push(note(format!("Not found, so not counted: {}", counted.missing.join(", "))));
+        }
+        rows.push(note(
+            "Counted from the source. Comments, math, code, labels, citations and the preamble do not count, nor does text that only macros or Typst functions generate."
+                .to_string(),
+        ));
+        if !counted.sections.is_empty() {
+            rows.push(div().mt(px(12.)).font_weight(FontWeight::SEMIBOLD).child("Words per section").into_any_element());
+            rows.extend(counted.sections.iter().map(|section| row(section.title.clone(), section.words, false)));
+        }
+        rows
+    }
+
+    /// Runs one export, from its first dialog to its last, off the main thread's way.
+    fn start_export(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        flow: impl AsyncFnOnce(WeakEntity<Self>, &mut AsyncWindowContext) + 'static,
+    ) {
+        if self.export_running {
+            self.set_status("An export is running.", cx);
+            return;
+        }
+        self.export_running = true;
+        cx.spawn_in(window, async move |this, cx| {
+            flow(this.clone(), cx).await;
+            this.update(cx, |this, cx| {
+                this.export_running = false;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn show_notice(&mut self, message: &str, detail: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // No answer to wait for: the dialog stays open without the receiver.
+        drop(window.prompt(PromptLevel::Info, message, Some(detail), &["OK"], cx));
+    }
+
+    /// Everything saved, or the author agreed to save. `false` ends the export.
+    async fn save_for_export(this: &WeakEntity<Self>, cx: &mut AsyncWindowContext) -> bool {
+        let unsaved = this
+            .update(cx, |this, cx| this.documents.iter().any(|document| document.view.read(cx).state.is_dirty()))
+            .unwrap_or(false);
+        if unsaved {
+            let question = "Save your changes before the export?";
+            let detail = "The export reads the files on disk.";
+            let answer = ask(this, cx, PromptLevel::Warning, question, detail, &["Save and export", "Cancel"]).await;
+            if answer != Some(0) {
+                return false;
+            }
+        }
+        this.update(cx, |this, cx| this.save_all(cx)).unwrap_or(false)
+    }
+
+    /// Asks where the export goes. A source file is never a valid place.
+    async fn ask_target(this: &WeakEntity<Self>, cx: &mut AsyncWindowContext, directory: PathBuf, name: String) -> Option<PathBuf> {
+        let sources = this
+            .update(cx, |this, cx| {
+                let open = this.documents.iter().filter_map(|document| document.view.read(cx).path.clone());
+                open.chain(this.last_main.clone()).collect::<Vec<PathBuf>>()
+            })
+            .ok()?;
+        let answer = this.update(cx, |_, cx| cx.prompt_for_new_path(&directory, Some(&name))).ok()?;
+        let target = match answer.await {
+            Ok(Ok(Some(target))) => target,
+            Ok(Err(error)) => {
+                fail_export(this, cx, &error.to_string()).await;
+                return None;
+            }
+            _ => return None,
+        };
+        if export::is_source(&target, &sources) {
+            fail_export(this, cx, &format!("{} is a source file of this project. Choose another name.", target.display())).await;
+            return None;
+        }
+        Some(target)
+    }
+
+    fn download_source(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self.root.clone() else {
+            self.set_status("Open a folder first.", cx);
+            return;
+        };
+        let downloads_packages = self.config.engine == Some(Engine::Tectonic);
+        self.start_export(window, cx, async move |this, cx| {
+            if !Self::save_for_export(&this, cx).await {
+                return;
+            }
+            let name = root.file_name().map_or_else(|| "project".to_string(), |name| name.to_string_lossy().into_owned());
+            let folder = root.parent().unwrap_or(&root).to_path_buf();
+            let Some(target) = Self::ask_target(&this, cx, folder, format!("{name}.zip")).await else {
+                return;
+            };
+            show_status(&this, cx, "Reading the project…");
+            let (source, destination) = (root.clone(), target.clone());
+            let listed = cx.background_spawn(async move { export::project_entries(&source, &destination) }).await;
+            let mut entries = match listed {
+                Ok(entries) => entries,
+                Err(error) => return fail_export(&this, cx, &error).await,
+            };
+            let suspicious = export::suspicious_files(&entries);
+            if !suspicious.is_empty() {
+                let question = "These files may hold secrets";
+                let detail = shortened_list(&suspicious);
+                match ask(&this, cx, PromptLevel::Warning, question, &detail, &["Leave out", "Include", "Cancel"]).await {
+                    Some(0) => entries.retain(|entry| !suspicious.contains(&entry.relative)),
+                    Some(1) => {}
+                    _ => return show_status(&this, cx, "Export cancelled."),
+                }
+            }
+            show_status(&this, cx, "Packing and checking the archive…");
+            let files = entries.len();
+            let destination = target.clone();
+            let packed = cx
+                .background_spawn(async move {
+                    export::zip_project(&entries, &destination)?;
+                    Ok::<bool, String>(export::uses_online_packages(&entries))
+                })
+                .await;
+            match packed {
+                Ok(online) => {
+                    show_status(&this, cx, &format!("Archive saved and checked, {files} entries."));
+                    if online || downloads_packages {
+                        let detail = "This project downloads packages when it compiles. They are not in the archive.";
+                        ask(&this, cx, PromptLevel::Info, "Archive saved", detail, &["OK"]).await;
+                    }
+                }
+                Err(error) => fail_export(&this, cx, &error).await,
+            }
+        });
+    }
+
+    /// The build's state as the check before a PDF export reads it.
+    fn pdf_snapshot(&self, cx: &App) -> Option<PdfSnapshot> {
+        Some(PdfSnapshot {
+            root: self.root.clone()?,
+            pdf: self.last_pdf.clone()?,
+            building: self.building,
+            unsaved: self.documents.iter().any(|document| document.view.read(cx).state.is_dirty()),
+            has_errors: self.preview_state == PreviewState::Incomplete,
+            last_good: self.preview_state == PreviewState::LastGood,
+            warnings: self
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.severity == Severity::Warning)
+                .map(|diagnostic| diagnostic.message.clone())
+                .collect(),
+        })
+    }
+
+    fn download_pdf(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.last_pdf.is_none() {
+            self.show_notice("There is no PDF yet", "Recompile, then download the PDF.", window, cx);
+            return;
+        }
+        self.start_export(window, cx, async move |this, cx| {
+            let pdf = loop {
+                let Ok(Some(snapshot)) = this.update(cx, |this, cx| this.pdf_snapshot(cx)) else {
+                    return show_status(&this, cx, "The build left no PDF, so nothing was exported.");
+                };
+                let (root, pdf) = (snapshot.root.clone(), snapshot.pdf.clone());
+                let (newest_source, pdf_modified) = cx
+                    .background_spawn(async move {
+                        let name = pdf.file_name().map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+                        (export::newest_source(&root, &name), std::fs::metadata(&pdf).and_then(|metadata| metadata.modified()).ok())
+                    })
+                    .await;
+                let problems = export::pdf_problems(&PdfState {
+                    building: snapshot.building,
+                    unsaved: snapshot.unsaved,
+                    has_errors: snapshot.has_errors,
+                    last_good: snapshot.last_good,
+                    newest_source,
+                    pdf_modified,
+                    warnings: &snapshot.warnings,
+                });
+                if problems.is_empty() {
+                    break snapshot.pdf;
+                }
+                let buttons = ["Recompile first", "Export anyway", "Cancel"];
+                match ask(&this, cx, PromptLevel::Warning, "This PDF may not be ready", &problems.join("\n"), &buttons).await {
+                    Some(0) => {
+                        if !Self::rebuild_for_export(&this, cx).await {
+                            return show_status(&this, cx, "The build failed, so nothing was exported.");
+                        }
+                    }
+                    Some(1) => break snapshot.pdf,
+                    _ => return,
+                }
+            };
+            let Ok(Some(root)) = this.read_with(cx, |this, _| this.root.clone()) else {
+                return;
+            };
+            let name = pdf.file_name().map_or_else(|| "document.pdf".to_string(), |name| name.to_string_lossy().into_owned());
+            let Some(target) = Self::ask_target(&this, cx, root, name).await else {
+                return;
+            };
+            let destination = target.clone();
+            match cx.background_spawn(async move { export::copy_pdf(&pdf, &destination) }).await {
+                Ok(()) => show_status(&this, cx, &format!("PDF saved to {}", target.display())),
+                Err(error) => fail_export(&this, cx, &error).await,
+            }
+        });
+    }
+
+    /// Saves and builds, and tells whether the build worked.
+    async fn rebuild_for_export(this: &WeakEntity<Self>, cx: &mut AsyncWindowContext) -> bool {
+        let started = this.update(cx, |this, cx| {
+            this.last_build_succeeded = false;
+            this.recompile(cx);
+            this.building
+        });
+        if !started.unwrap_or(false) {
+            return false;
+        }
+        loop {
+            cx.background_executor().timer(Duration::from_millis(100)).await;
+            match this.read_with(cx, |this, _| (this.building, this.last_build_succeeded)) {
+                Ok((true, _)) => {}
+                Ok((false, succeeded)) => return succeeded,
+                Err(_) => return false,
+            }
+        }
+    }
+
+    fn download_draft(&mut self, format: DraftFormat, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self.root.clone() else {
+            self.set_status("Open a folder first.", cx);
+            return;
+        };
+        let active = self.active_view().and_then(|view| view.read(cx).path.clone());
+        let main = build::find_main(&root, &self.config, active.as_deref()).filter(|main| export::pandoc_reader(main).is_some());
+        let Some(main) = main else {
+            self.show_notice("This file has no draft export", "Drafts need a LaTeX, Typst or Markdown file.", window, cx);
+            return;
+        };
+        let Some(pandoc) = build::find_tool("pandoc") else {
+            self.show_notice("Pandoc is not installed", "Word, HTML and Markdown drafts need Pandoc. The PDF and source downloads work without it.", window, cx);
+            return;
+        };
+        self.start_export(window, cx, async move |this, cx| {
+            if !Self::save_for_export(&this, cx).await {
+                return;
+            }
+            let stem = main.file_stem().map_or_else(|| "document".to_string(), |stem| stem.to_string_lossy().into_owned());
+            let name = format!("{stem}-draft.{}", format.extension());
+            let Some(target) = Self::ask_target(&this, cx, root, name).await else {
+                return;
+            };
+            show_status(&this, cx, "Converting with Pandoc…");
+            let destination = target.clone();
+            let converted = cx.background_spawn(async move { export::run_pandoc(&pandoc, &main, format, &destination) }).await;
+            let draft = match converted {
+                Ok(draft) => draft,
+                Err(error) => return fail_export(&this, cx, &error).await,
+            };
+            if !draft.report.is_empty() {
+                let detail = shortened_list(&draft.report);
+                let answer = ask(&this, cx, PromptLevel::Warning, "Not in this draft", &detail, &["Keep draft", "Discard"]).await;
+                if answer != Some(0) {
+                    return show_status(&this, cx, "Draft discarded.");
+                }
+            }
+            match cx.background_spawn(async move { draft.keep(&target) }).await {
+                Ok(()) => show_status(&this, cx, "Draft saved. Layout differs from the PDF."),
+                Err(error) => fail_export(&this, cx, &error).await,
+            }
+        });
+    }
+
     // File tree keys
 
     fn focus_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2003,6 +2461,7 @@ impl Workspace {
             return;
         };
         let back_to_tree = self.tree_focus.is_focused(window);
+        self.show_files();
         let view = cx.new(|cx| {
             let mut view = EditorView::new("", None, cx);
             view.set_plain();
@@ -2012,8 +2471,14 @@ impl Workspace {
         window.focus(&view.read(cx).focus_handle(cx), cx);
         self.tree_input = Some(TreeInput { folder, parent, view, back_to_tree, _observer });
         self.tree_error = None;
-        self.show_tree = true;
         cx.notify();
+    }
+
+    /// Menu actions can start with the panel closed, or on another of its pages.
+    fn show_files(&mut self) {
+        self.show_file_panel = true;
+        self.show_tree = true;
+        self.left_panel = LeftPanel::Files;
     }
 
     fn close_tree_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2073,6 +2538,7 @@ impl Workspace {
         let Some(folder) = self.creation_folder(window) else {
             return;
         };
+        self.show_files();
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -2654,6 +3120,21 @@ impl Workspace {
         let check = |on: bool, label: &str| format!("{} {label}", if on { "✓" } else { "  " });
         match menu {
             Menu::File => vec![
+                entry("New file…", "⌘N", |this, window, cx| this.open_tree_input(false, window, cx)),
+                entry("New folder…", "", |this, window, cx| this.open_tree_input(true, window, cx)),
+                entry("Add files…", "", |this, window, cx| this.prompt_add_files(window, cx)),
+                entry("Make a copy", "", |this, window, cx| this.make_copy(window, cx)),
+                menu_separator(),
+                entry("Version history", "", |this, _, cx| this.show_version_history(cx)),
+                entry("Word count…", "", |this, window, cx| this.show_word_count(window, cx)),
+                menu_separator(),
+                menu_heading("Download"),
+                entry("Source (.zip)…", "", |this, window, cx| this.download_source(window, cx)),
+                entry("PDF…", "", |this, window, cx| this.download_pdf(window, cx)),
+                entry("Word draft (.docx)…", "", |this, window, cx| this.download_draft(DraftFormat::Word, window, cx)),
+                entry("HTML draft…", "", |this, window, cx| this.download_draft(DraftFormat::Html, window, cx)),
+                entry("Markdown draft…", "", |this, window, cx| this.download_draft(DraftFormat::Markdown, window, cx)),
+                menu_separator(),
                 entry("Open folder…", "⌘O", |this, window, cx| this.prompt_open_folder(window, cx)),
                 entry("Save", "⌘S", |this, _, cx| this.save_active(cx)),
                 entry("Recompile", "⌘↩", |this, _, cx| this.recompile(cx)),
@@ -2806,6 +3287,20 @@ impl Workspace {
                         .border_color(theme::color(theme::DIVIDER))
                         .shadow_lg()
                         .children(items.into_iter().enumerate().map(|(index, item)| {
+                            match item.kind {
+                                MenuEntryKind::Separator => {
+                                    return div().my(px(4.)).h(px(1.)).bg(theme::color(theme::DIVIDER)).into_any_element();
+                                }
+                                MenuEntryKind::Heading => {
+                                    return div()
+                                        .px(px(12.))
+                                        .py(px(3.))
+                                        .text_color(theme::color(theme::UI_MUTED))
+                                        .child(item.label.clone())
+                                        .into_any_element();
+                                }
+                                MenuEntryKind::Action => {}
+                            }
                             let handler = item.handler.clone();
                             div()
                                 .id(index)
@@ -2827,6 +3322,7 @@ impl Workspace {
                                         .text_color(theme::color(theme::UI_MUTED))
                                         .child(item.shortcut),
                                 )
+                                .into_any_element()
                         })),
                 ),
         )
@@ -4555,11 +5051,13 @@ impl Workspace {
         let title = match dialog {
             Dialog::Settings(_) => "Settings",
             Dialog::Shortcuts => "Keyboard shortcuts",
+            Dialog::WordCount => "Word count",
         };
         let content = match dialog {
             Dialog::Settings(SettingsPage::Editor) => self.render_editor_settings(cx),
             Dialog::Settings(SettingsPage::Compiler) => self.render_compiler_settings(cx),
             Dialog::Shortcuts => self.render_shortcuts(),
+            Dialog::WordCount => self.render_word_count(),
         };
         div()
             .id("dialog-backdrop")
@@ -4611,7 +5109,7 @@ impl Workspace {
                             .when_some(
                                 match dialog {
                                     Dialog::Settings(page) => Some(page),
-                                    Dialog::Shortcuts => None,
+                                    Dialog::Shortcuts | Dialog::WordCount => None,
                                 },
                                 |element, page| {
                                     element.child(
@@ -4888,6 +5386,11 @@ impl Render for Workspace {
             )
             .on_action(cx.listener(|this, _: &OpenFolder, window, cx| this.prompt_open_folder(window, cx)))
             .on_action(cx.listener(|this, _: &Save, _, cx| this.save_active(cx)))
+            .on_action(cx.listener(|this, _: &NewFile, window, cx| {
+                if this.dialog.is_none() {
+                    this.open_tree_input(false, window, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &LookupDoi, _, cx| this.lookup_doi(cx)))
             .on_action(cx.listener(|this, _: &QuickFix, _, cx| this.quick_fix(cx)))
             .on_action(cx.listener(|this, _: &InsertCitation, window, cx| {

@@ -105,6 +105,14 @@ add-on on.
 
 A dropdown is a quiet button with the chosen option and a chevron. Its list opens upward, 200 wide, in the panel color with a divider border, and marks the chosen option with a check. Arrows or `j` and `k` move, Enter chooses, and Esc or a click elsewhere closes it and gives the focus back.
 
+## File menu
+
+Menu rows keep their size. A separator is 1 high with 4 above and below, in the divider color. A heading such as `Download` is muted and takes no clicks. Rows under it are not indented.
+
+Word count uses the dialog of the settings, without its side tabs. The total comes first in semibold, then the limits of the count, then the words per section, so that the limits show without scrolling.
+
+Export questions use the system's alert, and the target comes from the system's save dialog. The safe or usual choice is the first button. The status in the preview toolbar shows the running step and the result.
+
 ## DOI dialog
 
 An add-on with the `lookup_doi` permission draws a dialog over the top of the window, opened with Cmd+Shift+D, Insert > Citation from a DOI, or `Space r` in Vim mode. Enter presses its default button, and Esc closes it and drops an answer still on its way. A dialog without a default button, as for a retracted work, ignores Enter.

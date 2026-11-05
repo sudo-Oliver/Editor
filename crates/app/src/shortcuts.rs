@@ -26,6 +26,7 @@ pub fn sections(vim_mode: bool) -> Vec<Section> {
             rows: vec![
                 (modified("S"), "Save"),
                 (modified("Return"), "Recompile"),
+                (modified("N"), "New file"),
                 (modified("O"), "Open folder"),
                 (modified("W"), "Close tab"),
                 (modified("1 to 9"), "Go to tab"),
