@@ -1,11 +1,13 @@
 use std::{
     collections::HashSet,
     fs,
-    io::{self, ErrorKind},
+    io::{self, ErrorKind, Write},
     path::{Component, Path, PathBuf},
 };
 
 use ignore::WalkBuilder;
+
+const COPY_NAME_LIMIT: usize = 999;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TreeEntry {
@@ -24,7 +26,10 @@ pub fn scan(root: &Path, collapsed: &HashSet<PathBuf>) -> Vec<TreeEntry> {
         .require_git(false)
         .filter_entry(|entry| {
             let name = entry.file_name();
-            name != ".git" && name != ".build" && name != ".DS_Store"
+            name != ".git"
+                && name != ".build"
+                && name != ".DS_Store"
+                && !name.to_string_lossy().starts_with(crate::export::TEMP_PREFIX)
         })
         .build();
     for entry in walker.flatten() {
@@ -146,9 +151,63 @@ pub fn copy_into(folder: &Path, sources: &[PathBuf]) -> CopyReport {
     report
 }
 
+/// `a.tex` becomes `a-copy.tex`, then `a-copy-2.tex`. No blank, as LaTeX can fail on one.
+fn copy_name(path: &Path, attempt: usize) -> PathBuf {
+    let stem = path.file_stem().map_or_else(String::new, |stem| stem.to_string_lossy().into_owned());
+    let number = if attempt > 1 { format!("-{attempt}") } else { String::new() };
+    let name = match path.extension() {
+        Some(extension) => format!("{stem}-copy{number}.{}", extension.to_string_lossy()),
+        None => format!("{stem}-copy{number}"),
+    };
+    path.with_file_name(name)
+}
+
+/// Creates a copy beside `source`, from `text` when given and else from the file.
+/// An existing file never gets replaced, and a failed copy leaves nothing behind.
+pub fn make_copy(source: &Path, text: Option<&str>) -> io::Result<PathBuf> {
+    for attempt in 1..=COPY_NAME_LIMIT {
+        let target = copy_name(source, attempt);
+        let mut file = match fs::OpenOptions::new().write(true).create_new(true).open(&target) {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        let written = match text {
+            Some(text) => file.write_all(text.as_bytes()),
+            None => fs::File::open(source).and_then(|mut input| io::copy(&mut input, &mut file)).map(|_| ()),
+        };
+        if let Err(error) = written.and_then(|()| file.sync_all()) {
+            fs::remove_file(&target).ok();
+            return Err(error);
+        }
+        return Ok(target);
+    }
+    Err(io::Error::new(ErrorKind::AlreadyExists, "too many copies of this file"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copies_count_up_and_keep_the_original() {
+        let folder = tempfile::tempdir().unwrap();
+        let source = folder.path().join("a.tex");
+        fs::write(&source, "disk").unwrap();
+        assert_eq!(make_copy(&source, Some("buffer")).unwrap(), folder.path().join("a-copy.tex"));
+        assert_eq!(make_copy(&source, None).unwrap(), folder.path().join("a-copy-2.tex"));
+        assert_eq!(fs::read_to_string(folder.path().join("a-copy.tex")).unwrap(), "buffer");
+        assert_eq!(fs::read_to_string(folder.path().join("a-copy-2.tex")).unwrap(), "disk");
+        assert_eq!(fs::read_to_string(&source).unwrap(), "disk");
+    }
+
+    #[test]
+    fn a_copy_name_handles_files_without_an_extension() {
+        assert_eq!(copy_name(Path::new("/p/Makefile"), 1), Path::new("/p/Makefile-copy"));
+        assert_eq!(copy_name(Path::new("/p/.env"), 2), Path::new("/p/.env-copy-2"));
+        assert_eq!(copy_name(Path::new("/p/a.b.tex"), 3), Path::new("/p/a.b-copy-3.tex"));
+    }
+
 
     #[test]
     fn new_entries_go_to_the_selected_folder() {

@@ -76,6 +76,18 @@ After an insert, `Tab` moves to the next empty field. `Esc` or moving the cursor
 
 The buttons in the file tree's header make a new file or folder, add files from elsewhere and close the panel. New entries go to the last clicked folder, or the folder of the last clicked file. Nothing gets replaced: a name that exists shows an error, and added files with such a name are left out. Clicking the header folds the tree, so that the outline gets its space.
 
+### File menu
+
+The File menu creates files and folders (New file with Cmd+N), adds files from elsewhere, and copies the open file as `a-copy.tex`, with its unsaved changes. Version history opens the Git panel with the history showing.
+
+Word count works from the main file through `\input`, `\include`, `\subfile` and `#include`, and open documents count with their unsaved text. Comments, math, code, labels, citations and the preamble do not count, and neither does text that only macros or Typst functions generate. Files it cannot find are named.
+
+Downloads never change the project, and a failed one leaves an existing file as it was:
+
+- **PDF** copies the preview byte for byte, so its layout is the same. If the PDF has errors, is out of date or has undefined references, a dialog says so first and offers to recompile.
+- **Source (.zip)** holds everything except `.git`, `.build` and `.DS_Store`, also what `.gitignore` lists, because a build can need it. Files that may hold secrets, such as `.env`, are asked about. Every entry is compared with its original before the archive is saved. A file that cannot be read stops the export. Typst `@preview` and Tectonic packages download at compile time and are not in the archive.
+- **Word, HTML and Markdown drafts** come from Pandoc, which has to be installed. They do not keep the layout: page margins, the document class and fonts are lost. A dialog lists what Pandoc reports as left out, before the draft is saved. Pandoc does not report everything for Typst, such as shapes and show rules, so compare with the PDF. A Typst project with `@preview` packages only converts once they are in the local cache.
+
 ### Packages
 
 LaTeX errors about a missing package get a button that adds `\\usepackage` to the preamble of the main file. After each build, the editor also looks through the whole project:

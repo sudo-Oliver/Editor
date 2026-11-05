@@ -140,6 +140,12 @@ impl GitPanel {
         self.commit_box.read(cx).focus_handle(cx).is_focused(window)
     }
 
+    pub fn show_history_section(&mut self, cx: &mut Context<Self>) {
+        self.show_history = true;
+        self.load_history(cx);
+        cx.notify();
+    }
+
     fn reset_history(&mut self) {
         self.commits.clear();
         self.rows.clear();

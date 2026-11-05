@@ -4,6 +4,7 @@ mod addons;
 mod assets;
 mod completion;
 mod editor_view;
+mod export;
 mod file_tree;
 mod git_panel;
 mod image_view;
