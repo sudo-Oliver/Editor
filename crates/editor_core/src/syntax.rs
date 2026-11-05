@@ -112,12 +112,15 @@ pub struct Symbol {
 struct HeadingRules {
     /// Returns the level of a heading node and the bytes of its title.
     find: fn(Node) -> Option<(usize, Range<usize>)>,
+    /// The nodes `find` answers for.
+    kinds: &'static [&'static str],
     /// Nodes that cannot hold a real heading, which also saves walking them.
     skip: &'static [&'static str],
 }
 
 const LATEX_HEADINGS: HeadingRules = HeadingRules {
     find: latex_heading,
+    kinds: &["part", "chapter", "section", "subsection", "subsubsection"],
     skip: &[
         "text",
         "inline_formula",
@@ -130,10 +133,12 @@ const LATEX_HEADINGS: HeadingRules = HeadingRules {
 };
 const TYPST_HEADINGS: HeadingRules = HeadingRules {
     find: typst_heading,
+    kinds: &["heading"],
     skip: &["text", "math", "raw_blck", "heading"],
 };
 const MARKDOWN_HEADINGS: HeadingRules = HeadingRules {
     find: markdown_heading,
+    kinds: &["atx_heading", "setext_heading"],
     skip: &["atx_heading", "setext_heading", "paragraph", "fenced_code_block", "indented_code_block"],
 };
 
@@ -174,33 +179,22 @@ fn markdown_heading(node: Node) -> Option<(usize, Range<usize>)> {
     }
 }
 
-/// Walks with one cursor instead of recursing, because deeply nested groups in a
-/// document must not overflow the stack of the parse thread.
-fn collect_headings(rules: HeadingRules, tree: &Tree, rope: &Rope) -> Vec<Heading> {
-    let mut headings = Vec::new();
-    let mut cursor = tree.walk();
-    loop {
-        let node = cursor.node();
-        if let Some((level, title)) = (rules.find)(node) {
-            headings.push(Heading {
-                level,
-                title: rope.byte_slice(title).to_string(),
-                line: rope.byte_to_line(node.start_byte()),
-            });
-        }
-        if !rules.skip.contains(&node.kind()) && cursor.goto_first_child() {
-            continue;
-        }
-        while !cursor.goto_next_sibling() {
-            if !cursor.goto_parent() {
-                return headings;
-            }
-        }
-    }
+/// Returns the kind of a defining node and the bytes of its name.
+#[derive(Clone, Copy)]
+struct SymbolRules {
+    find: fn(Node) -> Option<(SymbolKind, Range<usize>)>,
+    /// The nodes `find` answers for.
+    kinds: &'static [&'static str],
 }
 
-/// Returns the kind of a defining node and the bytes of its name.
-type SymbolFinder = fn(Node) -> Option<(SymbolKind, Range<usize>)>;
+const LATEX_SYMBOLS: SymbolRules = SymbolRules {
+    find: latex_symbol,
+    kinds: &["label_definition", "new_command_definition", "old_command_definition"],
+};
+const TYPST_SYMBOLS: SymbolRules = SymbolRules {
+    find: typst_symbol,
+    kinds: &["label", "let"],
+};
 
 fn latex_symbol(node: Node) -> Option<(SymbolKind, Range<usize>)> {
     let (kind, field) = match node.kind() {
@@ -218,7 +212,8 @@ fn typst_symbol(node: Node) -> Option<(SymbolKind, Range<usize>)> {
     match node.kind() {
         "label" => {
             let range = node.byte_range();
-            Some((SymbolKind::Label, range.start + 1..range.end - 1))
+            // A recovering parser may hand out a label without its brackets.
+            (range.len() >= 2).then(|| (SymbolKind::Label, range.start + 1..range.end - 1))
         }
         "let" => {
             let pattern = node.child_by_field_name("pattern")?;
@@ -230,21 +225,69 @@ fn typst_symbol(node: Node) -> Option<(SymbolKind, Range<usize>)> {
     }
 }
 
-fn collect_symbols(find: SymbolFinder, tree: &Tree, rope: &Rope) -> Vec<Symbol> {
-    let mut symbols = Vec::new();
+/// One table entry per kind of node, because this runs over every node of the
+/// document after every parse, and comparing names is what would take the time.
+struct KindTable(Vec<bool>);
+
+impl KindTable {
+    fn new(language: &TsLanguage, names: &[&str]) -> Self {
+        // Several ids can share a name, so the ids decide and not the names.
+        let ids = 0..language.node_kind_count() as u16;
+        Self(ids.map(|id| language.node_kind_for_id(id).is_some_and(|name| names.contains(&name))).collect())
+    }
+
+    fn has(&self, node: Node) -> bool {
+        // Error nodes have an id outside of the table.
+        self.0.get(node.kind_id() as usize).copied().unwrap_or(false)
+    }
+}
+
+/// Walks with one cursor instead of recursing, because deeply nested groups in a
+/// document must not overflow the stack of the parse thread.
+fn collect_outline(config: &LanguageConfig, tree: &Tree, rope: &Rope) -> (Vec<Heading>, Vec<Symbol>) {
+    let (mut headings, mut symbols) = (Vec::new(), Vec::new());
     let mut cursor = tree.walk();
+    let mut depth = 0;
+    // Below this depth headings don't count. Symbols still do, like a label in a heading.
+    let mut heading_free_from: Option<usize> = None;
     loop {
         let node = cursor.node();
-        if let Some((kind, name)) = find(node) {
+        if let Some(rules) = config.headings
+            && heading_free_from.is_none()
+            && config.heading_kinds.has(node)
+            && let Some((level, title)) = (rules.find)(node)
+        {
+            headings.push(Heading {
+                level,
+                title: rope.byte_slice(title).to_string(),
+                line: rope.byte_to_line(node.start_byte()),
+            });
+        }
+        if let Some(rules) = config.symbols
+            && config.symbol_kinds.has(node)
+            && let Some((kind, name)) = (rules.find)(node)
+        {
             symbols.push(Symbol { kind, name: rope.byte_slice(name).to_string() });
         }
-        if cursor.goto_first_child() {
+        if heading_free_from.is_none() && config.heading_skip.has(node) {
+            heading_free_from = Some(depth);
+        }
+        let walk_below = config.symbols.is_some() || heading_free_from.is_none();
+        if walk_below && cursor.goto_first_child() {
+            depth += 1;
             continue;
         }
-        while !cursor.goto_next_sibling() {
-            if !cursor.goto_parent() {
-                return symbols;
+        loop {
+            if heading_free_from == Some(depth) {
+                heading_free_from = None;
             }
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return (headings, symbols);
+            }
+            depth -= 1;
         }
     }
 }
@@ -254,7 +297,10 @@ struct LanguageConfig {
     query: Query,
     kinds: Vec<Option<HighlightKind>>,
     headings: Option<HeadingRules>,
-    symbols: Option<SymbolFinder>,
+    symbols: Option<SymbolRules>,
+    heading_kinds: KindTable,
+    heading_skip: KindTable,
+    symbol_kinds: KindTable,
     /// Second grammar that parses the ranges of `inline` nodes in Markdown.
     inline: Option<Box<LanguageConfig>>,
 }
@@ -264,7 +310,7 @@ impl LanguageConfig {
         language: TsLanguage,
         source: &str,
         headings: Option<HeadingRules>,
-        symbols: Option<SymbolFinder>,
+        symbols: Option<SymbolRules>,
         inline: Option<Box<LanguageConfig>>,
     ) -> Self {
         let query = Query::new(&language, source).expect("bundled highlight query is valid");
@@ -273,12 +319,18 @@ impl LanguageConfig {
             .iter()
             .map(|name| kind_for_capture(name))
             .collect();
+        let heading_kinds = KindTable::new(&language, headings.map_or(&[], |rules| rules.kinds));
+        let heading_skip = KindTable::new(&language, headings.map_or(&[], |rules| rules.skip));
+        let symbol_kinds = KindTable::new(&language, symbols.map_or(&[], |rules| rules.kinds));
         Self {
             language,
             query,
             kinds,
             headings,
             symbols,
+            heading_kinds,
+            heading_skip,
+            symbol_kinds,
             inline,
         }
     }
@@ -293,7 +345,7 @@ impl LanguageConfig {
                     codebook_tree_sitter_latex::LANGUAGE.into(),
                     include_str!("../queries/latex.scm"),
                     Some(LATEX_HEADINGS),
-                    Some(latex_symbol),
+                    Some(LATEX_SYMBOLS),
                     None,
                 )
             })),
@@ -302,7 +354,7 @@ impl LanguageConfig {
                     codebook_tree_sitter_typst::LANGUAGE.into(),
                     include_str!("../queries/typst.scm"),
                     Some(TYPST_HEADINGS),
-                    Some(typst_symbol),
+                    Some(TYPST_SYMBOLS),
                     None,
                 )
             })),
@@ -331,7 +383,6 @@ impl LanguageConfig {
 pub struct Syntax {
     config: Option<&'static LanguageConfig>,
     tree: Option<Tree>,
-    inline_tree: Option<Tree>,
     headings: Vec<Heading>,
     symbols: Vec<Symbol>,
     applied_results: u64,
@@ -348,7 +399,6 @@ pub struct ParseJob {
 
 pub struct ParseResult {
     tree: Option<Tree>,
-    inline_tree: Option<Tree>,
     headings: Vec<Heading>,
     symbols: Vec<Symbol>,
     version: u64,
@@ -359,7 +409,6 @@ impl Syntax {
         Self {
             config: LanguageConfig::get(language),
             tree: None,
-            inline_tree: None,
             headings: Vec::new(),
             symbols: Vec::new(),
             applied_results: 0,
@@ -369,9 +418,6 @@ impl Syntax {
 
     pub fn edit(&mut self, edit: &InputEdit) {
         if let Some(tree) = &mut self.tree {
-            tree.edit(edit);
-        }
-        if let Some(tree) = &mut self.inline_tree {
             tree.edit(edit);
         }
     }
@@ -393,7 +439,6 @@ impl Syntax {
         }
         self.applied_version = result.version;
         self.tree = result.tree;
-        self.inline_tree = result.inline_tree;
         self.headings = result.headings;
         self.symbols = result.symbols;
         self.applied_results += 1;
@@ -448,9 +493,9 @@ impl Syntax {
         };
         if let Some(tree) = &self.tree {
             collect_spans(config, tree, rope, &range, &mut spans);
-        }
-        if let (Some(inline), Some(tree)) = (&config.inline, &self.inline_tree) {
-            collect_spans(inline, tree, rope, &range, &mut spans);
+            if let Some(inline) = &config.inline {
+                collect_inline_spans(inline, tree, rope, &range, &mut spans);
+            }
         }
         spans
     }
@@ -481,6 +526,45 @@ fn collect_spans(
     }
 }
 
+/// Parses the inline text that touches `range`, one block at a time. Text outside of
+/// the view costs nothing this way, and with many ranges in one parse tree-sitter takes
+/// quadratic time: 57 s for 100,000 paragraphs. Inline markup cannot cross blocks anyway.
+fn collect_inline_spans(
+    config: &LanguageConfig,
+    blocks: &Tree,
+    rope: &Rope,
+    range: &Range<usize>,
+    spans: &mut Vec<HighlightSpan>,
+) {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&config.language)
+        .expect("grammar ABI matches tree-sitter");
+    let mut cursor = blocks.walk();
+    loop {
+        let node = cursor.node();
+        if node.start_byte() >= range.end {
+            return;
+        }
+        if node.end_byte() > range.start {
+            if node.kind() == "inline" {
+                if parser.set_included_ranges(&[node.range()]).is_ok()
+                    && let Some(tree) = parse_rope(&mut parser, rope, None)
+                {
+                    collect_spans(config, &tree, rope, range, spans);
+                }
+            } else if cursor.goto_first_child_for_byte(range.start).is_some() {
+                continue;
+            }
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return;
+            }
+        }
+    }
+}
+
 impl ParseJob {
     pub fn version(&self) -> u64 {
         self.version
@@ -493,35 +577,13 @@ impl ParseJob {
             .expect("grammar ABI matches tree-sitter");
         let tree = parse_rope(&mut parser, &self.rope, self.old_tree.as_ref());
 
-        let inline_tree = match (&self.config.inline, &tree) {
-            (Some(inline), Some(tree)) => {
-                let mut ranges = Vec::new();
-                collect_inline_ranges(tree.root_node(), &mut ranges);
-                parser
-                    .set_language(&inline.language)
-                    .expect("grammar ABI matches tree-sitter");
-                if ranges.is_empty() || parser.set_included_ranges(&ranges).is_err() {
-                    None
-                } else {
-                    parse_rope(&mut parser, &self.rope, None)
-                }
-            }
-            _ => None,
-        };
-
-        let headings = match (self.config.headings, &tree) {
-            (Some(rules), Some(tree)) => collect_headings(rules, tree, &self.rope),
-            _ => Vec::new(),
-        };
-
-        let symbols = match (self.config.symbols, &tree) {
-            (Some(find), Some(tree)) => collect_symbols(find, tree, &self.rope),
-            _ => Vec::new(),
+        let (headings, symbols) = match &tree {
+            Some(tree) => collect_outline(self.config, tree, &self.rope),
+            None => Default::default(),
         };
 
         ParseResult {
             tree,
-            inline_tree,
             headings,
             symbols,
             version: self.version,
@@ -541,17 +603,6 @@ fn parse_rope(parser: &mut Parser, rope: &Rope, old_tree: Option<&Tree>) -> Opti
         old_tree,
         None,
     )
-}
-
-fn collect_inline_ranges(node: Node, ranges: &mut Vec<tree_sitter::Range>) {
-    if node.kind() == "inline" {
-        ranges.push(node.range());
-        return;
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_inline_ranges(child, ranges);
-    }
 }
 
 struct RopeProvider<'a>(&'a Rope);
@@ -676,6 +727,64 @@ mod tests {
         assert!(spans.iter().any(|(_, kind)| *kind == HighlightKind::Emphasis));
         assert!(spans.iter().any(|(_, kind)| *kind == HighlightKind::Strong));
         assert!(spans.iter().any(|(_, kind)| *kind == HighlightKind::Raw));
+    }
+
+    #[test]
+    fn markdown_inlines_do_not_depend_on_the_view() {
+        let text = "Plain *em* one\n\nOpen **never closed\n\nAnother **strong** one\n\n- item `code`\n";
+        let rope = Rope::from_str(text);
+        let mut syntax = Syntax::new(Language::Markdown);
+        let result = syntax.parse_job(&rope, 1).unwrap().run();
+        assert!(syntax.apply(result, &[]));
+        let sorted = |range: Range<usize>| {
+            let mut spans: Vec<_> = syntax
+                .highlights(&rope, range)
+                .into_iter()
+                .map(|span| (span.range.start, span.range.end, span.kind))
+                .collect();
+            spans.sort_by_key(|span| (span.0, span.1));
+            spans.dedup();
+            spans
+        };
+        let all = sorted(0..text.len());
+        let of = |word: &str, kind| {
+            let start = text.find(word).unwrap();
+            all.iter().any(|span| span.0 == start && span.1 == start + word.len() && span.2 == kind)
+        };
+        assert!(of("*em*", HighlightKind::Emphasis));
+        assert!(of("**strong**", HighlightKind::Strong));
+        assert!(of("`code`", HighlightKind::Raw));
+        // The open marker stays in its own paragraph.
+        assert!(!all.iter().any(|span| span.2 == HighlightKind::Strong && span.0 == text.find("**never").unwrap()));
+        for start in (0..text.len()).step_by(3) {
+            let range = start..(start + 8).min(text.len());
+            let touching: Vec<_> = all.iter().copied().filter(|span| span.0 < range.end && range.start < span.1).collect();
+            assert_eq!(sorted(range), touching);
+        }
+        assert!(syntax.highlights(&rope, text.len()..text.len()).is_empty());
+    }
+
+    #[test]
+    fn outline_sees_what_broken_and_skipped_nodes_hold() {
+        // The label sits in a heading, whose inside holds no further headings.
+        let typst = "= Title <first>\n#let x = 1\n== Next\n";
+        let rope = Rope::from_str(typst);
+        let mut syntax = Syntax::new(Language::Typst);
+        let result = syntax.parse_job(&rope, 1).unwrap().run();
+        assert!(syntax.apply(result, &[]));
+        assert_eq!(syntax.headings().iter().map(|heading| heading.level).collect::<Vec<_>>(), [1, 2]);
+        let names: Vec<_> = syntax.symbols().iter().map(|symbol| symbol.name.as_str()).collect();
+        assert_eq!(names, ["first", "x"]);
+
+        let latex = "\\section{A}\\label{a}\n}}{ \\section{B}\\label{b}\n$\\section{no}$\n";
+        let rope = Rope::from_str(latex);
+        let mut syntax = Syntax::new(Language::Latex);
+        let result = syntax.parse_job(&rope, 1).unwrap().run();
+        assert!(syntax.apply(result, &[]));
+        let titles: Vec<_> = syntax.headings().iter().map(|heading| heading.title.as_str()).collect();
+        assert_eq!(titles.first(), Some(&"{A}"));
+        assert!(!titles.contains(&"{no}"), "{titles:?}");
+        assert!(syntax.symbols().iter().any(|symbol| symbol.name == "a"));
     }
 
     #[test]
