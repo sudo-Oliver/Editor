@@ -82,7 +82,23 @@ impl Repository {
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
-        let output = self.command().args(args).output().map_err(|error| format!("Cannot start git: {error}"))?;
+        Self::finish(self.command().args(args))
+    }
+
+    /// For commands that reach a remote. A dead connection then ends in an error
+    /// instead of waiting forever.
+    fn run_on_network(&self, args: &[&str]) -> Result<String, String> {
+        let mut command = self.command();
+        command.args(["-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=60"]);
+        // These settings beat the user's own, so they stay out when the user has some.
+        if std::env::var_os("GIT_SSH_COMMAND").is_none() && self.run(["config", "--get", "core.sshCommand"]).is_err() {
+            command.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=4");
+        }
+        Self::finish(command.args(args))
+    }
+
+    fn finish(command: &mut Command) -> Result<String, String> {
+        let output = command.output().map_err(|error| format!("Cannot start git: {error}"))?;
         if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout).into_owned())
         } else {

@@ -89,7 +89,7 @@ impl Repository {
     /// Publishes the branch to the only remote or `origin` on the first push.
     pub fn push(&self) -> Result<(), String> {
         if self.run(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]).is_ok() {
-            return self.run(["push"]).map(drop);
+            return self.run_on_network(&["push"]).map(drop);
         }
         let remotes = self.run(["remote"])?;
         let remotes: Vec<&str> = remotes.lines().collect();
@@ -99,13 +99,13 @@ impl Repository {
             _ if remotes.contains(&"origin") => "origin",
             _ => return Err("This branch has no upstream. Set one with `git push -u`.".to_string()),
         };
-        self.run(["push", "-u", remote, "HEAD"]).map(drop)
+        self.run_on_network(&["push", "-u", remote, "HEAD"]).map(drop)
     }
 
     /// Only fast-forwards, because a merge may need decisions that this panel
     /// cannot ask for.
     pub fn pull(&self) -> Result<(), String> {
-        self.run(["pull", "--ff-only"]).map(drop).map_err(|error| {
+        self.run_on_network(&["pull", "--ff-only"]).map(drop).map_err(|error| {
             let counts = self.run(["rev-list", "--left-right", "--count", "HEAD...@{upstream}"]).unwrap_or_default();
             let diverged = counts.split_whitespace().filter_map(|count| count.parse::<usize>().ok()).all(|count| count > 0);
             if !counts.is_empty() && diverged {
