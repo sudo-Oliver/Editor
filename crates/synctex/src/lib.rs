@@ -53,6 +53,8 @@ pub struct SyncTex {
     /// Leaf records by tag and line, then file order. Auto-follow looks up a line
     /// on the UI thread, and a long document has millions of records.
     leaves: Vec<u32>,
+    /// Then the nodes of a page can be found by bisection.
+    pages_in_order: bool,
 }
 
 impl SyncTex {
@@ -103,6 +105,7 @@ impl SyncTex {
                 synctex.nodes.push(node);
             }
         }
+        synctex.pages_in_order = synctex.nodes.is_sorted_by_key(|node| node.page);
         // Boxes span whole paragraphs and pages, so only leaf records locate a line.
         synctex.leaves = (0..synctex.nodes.len() as u32).filter(|index| !synctex.nodes[*index as usize].is_box).collect();
         // A stable sort keeps the file order within a line.
@@ -157,7 +160,14 @@ impl SyncTex {
 
     /// Finds the source line for a position on a zero-based page.
     pub fn backward(&self, page: usize, x: f32, y: f32) -> Option<SourceLocation> {
-        let on_page = || self.nodes.iter().filter(|node| node.page == page);
+        let candidates = if self.pages_in_order {
+            let start = self.nodes.partition_point(|node| node.page < page);
+            let end = self.nodes.partition_point(|node| node.page <= page);
+            &self.nodes[start..end]
+        } else {
+            &self.nodes[..]
+        };
+        let on_page = || candidates.iter().filter(|node| node.page == page);
         // The tightest box under the point gives the row.
         let row = on_page()
             .filter(|node| node.is_box && node.contains(x, y))
