@@ -8,7 +8,7 @@ use std::{
 };
 
 use editor_core::{
-    EditorState, HighlightKind, Language, Mark, MarkSeverity, Motion, Selection, Symbol,
+    EditorState, HighlightKind, Language, LineChange, Mark, MarkSeverity, Motion, Selection, Symbol,
     snippet::Snippet,
     vim::{Effect, Input, Key, Mode, Vim},
 };
@@ -52,6 +52,14 @@ pub enum EditorEvent {
     CursorClicked { line: usize },
 }
 
+const MAX_ROW_CHANGES: usize = 64;
+
+/// The lines of `Rows` without wrap information, and whether lines moved.
+struct RowsDirty {
+    lines: Range<usize>,
+    shifted: bool,
+}
+
 /// Soft-wrap table: byte columns where each buffer line continues on a new row.
 #[derive(Default)]
 struct Rows {
@@ -65,13 +73,65 @@ impl Rows {
         self.starts.last().copied().unwrap_or(1) as usize
     }
 
-    fn rebuild_starts(&mut self) {
+    fn rows_of_line(&self, line: usize) -> u32 {
+        1 + self.breaks[line].as_ref().map_or(0, Vec::len) as u32
+    }
+
+    fn reset(&mut self, line_count: usize) -> RowsDirty {
+        self.breaks = vec![None; line_count];
         self.starts.clear();
-        self.starts.reserve(self.breaks.len() + 1);
-        let mut row = 0u32;
-        for breaks in &self.breaks {
+        RowsDirty { lines: 0..line_count, shifted: true }
+    }
+
+    /// Forgets the lines that changed and tells which ones to wrap again.
+    fn apply_changes(&mut self, changes: &[LineChange], line_count: usize) -> RowsDirty {
+        // Each change can move all later lines, so very many of them cost less at once.
+        if changes.len() > MAX_ROW_CHANGES {
+            return self.reset(line_count);
+        }
+        let (mut first, mut after, mut shifted) = (usize::MAX, 0, false);
+        for change in changes {
+            let start = change.start_line.min(self.breaks.len());
+            let end = (start + change.removed_lines).min(self.breaks.len());
+            if end - start == change.inserted_lines {
+                self.breaks[start..end].fill(None);
+            } else {
+                self.breaks.splice(start..end, std::iter::repeat_n(None, change.inserted_lines));
+                shifted = true;
+            }
+            // Later changes count lines after the earlier ones, so the range moves along.
+            let moved = if after > end { after + change.inserted_lines - (end - start) } else { 0 };
+            first = first.min(start);
+            after = moved.max(start + change.inserted_lines);
+        }
+        if self.breaks.len() != line_count {
+            return self.reset(line_count);
+        }
+        RowsDirty { lines: first..after, shifted }
+    }
+
+    /// Brings `starts` up to date after the dirty lines got wrapped. Without a change
+    /// of any row count, as with nearly every key press, nothing has to move.
+    fn update_starts(&mut self, dirty: &RowsDirty) {
+        let line_count = self.breaks.len();
+        let first = dirty.lines.start.min(line_count);
+        let unchanged = !dirty.shifted
+            && self.starts.len() == line_count + 1
+            && (first..dirty.lines.end.min(line_count))
+                .all(|line| self.starts[line + 1] - self.starts[line] == self.rows_of_line(line));
+        if unchanged {
+            return;
+        }
+        let first = first.min(self.starts.len());
+        self.starts.truncate(first);
+        let mut row = match first.checked_sub(1) {
+            Some(before) => self.starts[before] + self.rows_of_line(before),
+            None => 0,
+        };
+        self.starts.reserve(line_count + 1 - first);
+        for line in first..line_count {
             self.starts.push(row);
-            row += 1 + breaks.as_ref().map_or(0, Vec::len) as u32;
+            row += self.rows_of_line(line);
         }
         self.starts.push(row);
     }
@@ -644,23 +704,16 @@ impl EditorView {
         let changes = self.state.take_line_changes();
         let width_changed = (self.rows.width - width).abs() > px(0.5);
         let line_count = self.state.buffer().line_count();
-        if width_changed || self.rows.breaks.is_empty() {
+        let dirty = if width_changed || self.rows.breaks.is_empty() {
             self.rows.width = width;
-            self.rows.breaks = vec![None; line_count];
+            self.rows.reset(line_count)
         } else if !changes.is_empty() {
-            for change in changes {
-                let start = change.start_line.min(self.rows.breaks.len());
-                let end = (start + change.removed_lines).min(self.rows.breaks.len());
-                self.rows
-                    .breaks
-                    .splice(start..end, std::iter::repeat_n(None, change.inserted_lines));
-            }
-            if self.rows.breaks.len() != line_count {
-                self.rows.breaks = vec![None; line_count];
-            }
+            self.rows.apply_changes(&changes, line_count)
         } else if self.rows.starts.len() == line_count + 1 {
             return;
-        }
+        } else {
+            self.rows.reset(line_count)
+        };
 
         let font_size = px(theme::CODE_FONT_SIZE);
         let text_system = window.text_system().clone();
@@ -670,16 +723,21 @@ impl EditorView {
             .unwrap_or(px(7.2));
         let mut wrapper = text_system.line_wrapper(Self::plain_font(), font_size);
         let buffer = self.state.buffer();
-        for (line, breaks) in self.rows.breaks.iter_mut().enumerate() {
+        for line in dirty.lines.clone() {
+            let Some(breaks) = self.rows.breaks.get_mut(line) else {
+                break;
+            };
             if breaks.is_some() {
                 continue;
             }
-            let text = buffer.line_text(line);
-            // Monospaced ASCII that fits needs no shaping.
-            if text.is_ascii() && char_width * text.len() as f32 <= width {
+            // No character takes more cells than bytes, so a line that fits by its
+            // bytes needs no text and no shaping. Wide CJK has three bytes for two cells.
+            let bytes = buffer.line_end(line) - buffer.line_start(line);
+            if char_width * bytes as f32 <= width {
                 *breaks = Some(Vec::new());
                 continue;
             }
+            let text = buffer.line_text(line);
             let display = text.replace('\t', " ");
             let fragments = [LineFragment::text(&display)];
             let boundaries = wrapper
@@ -689,7 +747,7 @@ impl EditorView {
             *breaks = Some(boundaries);
         }
         drop(wrapper);
-        self.rows.rebuild_starts();
+        self.rows.update_starts(&dirty);
     }
 
     fn shape_plain(&self, text: &str, window: &mut Window) -> ShapedLine {
@@ -1665,6 +1723,55 @@ impl EditorView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rows_stay_right_with_changes_applied_piece_by_piece() {
+        // A small generator, so that a failure comes back the same way.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |limit: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as usize % limit
+        };
+        let wrap = |wide: bool| if wide { Some(vec![4, 8]) } else { Some(Vec::new()) };
+        let mut truth: Vec<bool> = (0..200).map(|index| index % 7 == 0).collect();
+        let mut rows = Rows::default();
+        rows.reset(truth.len());
+        for (line, wide) in truth.iter().enumerate() {
+            rows.breaks[line] = wrap(*wide);
+        }
+        let everything = RowsDirty { lines: 0..truth.len(), shifted: true };
+        rows.update_starts(&everything);
+        for _ in 0..3000 {
+            let most = if next(10) == 0 { MAX_ROW_CHANGES + 10 } else { 4 };
+            let batch = 1 + next(most);
+            let mut changes = Vec::new();
+            for _ in 0..batch {
+                let start_line = next(truth.len());
+                let removed_lines = 1 + next(3).min(truth.len() - start_line - 1);
+                let inserted_lines = if next(2) == 0 { removed_lines } else { 1 + next(3) };
+                truth.splice(start_line..start_line + removed_lines, (0..inserted_lines).map(|_| next(4) == 0));
+                changes.push(LineChange { start_line, removed_lines, inserted_lines });
+            }
+            let dirty = rows.apply_changes(&changes, truth.len());
+            for line in dirty.lines.clone() {
+                if rows.breaks[line].is_none() {
+                    rows.breaks[line] = wrap(truth[line]);
+                }
+            }
+            rows.update_starts(&dirty);
+            assert!(rows.breaks.iter().all(Option::is_some), "a line stayed unknown");
+            let mut row = 0;
+            for (line, wide) in truth.iter().enumerate() {
+                assert_eq!(rows.breaks[line], wrap(*wide));
+                assert_eq!(rows.starts[line], row);
+                row += if *wide { 3 } else { 1 };
+            }
+            assert_eq!(rows.starts.len(), truth.len() + 1);
+            assert_eq!(rows.count() as u32, row);
+        }
+    }
 
     #[test]
     fn only_a_real_outside_change_is_a_conflict() {
