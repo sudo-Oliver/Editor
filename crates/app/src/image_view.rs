@@ -47,6 +47,10 @@ pub struct ImageView {
 impl EventEmitter<ImageViewEvent> for ImageView {}
 
 impl ImageView {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn new(path: PathBuf, include: String, cx: &mut Context<Self>) -> Self {
         let read_path = path.clone();
         let svg_renderer = cx.svg_renderer();

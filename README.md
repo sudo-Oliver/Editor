@@ -60,7 +60,7 @@ These work for every engine:
 
 ## Images
 
-Clicking a PNG, JPEG, WebP or SVG in the file tree shows it in place of the editor, with its resolution and file size. Copy include puts the matching code for the engine on the clipboard, for example `\includegraphics{images/photo.png}` or `#image("images/photo.png")`. Export saves a copy elsewhere. Cmd+W or selecting a tab closes the image.
+Clicking a PNG, JPEG, WebP or SVG in the file tree opens it in a tab, with its resolution and file size. Copy include puts the matching code for the engine on the clipboard, for example `\includegraphics{images/photo.png}` or `#image("images/photo.png")`. Export saves a copy elsewhere. Cmd+W closes the tab.
 
 ## Toolbar
 

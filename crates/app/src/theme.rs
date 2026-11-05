@@ -5,6 +5,7 @@ use editor_core::HighlightKind;
 pub const BG: u32 = 0x1c222b;
 pub const PANEL: u32 = 0x313a4b;
 pub const DIVIDER: u32 = 0x4b5364;
+pub const TAB_INACTIVE: u32 = 0x262d3a;
 pub const ACTIVE_LINE: u32 = 0x444759;
 pub const GREEN: u32 = 0x3b8549;
 pub const GREEN_DARK: u32 = 0x2c5739;
