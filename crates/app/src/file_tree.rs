@@ -29,7 +29,7 @@ pub fn scan(root: &Path, collapsed: &HashSet<PathBuf>) -> Vec<TreeEntry> {
             name != ".git"
                 && name != ".build"
                 && name != ".DS_Store"
-                && !name.to_string_lossy().starts_with(crate::export::TEMP_PREFIX)
+                && !name.to_string_lossy().starts_with(crate::atomic::TEMP_PREFIX)
         })
         .build();
     for entry in walker.flatten() {

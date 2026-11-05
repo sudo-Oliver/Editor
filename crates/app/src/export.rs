@@ -10,13 +10,13 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use crate::atomic::{self, TEMP_PREFIX};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 /// Never part of a source archive: version history, build output and Finder data.
 const EXCLUDED: &[&str] = &[".git", ".build", ".DS_Store"];
-pub const TEMP_PREFIX: &str = ".export-";
 /// Formats that are compressed already, so Deflate only costs time.
 const STORED_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "pdf", "zip", "gz", "docx", "xlsx", "pptx", "mp4"];
 /// Earlier exports do not make a PDF out of date.
@@ -32,25 +32,8 @@ fn start_temp(target: &Path) -> Result<NamedTempFile, String> {
         .map_err(|error| format!("Cannot write to {}: {error}", folder.display()))
 }
 
-/// Puts a finished temp file in place, in one step. Temp files are private, so
-/// the result takes the rights of the file it replaces or normal ones.
 fn commit(temp: NamedTempFile, target: &Path) -> Result<(), String> {
-    let failed = |error: &dyn std::fmt::Display| format!("Cannot write {}: {error}", target.display());
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let permissions = fs::metadata(target).map_or_else(|_| fs::Permissions::from_mode(0o644), |metadata| metadata.permissions());
-        fs::set_permissions(temp.path(), permissions).map_err(|error| failed(&error))?;
-    }
-    // Pandoc writes by path, so the file is opened again for the sync.
-    File::open(temp.path()).and_then(|file| file.sync_all()).map_err(|error| failed(&error))?;
-    temp.persist(target).map_err(|error| failed(&error.error))?;
-    if let Some(folder) = target.parent()
-        && let Ok(folder) = File::open(folder)
-    {
-        folder.sync_all().ok();
-    }
-    Ok(())
+    atomic::finish(temp, target).map_err(|error| format!("Cannot write {}: {error}", target.display()))
 }
 
 fn hash_file(path: &Path) -> io::Result<Vec<u8>> {

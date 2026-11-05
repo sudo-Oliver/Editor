@@ -12,6 +12,11 @@ version = "0.1.0"
 gpui = { git = "https://github.com/zed-industries/zed", rev = "c4273271092b0287f7d181f616bd5171e0a2f70c" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "c4273271092b0287f7d181f616bd5171e0a2f70c", features = ["font-kit", "wayland", "x11"] }
 
+# Slower to link, but this is what users run.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
 [profile.dev]
 opt-level = 1
 debug = "line-tables-only"
