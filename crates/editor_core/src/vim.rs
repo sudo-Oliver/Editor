@@ -1439,7 +1439,7 @@ fn word_back(buffer: &Buffer, from: usize, big: bool) -> usize {
     while let Some(ch) = buffer.char_before(at).filter(|ch| ch.is_whitespace()) {
         at -= ch.len_utf8();
         if ch == '\n' && is_empty_line_at(buffer, at) && at != from {
-            return at;
+            return buffer.clip(at);
         }
     }
     let Some(first) = buffer.char_before(at) else {
@@ -1539,7 +1539,7 @@ fn find_on_line(
     let line = buffer.offset_to_line(from);
     let start = buffer.line_start(line);
     let text = buffer.line_text(line);
-    let column = from - start;
+    let column = (from - start).min(text.len());
     let forward = matches!(kind, FindKind::To | FindKind::Till);
     let till = matches!(kind, FindKind::Till | FindKind::BackTill);
     let hits: Vec<usize> = text.char_indices().filter(|(_, ch)| *ch == target).map(|(index, _)| index).collect();
@@ -1579,7 +1579,7 @@ fn word_object(buffer: &Buffer, cursor: usize, big: bool, around: bool) -> Optio
     let line = buffer.offset_to_line(cursor);
     let base = buffer.line_start(line);
     let text = buffer.line_text(line);
-    let column = cursor - base;
+    let column = (cursor - base).min(text.len());
     let first = text[column..].chars().next()?;
     let kind = class(first, big);
     let same = |ch: char| class(ch, big) == kind;
