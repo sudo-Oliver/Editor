@@ -3,13 +3,13 @@
 
 use std::{
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     os::unix::process::CommandExt,
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     sync::mpsc as std_mpsc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use addon_api::{API_VERSION, AddonMessage, HostMessage, Manifest};
@@ -20,6 +20,12 @@ const MANIFEST: &str = "addon.toml";
 pub const ENABLED_MARKER: &str = ".enabled";
 /// How long a program gets to exit by itself after its stdin closes.
 const EXIT_GRACE: Duration = Duration::from_millis(500);
+/// How long an add-on gets when the whole app ends.
+const QUIT_GRACE: Duration = Duration::from_millis(300);
+/// Larger than any useful message, but a broken add-on cannot fill the memory.
+const MAX_MESSAGE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_ERROR_LINE_BYTES: u64 = 16 * 1024;
+const EVENT_CAPACITY: usize = 256;
 const MAX_READ_BYTES: u64 = 8 << 20;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -192,7 +198,7 @@ pub struct AddonProcess {
 }
 
 impl AddonProcess {
-    pub fn start(add_on: &Installed) -> Result<(Self, mpsc::UnboundedReceiver<ProcessEvent>), String> {
+    pub fn start(add_on: &Installed) -> Result<(Self, mpsc::Receiver<ProcessEvent>), String> {
         let program = add_on.program();
         let mut child = Command::new(&program)
             .current_dir(&add_on.directory)
@@ -220,21 +226,30 @@ impl AddonProcess {
             }
         });
 
-        let (events, receiver) = mpsc::unbounded_channel();
+        // A full channel makes the add-on wait when it talks faster than the panel reads.
+        let (events, receiver) = mpsc::channel(EVENT_CAPACITY);
         let error_tail = thread::spawn(move || {
+            let mut reader = BufReader::new(stderr);
             let mut last = String::new();
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                last = line;
+            let mut bytes = Vec::new();
+            while let Ok(Some(_)) = read_line(&mut reader, &mut bytes, MAX_ERROR_LINE_BYTES) {
+                last = String::from_utf8_lossy(&bytes).trim_end().to_string();
             }
             last
         });
         thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                let event = match serde_json::from_str(&line) {
-                    Ok(message) => ProcessEvent::Message(message),
-                    Err(error) => ProcessEvent::Invalid(error.to_string()),
+            let mut reader = BufReader::new(stdout);
+            let mut bytes = Vec::new();
+            while let Ok(Some(complete)) = read_line(&mut reader, &mut bytes, MAX_MESSAGE_BYTES) {
+                let event = if complete {
+                    match serde_json::from_slice(&bytes) {
+                        Ok(message) => ProcessEvent::Message(message),
+                        Err(error) => ProcessEvent::Invalid(error.to_string()),
+                    }
+                } else {
+                    ProcessEvent::Invalid(format!("A message is larger than {} MB.", MAX_MESSAGE_BYTES / 1024 / 1024))
                 };
-                if events.send(event).is_err() {
+                if events.blocking_send(event).is_err() {
                     break;
                 }
             }
@@ -242,7 +257,7 @@ impl AddonProcess {
             let last = error_tail.join().unwrap_or_default();
             let code = status.map_or_else(|error| error.to_string(), |status| status.to_string());
             let reason = if last.is_empty() { code } else { format!("{code}: {last}") };
-            events.send(ProcessEvent::Exited(reason)).ok();
+            events.blocking_send(ProcessEvent::Exited(reason)).ok();
         });
         Ok((Self { sender: Some(sender), process_group }, receiver))
     }
@@ -252,6 +267,36 @@ impl AddonProcess {
             sender.send(message).ok();
         }
     }
+
+    /// Ends the add-on before the app exits, since no thread outlives the app to do it.
+    pub fn shut_down(&mut self) {
+        self.sender = None;
+        let group = self.process_group as libc::pid_t;
+        // SAFETY: `killpg` takes plain values. The group holds only this add-on.
+        unsafe { libc::killpg(group, libc::SIGTERM) };
+        let started = Instant::now();
+        // SAFETY: as above. Signal 0 only asks whether the group still exists.
+        while started.elapsed() < QUIT_GRACE && unsafe { libc::killpg(group, 0) } == 0 {
+            thread::sleep(Duration::from_millis(10));
+        }
+        // SAFETY: as above.
+        unsafe { libc::killpg(group, libc::SIGKILL) };
+    }
+}
+
+/// Reads one line, with its end, into `bytes`. `None` means the stream ended, and
+/// `Some(false)` means the line was too long, so what it held is gone.
+fn read_line(reader: &mut impl BufRead, bytes: &mut Vec<u8>, limit: u64) -> std::io::Result<Option<bool>> {
+    bytes.clear();
+    if reader.by_ref().take(limit).read_until(b'\n', bytes)? == 0 {
+        return Ok(None);
+    }
+    if bytes.len() as u64 == limit && bytes.last() != Some(&b'\n') {
+        bytes.clear();
+        reader.skip_until(b'\n')?;
+        return Ok(Some(false));
+    }
+    Ok(Some(true))
 }
 
 impl Drop for AddonProcess {
@@ -263,6 +308,9 @@ impl Drop for AddonProcess {
             thread::sleep(EXIT_GRACE);
             // SAFETY: `killpg` takes plain values. The group holds only this add-on.
             unsafe { libc::killpg(group, libc::SIGTERM) };
+            thread::sleep(EXIT_GRACE);
+            // SAFETY: as above.
+            unsafe { libc::killpg(group, libc::SIGKILL) };
         });
     }
 }
@@ -431,7 +479,21 @@ mod tests {
         Installed { manifest, directory: directory.to_path_buf(), enabled: true }
     }
 
-    fn next(receiver: &mut mpsc::UnboundedReceiver<ProcessEvent>) -> ProcessEvent {
+    #[test]
+    fn long_lines_and_broken_text_do_not_stop_reading() {
+        let mut input = std::io::Cursor::new([b"short\n".as_slice(), &[b'x'; 40], b"\n\xFF\xFE\nend".as_slice()].concat());
+        let mut bytes = Vec::new();
+        assert_eq!(read_line(&mut input, &mut bytes, 16).unwrap(), Some(true));
+        assert_eq!(bytes, b"short\n");
+        assert_eq!(read_line(&mut input, &mut bytes, 16).unwrap(), Some(false));
+        assert_eq!(read_line(&mut input, &mut bytes, 16).unwrap(), Some(true));
+        assert_eq!(bytes, b"\xFF\xFE\n");
+        assert_eq!(read_line(&mut input, &mut bytes, 16).unwrap(), Some(true));
+        assert_eq!(bytes, b"end");
+        assert_eq!(read_line(&mut input, &mut bytes, 16).unwrap(), None);
+    }
+
+    fn next(receiver: &mut mpsc::Receiver<ProcessEvent>) -> ProcessEvent {
         tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()

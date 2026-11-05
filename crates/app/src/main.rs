@@ -16,6 +16,7 @@ mod pdf_text;
 mod pdf_view;
 mod picker;
 mod problems;
+mod recovery;
 mod settings;
 mod shortcuts;
 mod smear;
