@@ -17,6 +17,7 @@ logo, icons and code are not.
 | Pane dividers | 7 wide |
 | File tree / outline divider | 6 high |
 | Editor tab bar | y 40 to 76 |
+| Editor tabs | 32 high, interlocked by edges with 12 px slant and a 1.5 px gap. Edges lean toward the active tab, which has the toolbar color and a 1 px top line |
 | Editor toolbar | y 76 to 108 |
 | PDF toolbar | y 40 to 72 |
 | Code font | 12, line height 19.2 (inferred from 24 px rows in the scaled screenshot) |

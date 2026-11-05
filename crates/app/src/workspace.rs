@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     rc::Rc,
@@ -19,9 +20,9 @@ use editor_core::{
     vim::{self, Effect, Key, Leader, Mode},
 };
 use gpui::{
-    AnyElement, Anchor, App, ClickEvent, ClipboardItem, Context, CursorStyle, Entity, FocusHandle, Focusable, FontWeight, Keystroke,
+    AnyElement, Anchor, App, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Entity, FocusHandle, Focusable, FontWeight, Keystroke,
     KeystrokeEvent, MouseButton, MouseMoveEvent, PathPromptOptions, Pixels, Point, Render, ScrollHandle, SharedString,
-    EntityId, Subscription, Task, Window, anchored, black, deferred, div, point, prelude::*, px, svg,
+    EntityId, Subscription, Task, Window, anchored, black, canvas, deferred, div, fill, point, prelude::*, px, size, svg,
 };
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use synctex::SyncTex;
@@ -51,6 +52,9 @@ const TOP_BAR_HEIGHT: f32 = 40.0;
 const RAIL_WIDTH: f32 = 40.0;
 const DIVIDER_WIDTH: f32 = 7.0;
 const TAB_BAR_HEIGHT: f32 = 36.0;
+const TAB_SLANT: f32 = 12.0;
+const TAB_GAP: f32 = 1.5;
+const TAB_HEIGHT: f32 = 32.0;
 const TOOLBAR_HEIGHT: f32 = 32.0;
 const SYMBOL_CELL: f32 = 32.0;
 const SYMBOL_COLUMNS: f32 = 11.0;
@@ -196,7 +200,52 @@ struct TrackedEdits {
 
 struct ImagePreview {
     view: Entity<ImageView>,
+    /// How many documents come before this tab.
+    after: usize,
     _subscription: Subscription,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Tab {
+    Document(usize),
+    Image(usize),
+}
+
+/// The tabs from left to right. `image_after` is sorted, as images only join at the end.
+fn tab_order(documents: usize, image_after: &[usize]) -> Vec<Tab> {
+    let mut tabs = Vec::with_capacity(documents + image_after.len());
+    let mut images = image_after.iter().enumerate().peekable();
+    for document in 0..=documents {
+        while let Some((image, _)) = images.next_if(|(_, after)| **after <= document) {
+            tabs.push(Tab::Image(image));
+        }
+        if document < documents {
+            tabs.push(Tab::Document(document));
+        }
+    }
+    tabs
+}
+
+/// Which tab a click in the box of a tab belongs to, as an offset to that tab: -1, 0
+/// or 1. Each tab reaches into the box of its neighbors, so that the slanted edge
+/// decides and not the box. `up` runs from 0 at the bottom to 1 at the top.
+fn tab_hit(x: f32, left: f32, right: f32, up: f32, (left_forward, right_forward): (bool, bool)) -> isize {
+    let lean = |forward: bool| TAB_SLANT * (up - 0.5) * if forward { 1. } else { -1. };
+    if x < left + lean(left_forward) {
+        -1
+    } else if x > right + lean(right_forward) {
+        1
+    } else {
+        0
+    }
+}
+
+/// Whether the left and the right edge of a tab lean to the right going up. Two
+/// neighbors share an edge, and edges lean toward the active tab, so that it is
+/// the one wide tab at the bottom and the others interlock with it.
+fn tab_edges(position: usize, count: usize, active: Option<usize>) -> (bool, bool) {
+    let active = active.unwrap_or(count);
+    (position <= active, position < active && position + 1 < count)
 }
 
 pub struct Workspace {
@@ -265,7 +314,8 @@ pub struct Workspace {
     follow_line: Option<usize>,
     follow_task: Option<Task<()>>,
     /// Shown instead of the editor. The tabs stay as they are.
-    image_preview: Option<ImagePreview>,
+    images: Vec<ImagePreview>,
+    shown_image: Option<usize>,
     last_pdf: Option<PathBuf>,
     last_main: Option<PathBuf>,
     /// The main file of the PDF on screen.
@@ -392,7 +442,8 @@ impl Workspace {
             sync_on_click: true,
             follow_line: None,
             follow_task: None,
-            image_preview: None,
+            images: Vec::new(),
+            shown_image: None,
             last_pdf: None,
             last_main: None,
             pdf_main: None,
@@ -441,7 +492,8 @@ impl Workspace {
         self.tree_error = None;
         self.documents.clear();
         self.active = None;
-        self.image_preview = None;
+        self.images.clear();
+        self.shown_image = None;
         self.start_watching(&root, cx);
         self.git_branch = git_branch(&root);
         self.root = Some(root.clone());
@@ -584,6 +636,10 @@ impl Workspace {
     }
 
     fn open_image(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(index) = self.images.iter().position(|image| image.view.read(cx).path() == path) {
+            self.show_image(index, window, cx);
+            return;
+        }
         let active = self.active_view().and_then(|view| view.read(cx).path.clone());
         let main = self.root.as_deref().and_then(|root| find_main(root, &self.config, active.as_deref()));
         let engine = self.engine.or_else(|| Engine::for_path(main.as_deref()?));
@@ -594,14 +650,92 @@ impl Workspace {
         let subscription = cx.subscribe(&view, |this, _, event, cx| match event {
             ImageViewEvent::Status(message) => this.set_status(message.clone(), cx),
         });
-        let focus = view.read(cx).focus_handle().clone();
+        self.images.push(ImagePreview { view, after: self.documents.len(), _subscription: subscription });
+        self.show_image(self.images.len() - 1, window, cx);
+    }
+
+    fn show_image(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.shown_image = Some(index);
+        let focus = self.images[index].view.read(cx).focus_handle().clone();
         window.focus(&focus, cx);
-        self.image_preview = Some(ImagePreview { view, _subscription: subscription });
         cx.notify();
     }
 
+    fn image_preview(&self) -> Option<&ImagePreview> {
+        self.shown_image.and_then(|index| self.images.get(index))
+    }
+
+    fn tabs(&self) -> Vec<Tab> {
+        let after: Vec<usize> = self.images.iter().map(|image| image.after).collect();
+        tab_order(self.documents.len(), &after)
+    }
+
+    fn active_tab(&self) -> Option<Tab> {
+        self.shown_image.map(Tab::Image).or(self.active.map(Tab::Document))
+    }
+
+    fn activate_tab(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
+        match tab {
+            Tab::Document(index) => self.activate(index, window, cx),
+            Tab::Image(index) => self.show_image(index, window, cx),
+        }
+    }
+
+    fn close_tab(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
+        match tab {
+            Tab::Document(index) => self.close_document(index, window, cx),
+            Tab::Image(index) => self.close_image(index, window, cx),
+        }
+    }
+
+    fn go_to_tab(&mut self, position: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs().get(position).copied() {
+            self.activate_tab(tab, window, cx);
+        }
+    }
+
+    /// A click on the close button of another tab must not take the keys away.
+    fn focus_shown_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.image_preview().map(|image| image.view.read(cx).focus_handle().clone()) {
+            Some(focus) => window.focus(&focus, cx),
+            None => self.focus_active(window, cx),
+        }
+    }
+
+    fn close_image(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let position = self.tabs().iter().position(|tab| *tab == Tab::Image(index)).unwrap_or(0);
+        self.images.remove(index);
+        match self.shown_image {
+            Some(shown) if shown == index => {
+                self.shown_image = None;
+                let tabs = self.tabs();
+                match tabs.get(position).or(tabs.last()).copied() {
+                    Some(tab) => self.activate_tab(tab, window, cx),
+                    None => self.focus_active(window, cx),
+                }
+            }
+            Some(shown) => {
+                if shown > index {
+                    self.shown_image = Some(shown - 1);
+                }
+                self.focus_shown_tab(window, cx);
+            }
+            None => self.focus_active(window, cx),
+        }
+        cx.notify();
+    }
+
+    /// Keeps the images in their place when the document at `index` goes away.
+    fn move_images_for_removed_document(&mut self, index: usize) {
+        for image in &mut self.images {
+            if image.after > index {
+                image.after -= 1;
+            }
+        }
+    }
+
     fn activate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.image_preview = None;
+        self.shown_image = None;
         self.follow_line = None;
         self.active = Some(index);
         let view = self.documents[index].view.clone();
@@ -621,14 +755,24 @@ impl Workspace {
     }
 
     fn remove_document(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let closed_active = self.active == Some(index);
         self.documents.remove(index);
-        self.active = if self.documents.is_empty() {
-            None
-        } else {
-            Some(index.min(self.documents.len() - 1))
+        self.move_images_for_removed_document(index);
+        self.active = match self.active {
+            Some(active) if active == index => self.documents.len().checked_sub(1).map(|last| index.min(last)),
+            Some(active) if active > index => Some(active - 1),
+            other => other,
         };
+        // Another tab stays as it is, also when it is an image with this document below it.
+        if !closed_active || self.shown_image.is_some() {
+            self.focus_shown_tab(window, cx);
+            cx.notify();
+            return;
+        }
         if let Some(active) = self.active {
             self.activate(active, window, cx);
+        } else if let Some(last) = self.images.len().checked_sub(1) {
+            self.show_image(last, window, cx);
         } else if self.settings.vim_mode {
             self.focus_tree(window, cx);
         }
@@ -1058,6 +1202,7 @@ impl Workspace {
         for path in tracked.created {
             if let Some(index) = self.document_at(&path, cx) {
                 self.documents.remove(index);
+                self.move_images_for_removed_document(index);
                 self.active = match self.active {
                     Some(active) if active == index => self.documents.len().checked_sub(1),
                     Some(active) if active > index => Some(active - 1),
@@ -1640,7 +1785,14 @@ impl Workspace {
             return;
         }
         // These keep their own key bindings, also with no document open.
-        if self.pdf.read(cx).is_focused(window) || self.image_preview.is_some() {
+        if self.pdf.read(cx).is_focused(window) {
+            return;
+        }
+        if self.image_preview().is_some_and(|image| image.view.read(cx).focus_handle().is_focused(window)) {
+            if event.keystroke.modifiers.shift && matches!(event.keystroke.key.as_str(), "h" | "l") {
+                cx.stop_propagation();
+                self.step_tab(event.keystroke.key == "l", window, cx);
+            }
             return;
         }
         // The commit message is a text field with its own keys.
@@ -1767,10 +1919,12 @@ impl Workspace {
     }
 
     fn step_tab(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let count = self.documents.len();
-        if let (Some(active), true) = (self.active, count > 0) {
+        let tabs = self.tabs();
+        let count = tabs.len();
+        let active = self.active_tab();
+        if let Some(active) = tabs.iter().position(|tab| Some(*tab) == active) {
             let next = if forward { (active + 1) % count } else { (active + count - 1) % count };
-            self.activate(next, window, cx);
+            self.activate_tab(tabs[next], window, cx);
         }
     }
 
@@ -2359,7 +2513,7 @@ impl Workspace {
 
     /// The language of the document that toolbar snippets go into.
     fn active_language(&self, cx: &App) -> Option<Language> {
-        if self.image_preview.is_some() {
+        if self.shown_image.is_some() {
             return None;
         }
         self.active_view().map(|view| view.read(cx).state.language())
@@ -3140,41 +3294,97 @@ impl Workspace {
             )
     }
 
+    /// The background of a tab. It reaches half a slant past the tab on each side,
+    /// where the neighbor leaves room for it, so that tabs interlock without overlap.
+    /// The active tab has the color of the toolbar below, so that the two join,
+    /// and a thin line on its top edge.
+    fn tab_shape(active: bool, (left_forward, right_forward): (bool, bool), box_bounds: Rc<Cell<Bounds<Pixels>>>) -> impl IntoElement {
+        canvas(
+            |_, _, _| {},
+            move |bounds: Bounds<Pixels>, _, window, _| {
+                box_bounds.set(bounds);
+                let half = px(TAB_SLANT / 2.);
+                let edge = |x: Pixels, forward: bool, top: bool| if forward == top { x + half } else { x - half };
+                let left = bounds.left() + px(TAB_GAP / 2.);
+                let right = bounds.right() - px(TAB_GAP / 2.);
+                let top_left = point(edge(left, left_forward, true), bounds.top());
+                let top_right = point(edge(right, right_forward, true), bounds.top());
+                let mut path = gpui::Path::new(point(edge(left, left_forward, false), bounds.bottom()));
+                path.line_to(top_left);
+                path.line_to(top_right);
+                path.line_to(point(edge(right, right_forward, false), bounds.bottom()));
+                window.paint_path(path, theme::color(if active { theme::PANEL } else { theme::TAB_INACTIVE }));
+                if active {
+                    let line = Bounds::new(top_left, size(top_right.x - top_left.x, px(1.)));
+                    window.paint_quad(fill(line, theme::color(theme::CARET)));
+                }
+            },
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+    }
+
     fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let tabs = self.tabs();
+        let count = tabs.len();
+        let current = self.active_tab();
+        let current_position = tabs.iter().position(|tab| Some(*tab) == current);
         div()
             .flex()
             .flex_none()
             .items_end()
             .h(px(TAB_BAR_HEIGHT))
-            .bg(theme::color(theme::PANEL))
-            .pl(px(4.))
-            .gap(px(2.))
-            .children(self.documents.iter().enumerate().map(|(index, document)| {
-                let view = document.view.read(cx);
-                let active = self.active == Some(index);
-                let dirty = view.state.is_dirty();
+            .bg(theme::color(theme::BG))
+            .pl(px(TAB_SLANT / 2. + 4.))
+            .children(tabs.into_iter().enumerate().map(|(position, tab)| {
+                let active = current_position == Some(position);
+                let edges = tab_edges(position, count, current_position);
+                let box_bounds = Rc::new(Cell::new(Bounds::default()));
+                let shape_bounds = box_bounds.clone();
+                let (title, dirty, icon): (SharedString, bool, &'static str) = match tab {
+                    Tab::Document(index) => {
+                        let view = self.documents[index].view.read(cx);
+                        (view.title().into(), view.state.is_dirty(), "file")
+                    }
+                    Tab::Image(index) => {
+                        let view = self.images[index].view.read(cx);
+                        let name = view.path().file_name().map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+                        (name.into(), false, "image")
+                    }
+                };
                 div()
-                    .id(("tab", index))
+                    .id(("tab", position))
+                    .relative()
                     .flex()
                     .items_center()
                     .gap(px(6.))
-                    .h(px(32.))
-                    .px(px(8.))
-                    .rounded_t(px(4.))
+                    .h(px(TAB_HEIGHT))
+                    .px(px(TAB_SLANT / 2. + 8.))
                     .cursor_pointer()
-                    .when(active, |style| style.bg(theme::color(theme::BG)))
-                    .on_click(cx.listener(move |this, _, window, cx| this.activate(index, window, cx)))
-                    .child(Self::icon("file", 14., theme::UI_TEXT))
-                    .child(view.title())
+                    .when(!active, |style| style.text_color(theme::color(theme::UI_MUTED)))
+                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        let bounds = box_bounds.get();
+                        let click = event.position();
+                        let up = f32::from(bounds.bottom() - click.y) / f32::from(bounds.size.height);
+                        let offset = tab_hit(f32::from(click.x), f32::from(bounds.left()), f32::from(bounds.right()), up, edges);
+                        if let Some(target) = position.checked_add_signed(offset) {
+                            this.go_to_tab(target, window, cx);
+                        }
+                    }))
+                    .child(Self::tab_shape(active, edges, shape_bounds))
+                    .child(Self::icon(icon, 14., if active { theme::UI_TEXT } else { theme::UI_MUTED }))
+                    .child(title)
                     .when(dirty, |element| {
                         element.child(div().size(px(6.)).rounded_full().bg(theme::color(theme::UI_TEXT)))
                     })
                     .child(
                         div()
-                            .id(("tab-close", index))
+                            .id(("tab-close", position))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
-                                this.close_document(index, window, cx);
+                                this.close_tab(tab, window, cx);
                             }))
                             .child(Self::icon("close", 12., theme::UI_MUTED)),
                     )
@@ -3421,7 +3631,7 @@ impl Workspace {
 
     fn render_editor_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let active = self.active_view();
-        let body: AnyElement = match (&self.image_preview, active) {
+        let body: AnyElement = match (self.image_preview(), active) {
             (Some(preview), _) => preview.view.clone().into_any_element(),
             (None, Some(view)) => view.into_any_element(),
             (None, None) => div()
@@ -4686,10 +4896,18 @@ impl Render for Workspace {
                 }
             }))
             .on_action(cx.listener(|this, _: &Recompile, _, cx| this.recompile(cx)))
+            .on_action(cx.listener(|this, _: &GoToTab1, window, cx| this.go_to_tab(0, window, cx)))
+            .on_action(cx.listener(|this, _: &GoToTab2, window, cx| this.go_to_tab(1, window, cx)))
+            .on_action(cx.listener(|this, _: &GoToTab3, window, cx| this.go_to_tab(2, window, cx)))
+            .on_action(cx.listener(|this, _: &GoToTab4, window, cx| this.go_to_tab(3, window, cx)))
+            .on_action(cx.listener(|this, _: &GoToTab5, window, cx| this.go_to_tab(4, window, cx)))
+            .on_action(cx.listener(|this, _: &GoToTab6, window, cx| this.go_to_tab(5, window, cx)))
+            .on_action(cx.listener(|this, _: &GoToTab7, window, cx| this.go_to_tab(6, window, cx)))
+            .on_action(cx.listener(|this, _: &GoToTab8, window, cx| this.go_to_tab(7, window, cx)))
+            .on_action(cx.listener(|this, _: &GoToTab9, window, cx| this.go_to_tab(8, window, cx)))
             .on_action(cx.listener(|this, _: &CloseTab, window, cx| {
-                if this.image_preview.take().is_some() {
-                    this.focus_active(window, cx);
-                    cx.notify();
+                if let Some(index) = this.shown_image {
+                    this.close_image(index, window, cx);
                 } else if let Some(index) = this.active {
                     this.close_document(index, window, cx);
                 }
@@ -4771,5 +4989,42 @@ impl Render for Workspace {
                         .on_mouse_down(MouseButton::Right, cx.listener(|this, _, window, cx| this.close_menu(window, cx))),
                 )
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_slanted_edge_decides_which_tab_a_click_hits() {
+        // An edge that leans to the right going up, as on the left of an active tab.
+        let edges = (true, false);
+        assert_eq!(tab_hit(103., 100., 200., 1., edges), -1);
+        assert_eq!(tab_hit(103., 100., 200., 0., edges), 0);
+        assert_eq!(tab_hit(197., 100., 200., 1., edges), 1);
+        assert_eq!(tab_hit(197., 100., 200., 0., edges), 0);
+        assert_eq!(tab_hit(150., 100., 200., 0.5, edges), 0);
+    }
+
+    #[test]
+    fn images_keep_their_place_among_documents() {
+        use Tab::*;
+        assert_eq!(tab_order(2, &[]), [Document(0), Document(1)]);
+        assert_eq!(tab_order(2, &[1, 2]), [Document(0), Image(0), Document(1), Image(1)]);
+        assert_eq!(tab_order(0, &[0, 0]), [Image(0), Image(1)]);
+    }
+
+    #[test]
+    fn neighbors_share_an_edge_that_leans_toward_the_active_tab() {
+        for active in [None, Some(0), Some(1), Some(3)] {
+            for position in 0..3 {
+                assert_eq!(tab_edges(position, 4, active).1, tab_edges(position + 1, 4, active).0);
+            }
+        }
+        assert_eq!(tab_edges(1, 3, Some(1)), (true, false));
+        // The outer edges of the bar always face inward.
+        assert!(tab_edges(0, 3, None).0);
+        assert!(!tab_edges(2, 3, None).1);
     }
 }
