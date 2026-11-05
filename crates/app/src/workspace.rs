@@ -1,6 +1,7 @@
 use std::{
     cell::Cell,
     collections::{HashMap, HashSet},
+    ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
     sync::{
@@ -22,8 +23,8 @@ use editor_core::{
 };
 use gpui::{
     AnyElement, Anchor, App, AsyncWindowContext, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Entity, FocusHandle, Focusable, FontWeight, Keystroke,
-    KeystrokeEvent, MouseButton, MouseMoveEvent, PathPromptOptions, Pixels, Point, Render, ScrollHandle, SharedString,
-    EntityId, PromptLevel, Subscription, Task, WeakEntity, Window, anchored, black, canvas, deferred, div, fill, point, prelude::*, px, size, svg,
+    KeystrokeEvent, MouseButton, MouseMoveEvent, PathPromptOptions, Pixels, Point, Render, ScrollHandle, ScrollStrategy, SharedString, UniformListScrollHandle,
+    EntityId, PromptLevel, Subscription, Task, WeakEntity, Window, anchored, black, canvas, deferred, div, fill, point, prelude::*, px, size, uniform_list, svg,
 };
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use synctex::SyncTex;
@@ -401,7 +402,7 @@ pub struct Workspace {
     picker_scroll: ScrollHandle,
     picker_files_task: Option<Task<()>>,
     tree_focus: FocusHandle,
-    tree_scroll: ScrollHandle,
+    tree_scroll: UniformListScrollHandle,
     tree_cursor: usize,
     show_tree: bool,
     /// The row last clicked, which decides where a new entry goes.
@@ -421,6 +422,8 @@ pub struct Workspace {
     _pdf_subscription: Subscription,
     _watcher: Option<RecommendedWatcher>,
     _watch_task: Option<Task<()>>,
+    refresh_task: Option<Task<()>>,
+    refresh_again: bool,
 }
 
 impl Workspace {
@@ -450,7 +453,7 @@ impl Workspace {
             GitPanelEvent::PickBranch => this.open_picker(PickerKind::Branches, window, cx),
             GitPanelEvent::Changed(branch) => {
                 this.git_branch = branch.clone().or_else(|| this.root.as_deref().and_then(git_branch));
-                this.refresh_from_disk(cx);
+                this.refresh_in_background(cx);
             }
         });
         let settings_path = settings::default_path();
@@ -530,7 +533,7 @@ impl Workspace {
             picker_scroll: ScrollHandle::new(),
             picker_files_task: None,
             tree_focus: cx.focus_handle(),
-            tree_scroll: ScrollHandle::new(),
+            tree_scroll: UniformListScrollHandle::new(),
             tree_cursor: 0,
             show_tree: true,
             tree_target: None,
@@ -548,6 +551,8 @@ impl Workspace {
             _pdf_subscription: pdf_subscription,
             _watcher: None,
             _watch_task: None,
+            refresh_task: None,
+            refresh_again: false,
         };
         workspace.reload_addons(cx);
         if let Some(root) = root {
@@ -557,6 +562,7 @@ impl Workspace {
     }
 
     fn open_root(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_refresh();
         self.entries = file_tree::scan(&root, &self.collapsed);
         self.tree_target = None;
         self.tree_input = None;
@@ -631,7 +637,7 @@ impl Workspace {
                 }
                 if changed
                     && this
-                        .update(cx, |this, cx| this.refresh_from_disk(cx))
+                        .update(cx, |this, cx| this.refresh_in_background(cx))
                         .is_err()
                 {
                     return;
@@ -640,7 +646,62 @@ impl Workspace {
         }));
     }
 
+    /// For a change from outside. A big project takes a while to walk, which must
+    /// not stop typing, and changes during a walk lead to one more walk afterward.
+    fn refresh_in_background(&mut self, cx: &mut Context<Self>) {
+        if self.refresh_task.is_some() {
+            self.refresh_again = true;
+            return;
+        }
+        let root = self.root.clone();
+        let collapsed = self.collapsed.clone();
+        let documents: Vec<_> = self
+            .documents
+            .iter()
+            .filter_map(|document| {
+                let view = document.view.read(cx);
+                let path = view.path.clone().filter(|_| !view.state.is_dirty())?;
+                Some((document.view.clone(), path, view.state.version()))
+            })
+            .collect();
+        let paths: Vec<PathBuf> = documents.iter().map(|(_, path, _)| path.clone()).collect();
+        self.refresh_task = Some(cx.spawn(async move |this, cx| {
+            // Open files come first, since the walk can take much longer.
+            let texts: Vec<Option<String>> = cx
+                .background_spawn(async move { paths.iter().map(|path| std::fs::read_to_string(path).ok()).collect() })
+                .await;
+            cx.update(|cx| {
+                for ((view, _, version), text) in documents.iter().zip(&texts) {
+                    if let Some(text) = text {
+                        view.update(cx, |view, cx| view.reload_text(text, *version, cx));
+                    }
+                }
+            });
+            let entries = cx.background_spawn(async move { root.map(|root| file_tree::scan(&root, &collapsed)) }).await;
+            this.update(cx, |this, cx| {
+                this.refresh_task = None;
+                if let Some(entries) = entries {
+                    this.entries = entries;
+                }
+                this.git_panel.update(cx, |panel, cx| panel.refresh(cx));
+                cx.notify();
+                if std::mem::take(&mut this.refresh_again) {
+                    this.refresh_in_background(cx);
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// A walk that is still running is older than what comes next, so it must not
+    /// overwrite it.
+    fn cancel_refresh(&mut self) {
+        self.refresh_task = None;
+        self.refresh_again = false;
+    }
+
     fn refresh_from_disk(&mut self, cx: &mut Context<Self>) {
+        self.cancel_refresh();
         if let Some(root) = &self.root {
             self.entries = file_tree::scan(root, &self.collapsed);
         }
@@ -1239,7 +1300,7 @@ impl Workspace {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| format!("Cannot write {relative}: {error}"))?;
         }
-        std::fs::write(&path, text).map_err(|error| format!("Cannot write {relative}: {error}"))?;
+        crate::atomic::write(&path, text.as_bytes()).map_err(|error| format!("Cannot write {relative}: {error}"))?;
         if let Some(view) = document {
             view.update(cx, |view, cx| view.reload_from_disk(cx));
         }
@@ -2396,7 +2457,7 @@ impl Workspace {
         if let Some(index) = active.and_then(|path| self.entries.iter().position(|entry| entry.path == path)) {
             self.tree_cursor = index;
         }
-        self.tree_scroll.scroll_to_item(self.tree_cursor);
+        self.tree_scroll.scroll_to_item(self.tree_cursor, ScrollStrategy::Nearest);
         self.tree_g_pending = false;
         self.tree_leader = None;
         window.focus(&self.tree_focus, cx);
@@ -2405,7 +2466,7 @@ impl Workspace {
 
     fn move_tree_cursor(&mut self, index: usize, cx: &mut Context<Self>) {
         self.tree_cursor = index.min(self.entries.len().saturating_sub(1));
-        self.tree_scroll.scroll_to_item(self.tree_cursor);
+        self.tree_scroll.scroll_to_item(self.tree_cursor, ScrollStrategy::Nearest);
         cx.notify();
     }
 
@@ -2527,7 +2588,7 @@ impl Workspace {
         self.refresh_from_disk(cx);
         if let Some(index) = self.entries.iter().position(|entry| entry.path == path) {
             self.tree_cursor = index;
-            self.tree_scroll.scroll_to_item(index);
+            self.tree_scroll.scroll_to_item(index, ScrollStrategy::Nearest);
         }
         self.tree_target = Some(path.to_path_buf());
     }
@@ -2608,7 +2669,7 @@ impl Workspace {
         }
         self.collapsed.insert(folder);
         self.refresh_from_disk(cx);
-        self.tree_scroll.scroll_to_item(self.tree_cursor);
+        self.tree_scroll.scroll_to_item(self.tree_cursor, ScrollStrategy::Nearest);
     }
 
     // Picker
@@ -3469,20 +3530,33 @@ impl Workspace {
         }
     }
 
-    fn render_file_tree(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let tree_cursor = self.tree_focus.is_focused(window).then_some(self.tree_cursor);
-        let active_path = self
-            .active_view()
-            .and_then(|view| view.read(cx).path.clone());
+    /// Only the rows in view exist, because a project can hold many thousand files.
+    fn render_file_tree(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("file-tree")
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
             .track_focus(&self.tree_focus)
-            .track_scroll(&self.tree_scroll)
             .px(px(4.))
-            .children(self.entries.iter().enumerate().map(|(index, entry)| {
+            .child(
+                uniform_list(
+                    "file-tree-rows",
+                    self.entries.len(),
+                    cx.processor(|this, range: Range<usize>, window, cx| this.render_tree_rows(range, window, cx)),
+                )
+                .size_full()
+                .track_scroll(&self.tree_scroll),
+            )
+    }
+
+    fn render_tree_rows(&self, range: Range<usize>, window: &Window, cx: &mut Context<Self>) -> Vec<impl IntoElement + use<>> {
+        let tree_cursor = self.tree_focus.is_focused(window).then_some(self.tree_cursor);
+        let active_path = self
+            .active_view()
+            .and_then(|view| view.read(cx).path.clone());
+        range
+            .map(|index| {
+                let entry = &self.entries[index];
                 let selected = active_path.as_deref() == Some(entry.path.as_path());
                 let path = entry.path.clone();
                 let is_dir = entry.is_dir;
@@ -3527,7 +3601,8 @@ impl Workspace {
                     })
                     .child(Self::icon(Self::file_icon(entry), 16., theme::UI_TEXT))
                     .child(div().truncate().child(entry.name.clone()))
-            }))
+            })
+            .collect()
     }
 
     fn render_outline(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3682,7 +3757,7 @@ impl Workspace {
             )
     }
 
-    fn render_file_panel(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_file_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let show_outline = self.show_outline;
         let show_tree = self.show_tree;
         let has_project = self.root.is_some();
@@ -3736,7 +3811,7 @@ impl Workspace {
                                 .child(error),
                         )
                     })
-                    .child(self.render_file_tree(window, cx))
+                    .child(self.render_file_tree(cx))
                     .child(self.divider_horizontal(cx))
             })
             .child(
@@ -5447,7 +5522,7 @@ impl Render for Workspace {
                     .child(self.render_rail(cx))
                     .when(show_file_panel, |element| {
                         let panel = match self.left_panel {
-                            LeftPanel::Files => self.render_file_panel(window, cx).into_any_element(),
+                            LeftPanel::Files => self.render_file_panel(cx).into_any_element(),
                             LeftPanel::Git => div()
                                 .flex_none()
                                 .w(self.file_panel_width)

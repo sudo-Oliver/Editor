@@ -205,7 +205,7 @@ fn load(path: &Path, svg_renderer: SvgRenderer) -> Result<(Arc<RenderImage>, Str
     let mut pixels = decoded.into_rgba8();
     let resolution = pixels.dimensions();
     // GPUI wants BGRA.
-    for pixel in pixels.chunks_exact_mut(4) {
+    for pixel in pixels.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
     let image = Arc::new(RenderImage::new([image::Frame::new(pixels)]));

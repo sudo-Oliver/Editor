@@ -196,7 +196,7 @@ impl EditorView {
         if !self.state.is_dirty() {
             return Ok(false);
         }
-        std::fs::write(path, self.state.buffer().to_string())?;
+        crate::atomic::write(path, self.state.buffer().to_string().as_bytes())?;
         self.state.mark_saved();
         cx.notify();
         Ok(true)
@@ -213,8 +213,17 @@ impl EditorView {
         let Ok(text) = std::fs::read_to_string(path) else {
             return;
         };
+        let version = self.state.version();
+        self.reload_text(&text, version, cx);
+    }
+
+    /// Takes text read from disk elsewhere, unless the document changed since then.
+    pub fn reload_text(&mut self, text: &str, version: u64, cx: &mut Context<Self>) {
+        if self.state.is_dirty() || self.state.version() != version {
+            return;
+        }
         if text != self.state.buffer().to_string() {
-            self.state.reload(&text);
+            self.state.reload(text);
             self.schedule_parse(cx);
             cx.notify();
         }
