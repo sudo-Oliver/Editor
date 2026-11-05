@@ -297,7 +297,7 @@ impl EditorView {
             return;
         }
         self.disk_hash = content_hash(text.as_bytes());
-        if text != self.state.buffer().to_string() {
+        if *self.state.buffer().rope() != text {
             self.state.reload(text);
             self.schedule_parse(cx);
             cx.notify();

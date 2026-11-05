@@ -50,6 +50,12 @@ struct Edit {
     text: String,
 }
 
+impl Operation {
+    fn bytes(&self) -> usize {
+        self.removed.len() + self.inserted.len()
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Operation {
     start: usize,
@@ -57,10 +63,20 @@ struct Operation {
     inserted: String,
 }
 
+/// More than a long day of work, and small enough that an undo history never
+/// becomes the reason for running out of memory.
+const MAX_UNDO_BYTES: usize = 256 * 1024 * 1024;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GroupKind {
     Typing,
     Other,
+}
+
+impl Transaction {
+    fn bytes(&self) -> usize {
+        self.operations.iter().map(Operation::bytes).sum()
+    }
 }
 
 struct Transaction {
@@ -87,6 +103,10 @@ pub struct EditorState {
     language: Language,
     selections: SelectionSet,
     undo_stack: Vec<Transaction>,
+    /// The text held by `undo_stack`.
+    undo_bytes: usize,
+    /// Transactions dropped from the start of `undo_stack`, which checkpoints count.
+    undo_dropped: usize,
     redo_stack: Vec<Transaction>,
     group_timeout: Duration,
     version: u64,
@@ -130,6 +150,8 @@ impl EditorState {
             language,
             selections: SelectionSet::default(),
             undo_stack: Vec::new(),
+            undo_bytes: 0,
+            undo_dropped: 0,
             redo_stack: Vec::new(),
             group_timeout: Duration::from_millis(600),
             version: 1,
@@ -211,11 +233,15 @@ impl EditorState {
 
     /// Marks the current point in the history for `merge_undo_since`.
     pub fn undo_checkpoint(&self) -> usize {
-        self.undo_stack.len()
+        self.undo_dropped + self.undo_stack.len()
     }
 
     /// Turns everything done since `checkpoint` into one undo step.
     pub fn merge_undo_since(&mut self, checkpoint: usize) {
+        // Everything since then may be gone already, if the history got too large.
+        let Some(checkpoint) = checkpoint.checked_sub(self.undo_dropped) else {
+            return;
+        };
         if self.undo_stack.len() <= checkpoint + 1 {
             return;
         }
@@ -666,6 +692,7 @@ impl EditorState {
         let Some(transaction) = self.undo_stack.pop() else {
             return false;
         };
+        self.undo_bytes -= transaction.bytes();
         for operation in transaction.operations.iter().rev() {
             self.raw_replace(
                 operation.start..operation.start + operation.inserted.len(),
@@ -691,17 +718,21 @@ impl EditorState {
         }
         self.selections = transaction.selections_after.clone();
         self.revision = transaction.revision_after;
+        self.undo_bytes += transaction.bytes();
         self.undo_stack.push(transaction);
         true
     }
 
-    /// Replaces the whole text from disk. The undo history stays usable.
+    /// Takes the text from disk. The undo history stays usable, and only what
+    /// differs goes through it, so that a small change stays small.
     pub fn reload(&mut self, text: &str) {
         let selections = self.selections.to_vec_primary_last();
+        let current = self.buffer.to_string();
+        let changed = changed_middle(&current, text);
         self.commit(
             vec![Edit {
-                range: 0..self.buffer.len(),
-                text: text.to_string(),
+                range: changed.clone(),
+                text: text[changed.start..text.len() - (current.len() - changed.end)].to_string(),
             }],
             SelectionSet::single(Selection::cursor(0)),
             GroupKind::Other,
@@ -825,6 +856,7 @@ impl EditorState {
             return;
         }
         self.redo_stack.clear();
+        self.undo_bytes += operations.iter().map(Operation::bytes).sum::<usize>();
 
         let revision_before = self.revision;
         self.revision = self.next_revision;
@@ -835,10 +867,19 @@ impl EditorState {
             && last.kind == GroupKind::Typing
             && now.duration_since(last.last_edit) < self.group_timeout
         {
-            last.operations.extend(operations);
+            for operation in operations {
+                match last.operations.last_mut() {
+                    // Typing on is one longer insertion, not one more entry per key.
+                    Some(previous) if operation.removed.is_empty() && previous.start + previous.inserted.len() == operation.start => {
+                        previous.inserted.push_str(&operation.inserted);
+                    }
+                    _ => last.operations.push(operation),
+                }
+            }
             last.selections_after = self.selections.clone();
             last.revision_after = self.revision;
             last.last_edit = now;
+            self.trim_undo();
             return;
         }
         self.undo_stack.push(Transaction {
@@ -850,6 +891,18 @@ impl EditorState {
             kind,
             last_edit: now,
         });
+        self.trim_undo();
+    }
+
+    /// The newest step always stays, however large it is.
+    fn trim_undo(&mut self) {
+        let mut dropped = 0;
+        while self.undo_bytes > MAX_UNDO_BYTES && dropped + 1 < self.undo_stack.len() {
+            self.undo_bytes -= self.undo_stack[dropped].bytes();
+            dropped += 1;
+        }
+        self.undo_stack.drain(..dropped);
+        self.undo_dropped += dropped;
     }
 
     fn raw_replace(&mut self, range: Range<usize>, text: &str) {
@@ -1059,9 +1112,91 @@ fn opens_latex_environment(line: &str) -> bool {
     line.trim_start().starts_with("\\begin{") && !line.contains("\\end{")
 }
 
+/// The part of `old` to replace to get `new`, on character boundaries of both.
+fn changed_middle(old: &str, new: &str) -> Range<usize> {
+    let (old_bytes, new_bytes) = (old.as_bytes(), new.as_bytes());
+    let longest = old_bytes.len().min(new_bytes.len());
+    let mut start = old_bytes.iter().zip(new_bytes).take_while(|(left, right)| left == right).count();
+    while !(old.is_char_boundary(start) && new.is_char_boundary(start)) {
+        start -= 1;
+    }
+    let same_end = old_bytes.iter().rev().zip(new_bytes.iter().rev()).take_while(|(left, right)| left == right).count();
+    let mut end = same_end.min(longest - start);
+    while !(old.is_char_boundary(old.len() - end) && new.is_char_boundary(new.len() - end)) {
+        end -= 1;
+    }
+    start..old.len() - end
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typing_on_keeps_one_undo_entry() {
+        let mut state = EditorState::new("", Language::Plain);
+        for ch in ["a", "b", "ä"] {
+            state.type_text(ch);
+        }
+        assert_eq!(state.undo_stack.len(), 1);
+        assert_eq!(state.undo_stack[0].operations.len(), 1);
+        assert_eq!(state.undo_stack[0].operations[0].inserted, "abä");
+        state.undo();
+        assert_eq!(state.buffer().to_string(), "");
+        state.redo();
+        assert_eq!(state.buffer().to_string(), "abä");
+    }
+
+    #[test]
+    fn undo_keeps_its_limit_and_its_checkpoints() {
+        let mut state = EditorState::new("", Language::Plain);
+        let large = "x".repeat(MAX_UNDO_BYTES / 2 + 1);
+        let old_checkpoint = state.undo_checkpoint();
+        let step = |state: &mut EditorState, text: &str| {
+            state.replace_range(0..0, text, Selection::cursor(0));
+            state.seal_undo_group();
+        };
+        step(&mut state, &large);
+        step(&mut state, "a");
+        let checkpoint = state.undo_checkpoint();
+        step(&mut state, &large);
+        step(&mut state, &large);
+        assert!(state.undo_bytes <= MAX_UNDO_BYTES);
+        assert_eq!(state.undo_stack.len(), 1);
+        assert_eq!(state.undo_checkpoint(), checkpoint + 2);
+        state.merge_undo_since(old_checkpoint);
+        assert_eq!(state.undo_stack.len(), 1);
+        assert!(state.undo());
+        assert!(!state.undo());
+        assert_eq!(state.undo_bytes, 0);
+        assert!(state.redo());
+        assert_eq!(state.undo_bytes, large.len());
+    }
+
+    #[test]
+    fn reload_changes_only_what_differs() {
+        assert_eq!(changed_middle("abcd", "abcd"), 4..4);
+        assert_eq!(changed_middle("abXcd", "abYcd"), 2..3);
+        assert_eq!(changed_middle("aaaa", "aa"), 2..4);
+        assert_eq!(changed_middle("aa", "aaaa"), 2..2);
+        assert_eq!(changed_middle("", "x"), 0..0);
+        // ä and ö share their first byte.
+        assert_eq!(changed_middle("xäy", "xöy"), 1..3);
+        let mut state = EditorState::new("eins\nzwei\ndrei\n", Language::Plain);
+        state.reload("eins\nZWEI\ndrei\n");
+        assert_eq!(state.buffer().to_string(), "eins\nZWEI\ndrei\n");
+        assert!(!state.is_dirty());
+        assert_eq!(state.undo_stack.last().unwrap().operations[0].inserted, "ZWEI");
+        state.undo();
+        assert_eq!(state.buffer().to_string(), "eins\nzwei\ndrei\n");
+        for (old, new) in [("ääää", "ää"), ("äöü", "äü"), ("a\r\nb", "a\nb"), ("🙂x", "🙃x")] {
+            let mut state = EditorState::new(old, Language::Plain);
+            state.reload(new);
+            assert_eq!(state.buffer().to_string(), new);
+            state.undo();
+            assert_eq!(state.buffer().to_string(), old);
+        }
+    }
 
     fn state(text: &str) -> EditorState {
         EditorState::new(text, Language::Latex)
