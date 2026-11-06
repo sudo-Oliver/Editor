@@ -40,6 +40,7 @@ use crate::{
     export::{self, DraftFormat, PdfState},
     file_tree::{self, TreeEntry},
     git_panel::{self, GitPanel, GitPanelEvent},
+    home_view::{HomeEvent, HomeView},
     outline::{self, OutlineItem},
     image_view::{ImageView, ImageViewEvent, include_snippet, is_image, relative_path},
     pdf_view::{PdfView, PdfViewEvent, ZOOM_STEP},
@@ -397,6 +398,12 @@ pub struct Workspace {
     /// The PDF tab is the one on screen.
     pdf_tab_shown: bool,
     focus_mode: bool,
+    home: Entity<HomeView>,
+    /// The hub also shows by itself while no project is open.
+    show_hub: bool,
+    /// The logo turns into a house under the mouse, as it leads to the hub.
+    logo_hovered: bool,
+    _home_subscription: Subscription,
     presenting: Option<PresentState>,
     show_logs: bool,
     show_outline: bool,
@@ -511,6 +518,20 @@ impl Workspace {
         let key_subscription = cx.intercept_keystrokes(move |event, window, cx| {
             key_handle.update(cx, |this, cx| this.intercept_key(event, window, cx)).ok();
         });
+        let home = cx.new(HomeView::new);
+        let home_subscription = cx.subscribe_in(&home, window, |this, _, event, window, cx| match event {
+            HomeEvent::Open(path) => {
+                let path = path.clone();
+                if this.root.as_deref() == Some(path.as_path()) {
+                    this.close_hub(window, cx);
+                } else {
+                    this.show_hub = false;
+                    this.open_root(path, window, cx);
+                }
+            }
+            HomeEvent::Close => this.close_hub(window, cx),
+            HomeEvent::Trashed(path) => this.forget_trashed_root(path, cx),
+        });
         let workspace_handle = cx.entity().downgrade();
         let git_panel = cx.new(|cx| GitPanel::new(workspace_handle, cx));
         let git_subscription = cx.subscribe_in(&git_panel, window, |this, _, event, window, cx| match event {
@@ -563,6 +584,10 @@ impl Workspace {
             layout: PaneLayout::Split,
             pdf_tab_shown: false,
             focus_mode: false,
+            home,
+            show_hub: false,
+            logo_hovered: false,
+            _home_subscription: home_subscription,
             presenting: None,
             show_logs: false,
             show_outline: true,
@@ -637,10 +662,81 @@ impl Workspace {
             refresh_again: false,
         };
         workspace.reload_addons(cx);
-        if let Some(root) = root {
-            workspace.open_root(root, window, cx);
+        match root {
+            Some(root) => workspace.open_root(root, window, cx),
+            None => {
+                let home = workspace.home.clone();
+                cx.defer_in(window, move |_, window, cx| home.update(cx, |home, cx| home.focus(window, cx)));
+            }
         }
         workspace
+    }
+
+    fn hub_shown(&self) -> bool {
+        (self.show_hub || self.root.is_none()) && self.presenting.is_none()
+    }
+
+    fn open_hub(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.open_menu.is_some() {
+            self.close_menu(window, cx);
+        }
+        self.show_hub = true;
+        let (has_project, vim_mode) = (self.root.is_some(), self.settings.vim_mode);
+        self.home.update(cx, |home, cx| {
+            home.set_context(has_project, vim_mode);
+            home.show(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn close_hub(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.root.is_none() {
+            return;
+        }
+        self.show_hub = false;
+        self.focus_main(window, cx);
+        cx.notify();
+    }
+
+    fn save_project_as_template(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        // The copy reads the disk, so the edits have to be there.
+        if !self.save_all(cx) {
+            return;
+        }
+        self.open_hub(window, cx);
+        self.home.update(cx, |home, cx| home.open_save_template(root, window, cx));
+    }
+
+    fn toggle_hub(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.hub_shown() { self.close_hub(window, cx) } else { self.open_hub(window, cx) }
+    }
+
+    /// The open project went to the trash, so nothing may write into it any more.
+    fn forget_trashed_root(&mut self, path: &Path, cx: &mut Context<Self>) {
+        if self.root.as_deref() != Some(path) {
+            return;
+        }
+        self.cancel_refresh();
+        self._watcher = None;
+        self._watch_task = None;
+        self.documents.clear();
+        self.active = None;
+        self.images.clear();
+        self.shown_image = None;
+        self.entries.clear();
+        self.tree_input = None;
+        self.root = None;
+        self.git_branch = None;
+        self.git_panel.update(cx, |panel, cx| panel.set_root(None, cx));
+        for entry in &self.addon_panels {
+            entry.panel.update(cx, |panel, cx| panel.set_root(None, cx));
+        }
+        let vim_mode = self.settings.vim_mode;
+        self.home.update(cx, |home, _| home.set_context(false, vim_mode));
+        cx.notify();
     }
 
     fn open_root(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
@@ -660,6 +756,11 @@ impl Workspace {
         self.start_watching(&root, cx);
         self.git_branch = git_branch(&root);
         self.root = Some(root.clone());
+        let vim_mode = self.settings.vim_mode;
+        self.home.update(cx, |home, cx| {
+            home.touch(&root, cx);
+            home.set_context(true, vim_mode);
+        });
         self.git_panel.update(cx, |panel, cx| panel.set_root(Some(root.clone()), cx));
         self.tracked_edits.clear();
         for entry in &self.addon_panels {
@@ -2336,6 +2437,12 @@ impl Workspace {
     /// Runs before the key bindings. An open picker takes its keys in any mode. Apart
     /// from that, nothing changes with vim mode off.
     fn intercept_key(&mut self, event: &KeystrokeEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.hub_shown() && self.dialog.is_none() && self.open_menu.is_none() {
+            if self.home.update(cx, |home, cx| home.handle_key(&event.keystroke, window, cx)) {
+                cx.stop_propagation();
+            }
+            return;
+        }
         if event.keystroke.modifiers.platform {
             return;
         }
@@ -2468,6 +2575,7 @@ impl Workspace {
             Effect::FindFiles => self.open_picker(PickerKind::Files, window, cx),
             Effect::FindText => self.open_picker(PickerKind::Text, window, cx),
             Effect::PickTheme => self.open_theme_picker(window, cx),
+            Effect::OpenHub => self.open_hub(window, cx),
             Effect::LookupDoi => self.lookup_doi(cx),
             Effect::QuickFix => self.quick_fix(cx),
             Effect::ShowError => {
@@ -3801,7 +3909,9 @@ impl Workspace {
                 entry("HTML draft…", "", |this, window, cx| this.download_draft(DraftFormat::Html, window, cx)),
                 entry("Markdown draft…", "", |this, window, cx| this.download_draft(DraftFormat::Markdown, window, cx)),
                 menu_separator(),
+                entry("Project hub…", "⇧⌘P", |this, window, cx| this.open_hub(window, cx)),
                 entry("Open folder…", "⌘O", |this, window, cx| this.prompt_open_folder(window, cx)),
+                entry("Save project as template…", "", |this, window, cx| this.save_project_as_template(window, cx)),
                 entry("Save", "⌘S", |this, window, cx| this.save_active(window, cx)),
                 entry("Recompile", "⌘↩", |this, _, cx| this.recompile_by_hand(cx)),
             ],
@@ -4038,6 +4148,32 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .gap(px(2.))
+                    .child(
+                        div()
+                            .id("hub-logo")
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .size(px(28.))
+                            .mr(px(4.))
+                            .rounded(px(4.))
+                            .cursor_pointer()
+                            .when(self.logo_hovered, |style| style.bg(theme::color(theme::palette().divider)))
+                            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                                this.logo_hovered = *hovered;
+                                cx.notify();
+                            }))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.logo_hovered = false;
+                                this.open_hub(window, cx);
+                            }))
+                            .child(if self.logo_hovered {
+                                Self::icon("home", 18., theme::palette().ui_text)
+                            } else {
+                                Self::icon("notepad", 18., theme::palette().accent)
+                            }),
+                    )
                     .child(self.menu_button(Menu::File, "File", cx))
                     .child(self.menu_button(Menu::Edit, "Edit", cx))
                     .child(self.menu_button(Menu::Insert, "Insert", cx))
@@ -4053,7 +4189,17 @@ impl Workspace {
                     .flex()
                     .justify_center()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .child(title),
+                    .child(
+                        div()
+                            .id("project-title")
+                            .px(px(8.))
+                            .py(px(2.))
+                            .rounded(px(4.))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme::color(theme::palette().divider)))
+                            .on_click(cx.listener(|this, _, window, cx| this.open_hub(window, cx)))
+                            .child(title),
+                    ),
             )
             .child(
                 div()
@@ -6235,7 +6381,8 @@ impl Render for Workspace {
         self.tree_cursor = self.tree_cursor.min(self.entries.len().saturating_sub(1));
         let dragging = self.dragging;
         let presenting = self.presenting.is_some();
-        let focus = self.focus_mode && !presenting;
+        let hub = self.hub_shown();
+        let focus = self.focus_mode && !presenting && !hub;
         let show_preview = !focus && matches!(self.layout, PaneLayout::Split | PaneLayout::PdfOnly);
         let show_editor = focus || self.layout != PaneLayout::PdfOnly;
         let show_file_panel = self.show_file_panel;
@@ -6318,6 +6465,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &LayoutPdfOnly, window, cx| this.set_layout(PaneLayout::PdfOnly, window, cx)))
             .on_action(cx.listener(|this, _: &LayoutPdfTab, window, cx| this.set_layout(PaneLayout::PdfTab, window, cx)))
             .on_action(cx.listener(|this, _: &ToggleFocusMode, window, cx| this.toggle_focus_mode(window, cx)))
+            .on_action(cx.listener(|this, _: &ToggleHub, window, cx| this.toggle_hub(window, cx)))
             .on_action(cx.listener(|this, _: &StartPresentation, window, cx| this.start_presentation(window, cx)))
             .on_action(cx.listener(|this, _: &ExitPresentation, window, cx| this.exit_presentation(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleLogs, _, cx| {
@@ -6335,7 +6483,8 @@ impl Render for Workspace {
                 this.open_dialog(Dialog::Settings(SettingsPage::Editor), window, cx);
             }))
             .on_action(|_: &Quit, _, cx: &mut App| cx.quit())
-            .when(!presenting && !focus, |element| element.child(self.render_top_bar(cx)))
+            .when(hub, |element| element.child(div().flex().flex_1().min_h_0().child(self.home.clone())))
+            .when(!presenting && !focus && !hub, |element| element.child(self.render_top_bar(cx)))
             .when(presenting, |element| {
                 let controls = self.presenting.as_ref().is_some_and(|state| state.controls_shown);
                 element.child(
@@ -6380,7 +6529,7 @@ impl Render for Workspace {
                             .child(div().flex().w_full().max_w(px(FOCUS_WIDTH)).h_full().child(self.render_editor_pane(cx))),
                     )
             })
-            .when(!presenting && !focus, |element| element.child(
+            .when(!presenting && !focus && !hub, |element| element.child(
                 div()
                     .flex()
                     .flex_1()
@@ -6414,7 +6563,7 @@ impl Render for Workspace {
                     .when(show_preview, |element| element.child(self.render_preview(cx))),
             ))
             // Vim needs its mode and command line in focus mode too.
-            .when(!presenting && (!focus || self.settings.vim_mode), |element| element.children(self.render_status_bar(cx)))
+            .when(!presenting && !hub && (!focus || self.settings.vim_mode), |element| element.children(self.render_status_bar(cx)))
             .when_some(self.dialog, |element, dialog| element.child(self.render_dialog(dialog, cx)))
             .when_some(self.picker.as_ref(), |element, picker| element.child(self.render_picker(picker, cx)))
             .when_some(addon_dialog, |element, dialog| element.child(dialog))

@@ -54,11 +54,16 @@ impl Settings {
     }
 }
 
-pub fn default_path() -> Option<PathBuf> {
+/// Where the editor keeps what belongs to the user and not to a project.
+pub fn config_dir() -> Option<PathBuf> {
     let config = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-    Some(config.join("editor").join("settings.toml"))
+    Some(config.join("editor"))
+}
+
+pub fn default_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("settings.toml"))
 }
 
 #[cfg(test)]

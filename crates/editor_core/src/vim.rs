@@ -53,6 +53,7 @@ pub enum Effect {
     ToggleTree,
     RevealInTree,
     PickTheme,
+    OpenHub,
     TogglePreview,
     FindFiles,
     FindText,
@@ -1298,7 +1299,8 @@ pub fn leader_lookup(keys: &str) -> Leader {
         "ee" => Effect::ToggleTree,
         "ef" => Effect::RevealInTree,
         "tc" => Effect::PickTheme,
-        "e" | "t" => return Leader::Prefix,
+        "hp" => Effect::OpenHub,
+        "e" | "t" | "h" => return Leader::Prefix,
         _ => return Leader::Unknown,
     })
 }
@@ -2247,6 +2249,7 @@ mod tests {
             (" ee", Effect::ToggleTree),
             (" ef", Effect::RevealInTree),
             (" tc", Effect::PickTheme),
+            (" hp", Effect::OpenHub),
             ("]d", Effect::NextError),
             ("[d", Effect::PreviousError),
             ("H", Effect::PreviousTab),
