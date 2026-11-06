@@ -2,7 +2,10 @@
 //! one helps, so `check` stays silent whenever it cannot be sure. The compiler's
 //! error remains the safety net.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::OnceLock,
+};
 
 use crate::explain::edit_distance;
 
@@ -73,8 +76,24 @@ const PACKAGES: &[Package] = &[
     package("longtable", &[], &["longtable"], &[], true),
     package("wrapfig", &[], &["wrapfigure", "wraptable"], &[], true),
     package("caption", &["\\captionsetup", "\\captionof"], &[], &[], false),
-    package("biblatex", &["\\printbibliography", "\\addbibresource", "\\autocite", "\\parencite", "\\textcite", "\\footcite"], &[], &["url"], false),
-    package("natbib", &["\\citep", "\\citet"], &[], &[], false),
+    package(
+        "natbib",
+        &["\\citep", "\\citet", "\\citep*", "\\citet*", "\\citealp", "\\citealt", "\\citeauthor", "\\citeyear", "\\citeyearpar"],
+        &[],
+        &[],
+        false,
+    ),
+    // `\citep` and `\citet` only with the `natbib` option, which a name cannot show.
+    package(
+        "biblatex",
+        &[
+            "\\printbibliography", "\\addbibresource", "\\autocite", "\\Autocite", "\\parencite", "\\Parencite", "\\textcite", "\\Textcite",
+            "\\footcite", "\\smartcite", "\\fullcite", "\\citeauthor", "\\citeyear", "\\citep", "\\citet",
+        ],
+        &[],
+        &["url"],
+        false,
+    ),
     package("csquotes", &["\\enquote"], &[], &[], false),
     package("enumitem", &["\\setlist", "\\newlist"], &[], &[], false),
     package("fancyhdr", &["\\fancyhead", "\\fancyfoot", "\\fancyhf"], &[], &[], false),
@@ -154,6 +173,58 @@ fn certainly_loaded(usage: &ProjectUsage) -> Option<HashSet<&'static str>> {
     Some(loaded)
 }
 
+/// The packages a project has for certain, for leaving out suggestions that
+/// would not work. When unsure, everything counts as available.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Loaded(Option<HashSet<&'static str>>);
+
+pub fn loaded(usage: &ProjectUsage) -> Loaded {
+    Loaded(certainly_loaded(usage))
+}
+
+impl Loaded {
+    /// Adds packages that a file loads now, before the next check sees them.
+    /// A name the table does not know may load anything.
+    pub fn with<'a>(&self, names: impl IntoIterator<Item = &'a str>) -> Self {
+        let Some(loaded) = &self.0 else {
+            return Self(None);
+        };
+        let mut loaded = loaded.clone();
+        let mut waiting = Vec::new();
+        for name in names {
+            match known(name.trim()) {
+                Some(package) => waiting.push(package),
+                None => return Self(None),
+            }
+        }
+        while let Some(package) = waiting.pop() {
+            if loaded.insert(package.name) {
+                waiting.extend(package.implies.iter().filter_map(|name| known(name)));
+            }
+        }
+        Self(Some(loaded))
+    }
+
+    /// Whether `command` works. Commands outside the table come from LaTeX itself.
+    pub fn provides(&self, command: &str) -> bool {
+        let Some(loaded) = &self.0 else {
+            return true;
+        };
+        // Asked for every suggestion on every key, so the table is indexed once.
+        static PROVIDERS: OnceLock<HashMap<&'static str, Vec<&'static str>>> = OnceLock::new();
+        let providers = PROVIDERS.get_or_init(|| {
+            let mut providers: HashMap<&'static str, Vec<&'static str>> = HashMap::new();
+            for package in PACKAGES {
+                for command in package.commands {
+                    providers.entry(command).or_default().push(package.name);
+                }
+            }
+            providers
+        });
+        providers.get(command).is_none_or(|packages| packages.iter().any(|package| loaded.contains(package)))
+    }
+}
+
 pub fn check(usage: &ProjectUsage) -> Vec<PackageFinding> {
     let mut findings = Vec::new();
     if let Some(loaded) = certainly_loaded(usage) {
@@ -205,6 +276,33 @@ pub fn check(usage: &ProjectUsage) -> Vec<PackageFinding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suggestions_follow_the_loaded_packages() {
+        let plain = loaded(&usage("article", &["amsmath"], &[], &[]));
+        assert!(plain.provides("\\cite") && plain.provides("\\section") && plain.provides("\\eqref"));
+        assert!(!plain.provides("\\citep") && !plain.provides("\\autocite") && !plain.provides("\\cref"));
+        let natbib = loaded(&usage("article", &["natbib"], &[], &[]));
+        assert!(natbib.provides("\\citep") && natbib.provides("\\citealp") && !natbib.provides("\\autocite"));
+        let biblatex = loaded(&usage("article", &["biblatex"], &[], &[]));
+        assert!(biblatex.provides("\\autocite") && biblatex.provides("\\citep"));
+        assert!(plain.with(["natbib"]).provides("\\citep"));
+        assert!(plain.with(["mathtools"]).provides("\\eqref"));
+        // Unsure means everything: an unknown class, package or style file.
+        assert!(loaded(&usage("revtex4-2", &[], &[], &[])).provides("\\citep"));
+        assert!(plain.with(["somethingelse"]).provides("\\citep"));
+        let own = ProjectUsage { has_own_style_files: true, ..usage("article", &[], &[], &[]) };
+        assert!(loaded(&own).provides("\\citep"));
+        assert!(Loaded::default().provides("\\citep"));
+    }
+
+    #[test]
+    fn biblatex_counts_for_natbib_commands() {
+        let findings = check(&usage("article", &["biblatex"], &["\\citep"], &[]));
+        assert!(!findings.iter().any(|finding| matches!(finding, PackageFinding::Missing { .. })), "{findings:?}");
+        let findings = check(&usage("article", &[], &["\\citep"], &[]));
+        assert!(findings.contains(&PackageFinding::Missing { package: "natbib", item: "\\citep".to_string() }), "{findings:?}");
+    }
 
     fn usage(class: &str, packages: &[&str], commands: &[&str], environments: &[&str]) -> ProjectUsage {
         ProjectUsage {

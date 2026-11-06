@@ -98,6 +98,8 @@ pub enum SymbolKind {
     Command,
     /// A name from `#let` in Typst.
     Binding,
+    /// The names in a `\usepackage`, as written between its braces.
+    Package,
 }
 
 /// A name that the document defines, for suggestions.
@@ -203,6 +205,10 @@ fn collect_headings(rules: HeadingRules, tree: &Tree, rope: &Rope) -> Vec<Headin
 type SymbolFinder = fn(Node) -> Option<(SymbolKind, Range<usize>)>;
 
 fn latex_symbol(node: Node) -> Option<(SymbolKind, Range<usize>)> {
+    if node.kind() == "package_include" {
+        let range = node.child_by_field_name("paths")?.byte_range();
+        return (range.len() >= 2).then(|| (SymbolKind::Package, range.start + 1..range.end - 1));
+    }
     let (kind, field) = match node.kind() {
         "label_definition" => (SymbolKind::Label, "name"),
         "new_command_definition" | "old_command_definition" => (SymbolKind::Command, "declaration"),
@@ -627,11 +633,12 @@ mod tests {
     fn latex_symbols_are_labels_and_own_commands() {
         let symbols = symbols_of(
             Language::Latex,
-            "\\newcommand{\\foo}{x}\n\\newcommand\\bar{y}\n\\def\\baz{z}\n\\section{A}\\label{sec:a}\n",
+            "\\usepackage[round]{natbib, amsmath}\n\\newcommand{\\foo}{x}\n\\newcommand\\bar{y}\n\\def\\baz{z}\n\\section{A}\\label{sec:a}\n",
         );
         assert_eq!(
             symbols,
             [
+                (SymbolKind::Package, "natbib, amsmath".to_string()),
                 (SymbolKind::Command, "\\foo".to_string()),
                 (SymbolKind::Command, "\\bar".to_string()),
                 (SymbolKind::Command, "\\baz".to_string()),
