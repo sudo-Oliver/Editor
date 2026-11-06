@@ -9,6 +9,7 @@ mod file_tree;
 mod git_panel;
 mod image_view;
 mod marketplace;
+mod nvim_themes;
 mod outline;
 mod package_check;
 mod pdf_text;

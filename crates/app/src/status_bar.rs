@@ -26,10 +26,10 @@ pub struct StatusInfo {
 
 fn mode_color(mode: Mode) -> u32 {
     match mode {
-        Mode::Normal => theme::ST_NORMAL,
-        Mode::Insert => theme::ST_INSERT,
-        Mode::Visual | Mode::VisualLine => theme::ST_VISUAL,
-        Mode::Command => theme::ST_GREEN,
+        Mode::Normal => theme::palette().st_normal,
+        Mode::Insert => theme::palette().st_insert,
+        Mode::Visual | Mode::VisualLine => theme::palette().st_visual,
+        Mode::Command => theme::palette().st_green,
     }
 }
 
@@ -87,6 +87,8 @@ pub fn render(info: StatusInfo) -> impl IntoElement {
     let color = mode_color(info.mode);
     let file_label = info.file.map(|name| if info.dirty { format!("{name} [+]") } else { name });
     let (file_icon, file_color) = info.file_icon;
+    // The devicon colors are made for dark bars.
+    let file_color = theme::legible(file_color, theme::palette().st_light);
     let position = format!("{}/{}", info.line, info.column);
     div()
         .flex()
@@ -99,9 +101,9 @@ pub fn render(info: StatusInfo) -> impl IntoElement {
                 .flex()
                 .items_center()
                 .h(px(HEIGHT))
-                .bg(theme::color(theme::ST_BG))
+                .bg(theme::color(theme::palette().st_bg))
                 .child(
-                    segment(color, theme::ST_BLACK)
+                    segment(color, theme::palette().st_black)
                         .pl(px(10.))
                         .font_weight(FontWeight::BOLD)
                         .child(
@@ -109,13 +111,13 @@ pub fn render(info: StatusInfo) -> impl IntoElement {
                                 .path("icons/vim.svg")
                                 .size(px(13.))
                                 .flex_none()
-                                .text_color(theme::color(theme::ST_BLACK)),
+                                .text_color(theme::color(theme::palette().st_black)),
                         )
                         .child(info.mode.label()),
                 )
-                .child(slant(color, theme::ST_GREY))
-                .child(slant(theme::ST_GREY, theme::ST_LIGHT))
-                .child(segment(theme::ST_LIGHT, theme::ST_TEXT).when_some(file_label, |element, label| {
+                .child(slant(color, theme::palette().st_grey))
+                .child(slant(theme::palette().st_grey, theme::palette().st_light))
+                .child(segment(theme::palette().st_light, theme::palette().st_text).when_some(file_label, |element, label| {
                     element
                         .child(
                             svg()
@@ -126,9 +128,9 @@ pub fn render(info: StatusInfo) -> impl IntoElement {
                         )
                         .child(label)
                 }))
-                .child(slant(theme::ST_LIGHT, theme::ST_BG))
+                .child(slant(theme::palette().st_light, theme::palette().st_bg))
                 .when_some(info.branch, |element, branch| {
-                    element.child(segment(theme::ST_BG, theme::ST_MUTED).font_weight(FontWeight::BOLD).child(branch))
+                    element.child(segment(theme::palette().st_bg, theme::palette().st_muted).font_weight(FontWeight::BOLD).child(branch))
                 })
                 .child(
                     div()
@@ -137,29 +139,29 @@ pub fn render(info: StatusInfo) -> impl IntoElement {
                         .flex()
                         .justify_center()
                         .truncate()
-                        .text_color(theme::color(theme::ST_TEXT))
+                        .text_color(theme::color(theme::palette().st_text))
                         .child(info.pending),
                 )
                 .when(info.errors > 0, |element| {
-                    element.child(segment(theme::ST_BG, theme::ST_RED).child(format!("E {}", info.errors)))
+                    element.child(segment(theme::palette().st_bg, theme::palette().st_red).child(format!("E {}", info.errors)))
                 })
                 .when(info.warnings > 0, |element| {
-                    element.child(segment(theme::ST_BG, theme::ST_YELLOW).child(format!("W {}", info.warnings)))
+                    element.child(segment(theme::palette().st_bg, theme::palette().st_yellow).child(format!("W {}", info.warnings)))
                 })
-                .child(round(theme::ST_RED, theme::ST_BG))
+                .child(round(theme::palette().st_red, theme::palette().st_bg))
                 .child(
-                    segment(theme::ST_RED, theme::ST_ONE_BG).pl(px(0.)).pr(px(5.)).child(
+                    segment(theme::palette().st_red, theme::palette().st_one_bg).pl(px(0.)).pr(px(5.)).child(
                         svg()
                             .path("icons/folder.svg")
                             .size(px(13.))
                             .flex_none()
-                            .text_color(theme::color(theme::ST_ONE_BG)),
+                            .text_color(theme::color(theme::palette().st_one_bg)),
                     ),
                 )
-                .child(segment(theme::ST_LIGHT, theme::ST_TEXT).child(info.project))
-                .child(round(theme::ST_GREEN, theme::ST_LIGHT))
+                .child(segment(theme::palette().st_light, theme::palette().st_text).child(info.project))
+                .child(round(theme::palette().st_green, theme::palette().st_light))
                 .child(
-                    segment(theme::ST_GREEN, theme::ST_BLACK)
+                    segment(theme::palette().st_green, theme::palette().st_black)
                         .pl(px(0.))
                         .pr(px(5.))
                         .child(
@@ -167,10 +169,10 @@ pub fn render(info: StatusInfo) -> impl IntoElement {
                                 .path("icons/position.svg")
                                 .size(px(11.))
                                 .flex_none()
-                                .text_color(theme::color(theme::ST_BLACK)),
+                                .text_color(theme::color(theme::palette().st_black)),
                         ),
                 )
-                .child(segment(theme::ST_LIGHT, theme::ST_GREEN).pr(px(10.)).child(position)),
+                .child(segment(theme::palette().st_light, theme::palette().st_green).pr(px(10.)).child(position)),
         )
         .when_some(info.command_line, |element, line| {
             let is_error = line.starts_with('E') && line.contains(':');
@@ -180,8 +182,8 @@ pub fn render(info: StatusInfo) -> impl IntoElement {
                     .items_center()
                     .h(px(HEIGHT))
                     .px(px(8.))
-                    .bg(theme::color(theme::BG))
-                    .text_color(theme::color(if is_error { theme::ST_RED } else { theme::CODE_TEXT }))
+                    .bg(theme::color(theme::palette().bg))
+                    .text_color(theme::color(if is_error { theme::palette().error } else { theme::palette().code_text }))
                     .child(line),
             )
         })
@@ -197,7 +199,7 @@ pub fn file_icon(extension: Option<&str>) -> (&'static str, u32) {
         Some("bib") => ("icons/file-bib.svg", 0xcbcb41),
         Some("toml") => ("icons/file-toml.svg", 0x9c4221),
         Some("txt") => ("icons/file-txt.svg", 0x89e051),
-        _ => ("icons/file-default.svg", theme::ST_TEXT),
+        _ => ("icons/file-default.svg", theme::palette().st_text),
     }
 }
 
