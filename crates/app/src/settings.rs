@@ -16,6 +16,9 @@ pub struct Settings {
     pub package_hints: bool,
     /// The Neovim colorscheme, or none for the built-in theme.
     pub theme: Option<String>,
+    /// The path and the heading of the cursor above the editor.
+    pub show_breadcrumbs: bool,
+    pub show_tabs: bool,
 }
 
 impl Default for Settings {
@@ -27,6 +30,8 @@ impl Default for Settings {
             auto_suggestions: true,
             package_hints: true,
             theme: None,
+            show_breadcrumbs: true,
+            show_tabs: true,
         }
     }
 }
@@ -79,7 +84,7 @@ mod tests {
     fn settings_survive_a_restart() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("nested").join("settings.toml");
-        let settings = Settings { vim_mode: true, smooth_cursor: false, auto_scroll_pdf: true, auto_suggestions: false, package_hints: false, theme: Some("vesper".to_string()) };
+        let settings = Settings { vim_mode: true, smooth_cursor: false, auto_scroll_pdf: true, auto_suggestions: false, package_hints: false, theme: Some("vesper".to_string()), show_breadcrumbs: false, show_tabs: false };
         settings.save(&path).unwrap();
         assert_eq!(Settings::load(&path), settings);
     }
@@ -89,6 +94,6 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.toml");
         std::fs::write(&path, "vim_mode = true").unwrap();
-        assert_eq!(Settings::load(&path), Settings { vim_mode: true, smooth_cursor: true, auto_scroll_pdf: false, auto_suggestions: true, package_hints: true, theme: None });
+        assert_eq!(Settings::load(&path), Settings { vim_mode: true, smooth_cursor: true, auto_scroll_pdf: false, auto_suggestions: true, package_hints: true, theme: None, show_breadcrumbs: true, show_tabs: true });
     }
 }
