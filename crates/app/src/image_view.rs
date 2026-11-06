@@ -125,8 +125,8 @@ impl ImageView {
             .py(px(4.))
             .rounded(px(4.))
             .cursor_pointer()
-            .bg(theme::color(theme::PANEL))
-            .hover(|style| style.bg(theme::color(theme::DIVIDER)))
+            .bg(theme::color(theme::palette().panel))
+            .hover(|style| style.bg(theme::color(theme::palette().divider)))
             .on_click(cx.listener(move |this, _, _, cx| handler(this, cx)))
             .child(label)
     }
@@ -144,7 +144,7 @@ impl Render for ImageView {
             .flex_col()
             .size_full()
             .track_focus(&self.focus)
-            .bg(theme::color(theme::BG))
+            .bg(theme::color(theme::palette().bg))
             .child(
                 div()
                     .flex()
@@ -152,14 +152,14 @@ impl Render for ImageView {
                     .items_center()
                     .gap(px(8.))
                     .p(px(8.))
-                    .text_color(theme::color(theme::UI_TEXT))
+                    .text_color(theme::color(theme::palette().ui_text))
                     .child(div().flex_none().font_weight(FontWeight::SEMIBOLD).child(name))
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_color(theme::color(theme::UI_MUTED))
+                            .text_color(theme::color(theme::palette().ui_muted))
                             .child(self.details.clone().unwrap_or_default()),
                     )
                     .child(self.action("copy-include", "Copy include", cx, |this, cx| {
@@ -186,7 +186,7 @@ impl Render for ImageView {
                         )
                     })
                     .when_some(self.error.clone(), |element, error| {
-                        element.text_color(theme::color(theme::UI_MUTED)).child(error)
+                        element.text_color(theme::color(theme::palette().ui_muted)).child(error)
                     }),
             )
     }

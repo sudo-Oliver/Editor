@@ -51,7 +51,7 @@ impl PageFrame {
         }
     }
 
-    fn rect(&self, rect: &PdfRect) -> Rect {
+    pub(crate) fn rect(&self, rect: &PdfRect) -> Rect {
         let (x1, y1) = self.point(rect.left().value, rect.bottom().value);
         let (x2, y2) = self.point(rect.right().value, rect.top().value);
         Rect { left: x1.min(x2), top: y1.min(y2), right: x1.max(x2), bottom: y1.max(y2) }
@@ -93,6 +93,27 @@ pub struct PageLink {
 pub struct PageContent {
     pub chars: Box<[PageChar]>,
     pub links: Box<[PageLink]>,
+}
+
+/// Where the page shows raster images. A form, as `\includegraphics` makes of
+/// a PDF figure, counts whole when it holds one, since its parts lie in its own
+/// coordinates.
+pub(crate) fn image_rects(page: &PdfPage, frame: &PageFrame) -> Vec<Rect> {
+    fn holds_image(object: &PdfPageObject) -> bool {
+        match object.object_type() {
+            PdfPageObjectType::Image => true,
+            PdfPageObjectType::XObjectForm => {
+                object.as_x_object_form_object().is_some_and(|form| form.iter().any(|child| holds_image(&child)))
+            }
+            _ => false,
+        }
+    }
+    page.objects()
+        .iter()
+        .filter(holds_image)
+        .filter_map(|object| object.bounds().ok())
+        .map(|bounds| frame.rect(&bounds.to_rect()))
+        .collect()
 }
 
 /// `document` is here because link targets can be on any page.
