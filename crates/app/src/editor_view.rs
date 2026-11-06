@@ -1,7 +1,8 @@
 use std::{ops::Range, path::PathBuf, sync::Arc, time::Instant};
 
+use build::Loaded;
 use editor_core::{
-    EditorState, HighlightKind, Language, Mark, MarkSeverity, Motion, Selection, Symbol,
+    EditorState, HighlightKind, Language, Mark, MarkSeverity, Motion, Selection, Symbol, SymbolKind,
     snippet::Snippet,
     vim::{Effect, Input, Key, Mode, Vim},
 };
@@ -118,6 +119,8 @@ pub struct EditorView {
     auto_suggestions: bool,
     /// What the other open documents define.
     project_symbols: Arc<Vec<Symbol>>,
+    /// The packages the project loads, as of the last package check.
+    loaded_packages: Arc<Loaded>,
 }
 
 impl EventEmitter<EditorEvent> for EditorView {}
@@ -154,6 +157,7 @@ impl EditorView {
             completion: None,
             auto_suggestions: false,
             project_symbols: Arc::default(),
+            loaded_packages: Arc::default(),
         };
         view.schedule_parse(cx);
         view
@@ -268,6 +272,10 @@ impl EditorView {
 
     pub fn set_project_symbols(&mut self, symbols: Arc<Vec<Symbol>>) {
         self.project_symbols = symbols;
+    }
+
+    pub fn set_loaded_packages(&mut self, loaded: Arc<Loaded>) {
+        self.loaded_packages = loaded;
     }
 
     pub fn symbols(&self) -> &[Symbol] {
@@ -425,8 +433,11 @@ impl EditorView {
         let Some(trigger) = completion::trigger(language, &before) else {
             return;
         };
-        let symbols = self.state.syntax().symbols().iter().chain(self.project_symbols.iter());
-        let items = completion::suggestions(language, trigger.kind, &before[trigger.start..], symbols);
+        let symbols = || self.state.syntax().symbols().iter().chain(self.project_symbols.iter());
+        // A `\usepackage` typed since the last check counts at once.
+        let packages = symbols().filter(|symbol| symbol.kind == SymbolKind::Package).flat_map(|symbol| symbol.name.split(','));
+        let loaded = self.loaded_packages.with(packages);
+        let items = completion::suggestions(language, trigger.kind, &before[trigger.start..], symbols(), &loaded);
         if !items.is_empty() {
             self.completion = Some(Completion { start: line_start + trigger.start, head, items, selected: 0 });
         }

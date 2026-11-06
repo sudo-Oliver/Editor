@@ -161,26 +161,37 @@ pub fn match_entries(entries: &[PickerItem], query: &str) -> Vec<PickerItem> {
 }
 
 /// Rates a subsequence match. Runs of letters and starts of names count more.
+/// It walks the candidate once and allocates nothing, since the file picker and
+/// the suggestions call it for every entry on every key.
 pub fn fuzzy_score(query: &str, candidate: &str) -> Option<i64> {
     let mut score = 0i64;
     let mut previous: Option<usize> = None;
-    let chars: Vec<char> = candidate.chars().collect();
-    let mut position = 0;
+    let mut chars = candidate.chars();
+    // The index of the next char of `chars`, and the char before it.
+    let (mut index, mut before) = (0usize, None);
     for wanted in query.chars().filter(|ch| !ch.is_whitespace()) {
         let wanted = wanted.to_lowercase().next().unwrap_or(wanted);
-        let found = (position..chars.len()).find(|index| chars[*index].to_lowercase().next() == Some(wanted))?;
-        score += 1;
-        if previous.is_some_and(|previous| previous + 1 == found) {
-            score += 8;
+        loop {
+            let ch = chars.next()?;
+            let (found, prior) = (index, before);
+            index += 1;
+            before = Some(ch);
+            if ch.to_lowercase().next() != Some(wanted) {
+                continue;
+            }
+            score += 1;
+            if previous.is_some_and(|previous| previous + 1 == found) {
+                score += 8;
+            }
+            if prior.is_none_or(|prior| matches!(prior, '/' | '\\' | '_' | '-' | ' ' | '.')) {
+                score += 6;
+            }
+            previous = Some(found);
+            break;
         }
-        if found == 0 || matches!(chars[found - 1], '/' | '\\' | '_' | '-' | ' ' | '.') {
-            score += 6;
-        }
-        previous = Some(found);
-        position = found + 1;
     }
     // Among equal matches, shorter paths win.
-    Some(score * 16 - chars.len() as i64)
+    Some(score * 16 - (index + chars.count()) as i64)
 }
 
 /// Finds literal text in the given files. Stops early when `cancel` is set.
@@ -232,6 +243,39 @@ mod tests {
         assert_eq!(merged[0].path, PathBuf::from("a.bib"));
         assert_eq!(merged[0].detail.as_deref(), Some("Ada 2024"));
         assert_eq!(merged[1].label, "b");
+    }
+
+    /// The first version, which collected the chars, as the reference.
+    fn reference_score(query: &str, candidate: &str) -> Option<i64> {
+        let mut score = 0i64;
+        let mut previous: Option<usize> = None;
+        let chars: Vec<char> = candidate.chars().collect();
+        let mut position = 0;
+        for wanted in query.chars().filter(|ch| !ch.is_whitespace()) {
+            let wanted = wanted.to_lowercase().next().unwrap_or(wanted);
+            let found = (position..chars.len()).find(|index| chars[*index].to_lowercase().next() == Some(wanted))?;
+            score += 1;
+            if previous.is_some_and(|previous| previous + 1 == found) {
+                score += 8;
+            }
+            if found == 0 || matches!(chars[found - 1], '/' | '\\' | '_' | '-' | ' ' | '.') {
+                score += 6;
+            }
+            previous = Some(found);
+            position = found + 1;
+        }
+        Some(score * 16 - chars.len() as i64)
+    }
+
+    #[test]
+    fn fuzzy_scores_match_the_reference() {
+        let candidates = ["", "a", "\\citep", "\\citep*", "src/lang_notes.typ", "Müller et al. 2024a", "ÄÖÜ äöü", "a_b-c.d/e f", "aaaa", "\\section*{x}"];
+        let queries = ["", "a", "ab", "\\c", "\\cit", "cite", "MÜ", "ü", "aa", "aaaaa", "l n", "sec", "x}", "zz"];
+        for candidate in candidates {
+            for query in queries {
+                assert_eq!(fuzzy_score(query, candidate), reference_score(query, candidate), "{query:?} in {candidate:?}");
+            }
+        }
     }
 
     #[test]

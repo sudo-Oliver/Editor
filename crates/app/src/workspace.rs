@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use build::{BuildEvent, BuildManager, BuildOutcome, BuildRequest, Config, Diagnostic, Engine, Fix, Severity, Trigger, find_main};
+use build::{BuildEvent, BuildManager, BuildOutcome, BuildRequest, Config, Diagnostic, Engine, Fix, Loaded, Severity, Trigger, find_main};
 use addon_api::{ActiveFile, DiagnosticInfo, Reply, Request, SearchHit};
 use editor_core::{
     Symbol, SymbolKind,
@@ -324,6 +324,8 @@ pub struct Workspace {
     /// got the names of the others.
     symbols_version: (usize, usize),
     package_hints: Vec<PackageHint>,
+    /// What the project loads, for the suggestions of every document.
+    loaded_packages: Arc<Loaded>,
     package_check_task: Option<Task<()>>,
     show_file_panel: bool,
     left_panel: LeftPanel,
@@ -474,6 +476,7 @@ impl Workspace {
             outline_version: (usize::MAX, 0),
             symbols_version: (usize::MAX, 0),
             package_hints: Vec::new(),
+            loaded_packages: Arc::default(),
             package_check_task: None,
             show_file_panel: true,
             left_panel: LeftPanel::Files,
@@ -689,10 +692,12 @@ impl Workspace {
     /// Opens a tab without switching to it.
     fn add_document(&mut self, path: PathBuf, text: &str, cx: &mut Context<Self>) {
         let settings = self.settings.clone();
+        let loaded = self.loaded_packages.clone();
         let view = cx.new(|cx| {
             let mut view = EditorView::new(text, Some(path), cx);
             view.set_vim_mode(settings.vim_mode, settings.smooth_cursor, cx);
             view.set_auto_suggestions(settings.auto_suggestions, cx);
+            view.set_loaded_packages(loaded);
             view
         });
         let subscription = cx.subscribe(&view, |this, view, event, cx| match event {
@@ -1474,11 +1479,13 @@ impl Workspace {
         let (Some(root), Some(main)) = (self.root.clone(), self.last_main.clone()) else {
             return;
         };
-        if !self.settings.package_hints || Language::from_path(&main) != Language::Latex {
+        if Language::from_path(&main) != Language::Latex {
             self.package_check_task = None;
-            self.show_package_hints(Vec::new(), cx);
+            self.show_package_hints(Vec::new(), Loaded::default(), cx);
             return;
         }
+        // The suggestions need what the project loads even without the hints.
+        let show_hints = self.settings.package_hints;
         let open: Vec<(PathBuf, String, u64)> = self
             .documents
             .iter()
@@ -1489,7 +1496,7 @@ impl Workspace {
             .collect();
         self.package_check_task = Some(cx.spawn(async move |this, cx| {
             let versions: Vec<(PathBuf, u64)> = open.iter().map(|(path, _, version)| (path.clone(), *version)).collect();
-            let hints = cx
+            let (hints, loaded) = cx
                 .background_spawn(async move {
                     let mut sources: Vec<(PathBuf, String)> = Vec::new();
                     let mut has_own_style_files = false;
@@ -1518,16 +1525,18 @@ impl Workspace {
                     })
                 });
                 if unchanged {
-                    this.show_package_hints(hints, cx);
+                    this.show_package_hints(if show_hints { hints } else { Vec::new() }, loaded, cx);
                 }
             })
             .ok();
         }));
     }
 
-    fn show_package_hints(&mut self, hints: Vec<PackageHint>, cx: &mut Context<Self>) {
+    fn show_package_hints(&mut self, hints: Vec<PackageHint>, loaded: Loaded, cx: &mut Context<Self>) {
+        let loaded = Arc::new(loaded);
         for document in &self.documents {
             document.view.update(cx, |view, cx| {
+                view.set_loaded_packages(loaded.clone());
                 let marks = hints
                     .iter()
                     .filter(|hint| view.path.as_deref() == Some(hint.path.as_path()))
@@ -1537,6 +1546,7 @@ impl Workspace {
             });
         }
         self.package_hints = hints;
+        self.loaded_packages = loaded;
         cx.notify();
     }
 
@@ -1563,7 +1573,8 @@ impl Workspace {
         // The hint is done, and the next build checks again.
         let mut hints = std::mem::take(&mut self.package_hints);
         hints.retain(|hint| hint.fix != *fix);
-        self.show_package_hints(hints, cx);
+        let loaded = (*self.loaded_packages).clone();
+        self.show_package_hints(hints, loaded, cx);
         let done = match fix {
             Fix::AddPackage(package) => format!("Added {package}"),
             Fix::RemovePackage(package) => format!("Removed {package}"),
