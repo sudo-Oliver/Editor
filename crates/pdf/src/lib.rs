@@ -1,12 +1,15 @@
 //! Renders PDF pages with PDFium. All PDFium handles stay on one worker thread.
 
 mod content;
+mod recolor;
 
 use content::PageFrame;
 pub use content::{LinkTarget, PageChar, PageContent, PageLink, Rect};
+pub use recolor::Recolor;
+use recolor::PixelRect;
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     path::Path,
     sync::mpsc::{self, RecvError, TryRecvError},
 };
@@ -18,7 +21,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 pub struct PageRequest {
     pub page: usize,
     pub width_px: u32,
-    pub invert: bool,
+    /// Draws the page in dark colors, see `recolor`.
+    pub recolor: Option<Recolor>,
 }
 
 #[derive(Debug)]
@@ -88,6 +92,8 @@ impl PdfWorker {
 fn run(pdfium: Pdfium, commands: mpsc::Receiver<Command>, events: UnboundedSender<PdfEvent>) {
     let mut document: Option<(u64, PdfDocument)> = None;
     let mut frames: Vec<PageFrame> = Vec::new();
+    // Found on the first dark render of a page, since it walks all objects.
+    let mut images: HashMap<usize, Vec<Rect>> = HashMap::new();
     let mut queue: VecDeque<PageRequest> = VecDeque::new();
     let mut pending: Option<Command> = None;
     loop {
@@ -98,7 +104,7 @@ fn run(pdfium: Pdfium, commands: mpsc::Receiver<Command>, events: UnboundedSende
                 Ok(command) => Ok(command),
                 Err(TryRecvError::Empty) => {
                     if let (Some((generation, document)), Some(request)) = (&document, queue.pop_front()) {
-                        render_page(document, *generation, request, &events);
+                        render_page(document, *generation, request, &frames, &mut images, &events);
                     }
                     continue;
                 }
@@ -112,6 +118,7 @@ fn run(pdfium: Pdfium, commands: mpsc::Receiver<Command>, events: UnboundedSende
             Command::Load { generation, bytes } => {
                 queue.clear();
                 document = None;
+                images.clear();
                 match pdfium.load_pdf_from_byte_vec(bytes, None) {
                     Ok(loaded) => {
                         let pages: Vec<(f32, f32)> = loaded
@@ -169,6 +176,8 @@ fn render_page(
     document: &PdfDocument,
     generation: u64,
     request: PageRequest,
+    frames: &[PageFrame],
+    images: &mut HashMap<usize, Vec<Rect>>,
     events: &UnboundedSender<PdfEvent>,
 ) {
     let config = PdfRenderConfig::new()
@@ -183,12 +192,23 @@ fn render_page(
     match rendered {
         Ok(bitmap) => {
             let mut bgra = bitmap.as_raw_bytes();
-            if request.invert {
-                for pixel in bgra.as_chunks_mut::<4>().0 {
-                    pixel[0] = 255 - pixel[0];
-                    pixel[1] = 255 - pixel[1];
-                    pixel[2] = 255 - pixel[2];
-                }
+            if let (Some(colors), Ok(page)) = (request.recolor, &page) {
+                let rects = images.entry(request.page).or_insert_with(|| {
+                    frames.get(request.page).map_or_else(Vec::new, |frame| content::image_rects(page, frame))
+                });
+                let (width, height) = (bitmap.width() as u32, bitmap.height() as u32);
+                let scale = width as f32 / page.width().value;
+                let to_pixel = |value: f32, limit: u32| (value * scale).clamp(0., limit as f32);
+                let keep: Vec<PixelRect> = rects
+                    .iter()
+                    .map(|rect| PixelRect {
+                        left: to_pixel(rect.left, width).floor() as u32,
+                        top: to_pixel(rect.top, height).floor() as u32,
+                        right: to_pixel(rect.right, width).ceil() as u32,
+                        bottom: to_pixel(rect.bottom, height).ceil() as u32,
+                    })
+                    .collect();
+                recolor::recolor(&mut bgra, width, colors, &keep);
             }
             events
                 .send(PdfEvent::Rendered {
