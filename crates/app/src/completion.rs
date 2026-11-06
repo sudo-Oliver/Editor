@@ -209,7 +209,31 @@ const LATEX_COMMANDS: &[&str] = &[
     "\\ref{${}}",
     "\\eqref{${}}",
     "\\pageref{${}}",
+    "\\autoref{${}}",
+    "\\cref{${}}",
+    "\\Cref{${}}",
+    "\\vref{${}}",
+    "\\nameref{${}}",
+    // natbib and biblatex: each opens the citation picker inside its braces.
     "\\cite{${}}",
+    "\\citep{${}}",
+    "\\citet{${}}",
+    "\\citep*{${}}",
+    "\\citet*{${}}",
+    "\\citealp{${}}",
+    "\\citealt{${}}",
+    "\\citeauthor{${}}",
+    "\\citeyear{${}}",
+    "\\citeyearpar{${}}",
+    "\\autocite{${}}",
+    "\\Autocite{${}}",
+    "\\parencite{${}}",
+    "\\Parencite{${}}",
+    "\\textcite{${}}",
+    "\\Textcite{${}}",
+    "\\footcite{${}}",
+    "\\smartcite{${}}",
+    "\\fullcite{${}}",
     "\\footnote{${}}",
     "\\caption{${}}",
     "\\centering",
@@ -333,6 +357,7 @@ const TYPST_CODE: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use editor_core::snippet::Snippet;
 
     fn at(language: Language, before: &str) -> Option<(TriggerKind, &str)> {
         trigger(language, before).map(|trigger| (trigger.kind, &before[trigger.start..]))
@@ -381,6 +406,36 @@ mod tests {
         assert_eq!(at(Language::Typst, "#"), Some((TriggerKind::Code, "")));
         assert_eq!(at(Language::Typst, "see @fig-a"), Some((TriggerKind::Label, "fig-a")));
         assert_eq!(at(Language::Typst, "see @"), None);
+    }
+
+    /// The text before the cursor once a suggestion is accepted.
+    fn before_cursor(template: &str) -> String {
+        let snippet = Snippet::parse(template, "");
+        snippet.text[..snippet.slots[0].start].to_string()
+    }
+
+    #[test]
+    fn every_citation_command_opens_the_picker() {
+        let cites: Vec<&str> = LATEX_COMMANDS.iter().copied().filter(|template| command_name(template).to_ascii_lowercase().contains("cite")).collect();
+        assert_eq!(cites.len(), 19);
+        for template in cites {
+            assert!(snippets::opens_citation(&before_cursor(template)), "{template}");
+        }
+        for (typed, wanted) in [("\\citep", "\\citep"), ("\\textc", "\\textcite"), ("\\parenc", "\\parencite"), ("\\citet", "\\citet*")] {
+            let items = suggestions(Language::Latex, TriggerKind::Command, typed, std::iter::empty());
+            assert!(labels(&items).contains(&wanted), "{typed}: {:?}", labels(&items));
+        }
+        // The plain command stays first among its variants.
+        let items = suggestions(Language::Latex, TriggerKind::Command, "\\cite", std::iter::empty());
+        assert_eq!(items[0].label, "\\cite");
+    }
+
+    #[test]
+    fn every_reference_command_suggests_labels() {
+        for name in ["\\ref", "\\eqref", "\\pageref", "\\autoref", "\\cref", "\\Cref", "\\vref", "\\nameref"] {
+            let template = LATEX_COMMANDS.iter().find(|template| command_name(template) == name).expect(name);
+            assert_eq!(at(Language::Latex, &before_cursor(template)), Some((TriggerKind::Label, "")), "{name}");
+        }
     }
 
     #[test]
