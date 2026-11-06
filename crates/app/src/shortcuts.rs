@@ -67,6 +67,7 @@ pub fn sections(vim_mode: bool) -> Vec<Section> {
                     ("Space g", "Find text"),
                     ("Space ee", "Toggle file tree"),
                     ("Space ef", "Show file in tree"),
+                    ("Space tc", "Select theme"),
                     ("Space p", "Toggle PDF preview"),
                     ("Space d", "Show error"),
                     ("Space r", "Cite from a DOI"),

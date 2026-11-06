@@ -465,8 +465,8 @@ impl EditorView {
                 .px(px(8.))
                 .py(px(2.))
                 .cursor_pointer()
-                .when(index == completion.selected, |row| row.bg(theme::color(theme::GREEN_DARK)))
-                .hover(|style| style.bg(theme::color(theme::GREEN_DARK)))
+                .when(index == completion.selected, |row| row.bg(theme::color(theme::palette().accent_soft)))
+                .hover(|style| style.bg(theme::color(theme::palette().accent_soft)))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if let Some(completion) = &mut this.completion {
                         completion.selected = index;
@@ -474,7 +474,7 @@ impl EditorView {
                     this.accept_completion(cx);
                 }))
                 .child(entry.label.clone())
-                .child(div().text_color(theme::color(theme::UI_MUTED)).child(entry.detail.clone()))
+                .child(div().text_color(theme::color(theme::palette().ui_muted)).child(entry.detail.clone()))
         });
         Some(
             div()
@@ -485,10 +485,10 @@ impl EditorView {
                 .rounded(px(4.))
                 .font(Self::font(FontStyle::Normal, FontWeight::NORMAL))
                 .text_size(px(theme::CODE_FONT_SIZE))
-                .text_color(theme::color(theme::CODE_TEXT))
-                .bg(theme::color(theme::PANEL))
+                .text_color(theme::color(theme::palette().code_text))
+                .bg(theme::color(theme::palette().panel))
                 .border_1()
-                .border_color(theme::color(theme::DIVIDER))
+                .border_color(theme::color(theme::palette().divider))
                 .shadow_lg()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .children(rows)
@@ -613,7 +613,7 @@ impl EditorView {
         let run = TextRun {
             len: display.len(),
             font: Self::plain_font(),
-            color: theme::color(theme::CODE_TEXT),
+            color: theme::color(theme::palette().code_text),
             background_color: None,
             underline: None,
             strikethrough: None,
@@ -881,7 +881,7 @@ impl Render for EditorView {
             .key_context(if self.completion.is_some() { "Editor Completion" } else { "Editor" })
             .track_focus(&self.focus_handle)
             .size_full()
-            .bg(theme::color(theme::BG))
+            .bg(theme::color(theme::palette().bg))
             .cursor(CursorStyle::IBeam);
         motion_actions!(self, root, cx;
             MoveLeft => Left, false;
@@ -1257,7 +1257,7 @@ impl Element for EditorElement {
                             point(bounds.left(), row.y),
                             size(bounds.size.width, line_height),
                         ),
-                        theme::color(theme::ACTIVE_LINE),
+                        theme::color(theme::palette().active_line),
                     ));
                 }
             }
@@ -1274,7 +1274,7 @@ impl Element for EditorElement {
                     for point in &points[1..] {
                         path.line_to(*point);
                     }
-                    window.paint_path(path, theme::color(theme::CARET).opacity(0.45));
+                    window.paint_path(path, theme::color(theme::palette().caret).opacity(0.45));
                     // Frames are only requested while a trail is on screen.
                     window.request_animation_frame();
                 }
@@ -1317,7 +1317,7 @@ impl Element for EditorElement {
                     *width,
                     &UnderlineStyle {
                         thickness: px(1.),
-                        color: Some(theme::color(theme::CODE_TEXT)),
+                        color: Some(theme::color(theme::palette().code_text)),
                         wavy: false,
                     },
                 );
@@ -1388,7 +1388,8 @@ impl EditorView {
         let mut hits_in_line: Vec<Range<usize>> = Vec::new();
 
         let code_font = Self::plain_font();
-        let number_color = theme::color(theme::LINE_NUMBER);
+        let number_color = theme::color(theme::palette().line_number);
+        let active_number_color = theme::color(theme::palette().line_number_active);
         let error_lines: std::collections::HashSet<usize> = self
             .state
             .marks()
@@ -1426,7 +1427,13 @@ impl EditorView {
                 let run = TextRun {
                     len: label.len(),
                     font: code_font.clone(),
-                    color: if error_lines.contains(&line) { theme::color(theme::ERROR) } else { number_color },
+                    color: if error_lines.contains(&line) {
+                        theme::color(theme::palette().error)
+                    } else if cursor_line == Some(line) {
+                        active_number_color
+                    } else {
+                        number_color
+                    },
                     background_color: None,
                     underline: None,
                     strikethrough: None,
@@ -1450,7 +1457,7 @@ impl EditorView {
                             point(text_left + shaped.x_for_index(from - row_start), y),
                             point(text_left + shaped.x_for_index(to - row_start), y + line_height),
                         ),
-                        theme::color(theme::SEARCH_MATCH),
+                        theme::color(theme::palette().search_match),
                     ));
                 }
             }
@@ -1481,7 +1488,7 @@ impl EditorView {
                             point(text_left + shaped.x_for_index(from), y),
                             point(text_left + right, y + line_height),
                         ),
-                        theme::color(theme::SELECTION),
+                        theme::color(theme::palette().selection),
                     ));
                 }
                 let head = selection.head;
@@ -1493,7 +1500,7 @@ impl EditorView {
                             point(text_left + shaped.x_for_index(head - row_start), y),
                             size(px(1.5), line_height),
                         ),
-                        theme::color(theme::CARET),
+                        theme::color(theme::palette().caret),
                     ));
                 }
             }
@@ -1506,9 +1513,9 @@ impl EditorView {
                     let left = shaped.x_for_index(from - row_start);
                     let right = shaped.x_for_index(to - row_start);
                     let color = match mark.severity {
-                        MarkSeverity::Error => theme::ERROR,
-                        MarkSeverity::Warning => theme::WARNING,
-                        MarkSeverity::Hint => theme::UI_MUTED,
+                        MarkSeverity::Error => theme::palette().error,
+                        MarkSeverity::Warning => theme::palette().warning,
+                        MarkSeverity::Hint => theme::palette().ui_muted,
                     };
                     squiggles.push((point(text_left + left, baseline), right - left, color));
                 }
@@ -1560,7 +1567,7 @@ impl EditorView {
             if shows_block {
                 block = Some(fill(
                     Bounds::new(to_screen(target), size(width, line_height)),
-                    theme::color(theme::CARET),
+                    theme::color(theme::palette().caret),
                 ));
             }
         }

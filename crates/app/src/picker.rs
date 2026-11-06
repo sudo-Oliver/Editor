@@ -1,4 +1,4 @@
-//! The search overlay for `Space f` and `Space g`. Text search reads the files
+//! The search overlay for `Space f`, `Space g` and `Space tc`. Text search reads the files
 //! on disk, so unsaved edits do not count.
 
 use std::{
@@ -11,6 +11,8 @@ use std::{
 
 use editor_core::vim::find_literal;
 use gpui::Task;
+
+use crate::{nvim_themes::Themes, theme};
 
 const MAX_RESULTS: usize = 200;
 const MAX_SEARCHED_FILE_BYTES: u64 = 4 << 20;
@@ -27,6 +29,8 @@ pub enum PickerKind {
     Citations,
     /// Branches to switch to, or a new one by the name typed.
     Branches,
+    /// Neovim colorschemes, shown while moving through them.
+    Themes,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,6 +55,9 @@ pub struct Picker {
     /// Set to stop the running text search when the query changes.
     pub cancel: Arc<AtomicBool>,
     pub task: Option<Task<()>>,
+    pub themes: Arc<Themes>,
+    /// The palette to restore when the theme picker closes without a choice.
+    pub original: Option<theme::Palette>,
 }
 
 pub fn relative_label(path: &Path, root: &Path) -> String {
@@ -139,6 +146,26 @@ pub fn match_branches(branches: &[PickerItem], query: &str) -> Vec<PickerItem> {
         });
     }
     items
+}
+
+/// The built-in themes first, then the Neovim ones by name.
+pub fn theme_items(themes: &Themes) -> Vec<PickerItem> {
+    let item = |label: &str, detail: Option<&str>| PickerItem {
+        path: PathBuf::new(),
+        label: label.to_string(),
+        position: None,
+        detail: detail.map(str::to_string),
+    };
+    theme::BUILT_IN
+        .iter()
+        .map(|(name, _)| item(name, Some("Built-in")))
+        .chain(themes.keys().map(|name| item(name, None)))
+        .collect()
+}
+
+/// Themes keep their order until the query asks for something.
+pub fn match_themes(themes: &[PickerItem], query: &str) -> Vec<PickerItem> {
+    if query.trim().is_empty() { themes.to_vec() } else { match_entries(themes, query) }
 }
 
 /// Entries that match `query` in the label or detail, best first.
@@ -296,6 +323,16 @@ mod tests {
         let citations = [item("knuth", "Art"), item("greenwade", "Network")];
         assert_eq!(match_entries(&citations, "network")[0].label, "greenwade");
         assert_eq!(match_entries(&citations, "kn")[0].label, "knuth");
+    }
+
+    #[test]
+    fn themes_list_the_built_in_one_first() {
+        let palette = theme::Palette::OVERLEAF_DARK;
+        let themes = Themes::from([("vesper".to_string(), palette), ("koda".to_string(), palette)]);
+        let items = theme_items(&themes);
+        let labels: Vec<String> = match_themes(&items, "").into_iter().map(|item| item.label).collect();
+        assert_eq!(labels, ["overleaf-dark", "overleaf-light", "koda", "vesper"]);
+        assert_eq!(match_themes(&items, "ves")[0].label, "vesper");
     }
 
     #[test]

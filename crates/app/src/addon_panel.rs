@@ -364,8 +364,8 @@ impl AddonPanel {
             .py(px(2.))
             .rounded(px(6.))
             .cursor_pointer()
-            .when(open.is_some(), |style| style.bg(theme::color(theme::PANEL)))
-            .hover(|style| style.bg(theme::color(theme::PANEL)))
+            .when(open.is_some(), |style| style.bg(theme::color(theme::palette().panel)))
+            .hover(|style| style.bg(theme::color(theme::palette().panel)))
             .on_click(cx.listener(move |this, _, window, cx| {
                 let focus = cx.focus_handle();
                 let previous = window.focused(cx);
@@ -379,7 +379,7 @@ impl AddonPanel {
                     .path("icons/chevron-down.svg")
                     .size(px(12.))
                     .flex_none()
-                    .text_color(theme::color(theme::UI_MUTED)),
+                    .text_color(theme::color(theme::palette().ui_muted)),
             )
             .children(open.map(|open| self.render_dropdown_list(open, options, selected, cx)))
             .into_any_element()
@@ -410,8 +410,8 @@ impl AddonPanel {
                 .gap(px(2.))
                 .rounded(px(8.))
                 .border_1()
-                .border_color(theme::color(theme::DIVIDER))
-                .bg(theme::color(theme::PANEL))
+                .border_color(theme::color(theme::palette().divider))
+                .bg(theme::color(theme::palette().panel))
                 .shadow_lg()
                 .occlude()
                 .on_action(cx.listener(|this, _: &CloseMenu, window, cx| this.close_dropdown(window, cx)))
@@ -427,8 +427,8 @@ impl AddonPanel {
                         .py(px(4.))
                         .rounded(px(4.))
                         .cursor_pointer()
-                        .when(index == open.highlighted, |style| style.bg(theme::color(theme::DIVIDER)))
-                        .hover(|style| style.bg(theme::color(theme::DIVIDER)))
+                        .when(index == open.highlighted, |style| style.bg(theme::color(theme::palette().divider)))
+                        .hover(|style| style.bg(theme::color(theme::palette().divider)))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
                             this.choose_dropdown_option(index, window, cx);
@@ -440,10 +440,10 @@ impl AddonPanel {
                                 .min_w_0()
                                 .child(option.label.clone())
                                 .when(!option.description.is_empty(), |element| {
-                                    element.child(div().text_color(theme::color(theme::UI_MUTED)).child(option.description.clone()))
+                                    element.child(div().text_color(theme::color(theme::palette().ui_muted)).child(option.description.clone()))
                                 }),
                         )
-                        .when(index == selected, |element| element.child(div().flex_none().text_color(theme::color(theme::CARET)).child("✓")))
+                        .when(index == selected, |element| element.child(div().flex_none().text_color(theme::color(theme::palette().accent)).child("✓")))
                 })),
         );
         div().child(deferred(backdrop).with_priority(1)).child(deferred(list).with_priority(2)).into_any_element()
@@ -503,14 +503,14 @@ impl AddonPanel {
             }
             Node::Text { text, muted, .. } => div()
                 .flex_none()
-                .when(*muted, |style| style.text_color(theme::color(theme::UI_MUTED)))
+                .when(*muted, |style| style.text_color(theme::color(theme::palette().ui_muted)))
                 .child(text.clone())
                 .into_any_element(),
             Node::Code { text, .. } => div()
                 .flex_none()
                 .p(px(6.))
                 .rounded(px(4.))
-                .bg(theme::color(theme::PANEL))
+                .bg(theme::color(theme::palette().panel))
                 .font_family(theme::CODE_FONT)
                 .text_size(px(theme::CODE_FONT_SIZE))
                 .child(text.clone())
@@ -527,9 +527,10 @@ impl AddonPanel {
                     .h(px(26.))
                     .rounded(px(4.))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .bg(theme::color(if *primary && enabled { theme::GREEN } else { theme::DIVIDER }))
+                    .bg(theme::color(if *primary && enabled { theme::palette().accent } else { theme::palette().divider }))
+                    .when(*primary && enabled, |style| style.text_color(theme::color(theme::palette().on_accent)))
                     .when(enabled, |style| style.cursor_pointer())
-                    .when(!enabled, |style| style.text_color(theme::color(theme::UI_MUTED)))
+                    .when(!enabled, |style| style.text_color(theme::color(theme::palette().ui_muted)))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if enabled {
                             this.click(&button, submits.as_deref(), cx);
@@ -547,7 +548,7 @@ impl AddonPanel {
                     .h(px(INPUT_HEIGHT))
                     .rounded(px(4.))
                     .border_1()
-                    .border_color(theme::color(theme::DIVIDER))
+                    .border_color(theme::color(theme::palette().divider))
                     .overflow_hidden()
                     .children(input.cloned())
                     .when(empty, |element| {
@@ -559,7 +560,7 @@ impl AddonPanel {
                                 .font_family(theme::CODE_FONT)
                                 .text_size(px(theme::CODE_FONT_SIZE))
                                 .line_height(px(theme::CODE_LINE_HEIGHT))
-                                .text_color(theme::color(theme::UI_MUTED))
+                                .text_color(theme::color(theme::palette().ui_muted))
                                 .child(placeholder.clone()),
                         )
                     })
@@ -572,7 +573,7 @@ impl AddonPanel {
                 .p(px(2.))
                 .gap(px(2.))
                 .rounded(px(6.))
-                .bg(theme::color(theme::PANEL))
+                .bg(theme::color(theme::palette().panel))
                 .children(options.iter().enumerate().map(|(index, option)| {
                     let select = id.clone();
                     let chosen = index == *selected;
@@ -582,8 +583,8 @@ impl AddonPanel {
                         .py(px(2.))
                         .rounded(px(4.))
                         .cursor_pointer()
-                        .when(chosen, |style| style.bg(theme::color(theme::GREEN_DARK)).font_weight(FontWeight::SEMIBOLD))
-                        .when(!chosen, |style| style.hover(|style| style.bg(theme::color(theme::DIVIDER))))
+                        .when(chosen, |style| style.bg(theme::color(theme::palette().accent_soft)).font_weight(FontWeight::SEMIBOLD))
+                        .when(!chosen, |style| style.hover(|style| style.bg(theme::color(theme::palette().divider))))
                         .on_click(cx.listener(move |this, _, _, _| {
                             this.send(HostMessage::Select { id: select.clone(), selected: index });
                         }))
@@ -603,7 +604,7 @@ impl AddonPanel {
                     .py(px(1.))
                     .rounded(px(4.))
                     .cursor_pointer()
-                    .hover(|style| style.bg(theme::color(theme::PANEL)))
+                    .hover(|style| style.bg(theme::color(theme::palette().panel)))
                     .on_click(cx.listener(move |this, _, _, _| this.send(HostMessage::Click { id: check.clone() })))
                     .child(
                         div()
@@ -611,16 +612,16 @@ impl AddonPanel {
                             .size(px(CHECK_SIZE))
                             .rounded(px(3.))
                             .border_1()
-                            .border_color(theme::color(if *checked { theme::GREEN } else { theme::UI_MUTED }))
-                            .when(*checked, |style| style.bg(theme::color(theme::GREEN))),
+                            .border_color(theme::color(if *checked { theme::palette().accent } else { theme::palette().ui_muted }))
+                            .when(*checked, |style| style.bg(theme::color(theme::palette().accent))),
                     )
                     .child(label.clone())
                     .into_any_element()
             }
             Node::Alert { text } => {
-                div().flex_none().p(px(8.)).rounded(px(4.)).bg(theme::color(theme::ERROR_PANEL)).font_weight(FontWeight::SEMIBOLD).child(text.clone()).into_any_element()
+                div().flex_none().p(px(8.)).rounded(px(4.)).bg(theme::color(theme::palette().error_panel)).font_weight(FontWeight::SEMIBOLD).child(text.clone()).into_any_element()
             }
-            Node::Divider => div().flex_none().h(px(1.)).bg(theme::color(theme::PANEL)).into_any_element(),
+            Node::Divider => div().flex_none().h(px(1.)).bg(theme::color(theme::palette().panel)).into_any_element(),
         }
     }
 }
@@ -740,7 +741,7 @@ impl Render for AddonPanel {
         let failure = self.stopped.clone().map(|reason| format!("{} stopped. {reason}", self.add_on.manifest.name));
         let invalid = self.invalid.clone().map(|error| format!("The add-on sent a broken message: {error}"));
         let restart = failure.is_some();
-        let banner = |text: String| div().flex_none().p(px(8.)).rounded(px(4.)).bg(theme::color(theme::ERROR_PANEL)).text_size(px(12.)).child(text);
+        let banner = |text: String| div().flex_none().p(px(8.)).rounded(px(4.)).bg(theme::color(theme::palette().error_panel)).text_size(px(12.)).child(text);
         div()
             .flex()
             .flex_col()
@@ -761,7 +762,7 @@ impl Render for AddonPanel {
                         .h(px(26.))
                         .rounded(px(4.))
                         .cursor_pointer()
-                        .bg(theme::color(theme::DIVIDER))
+                        .bg(theme::color(theme::palette().divider))
                         .on_click(cx.listener(|this, _, _, cx| this.start(cx)))
                         .child("Restart"),
                 )
