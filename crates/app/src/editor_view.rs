@@ -17,7 +17,7 @@ use gpui::{
 
 use crate::{
     actions::*,
-    completion::{self, Entry},
+    completion::{self, Entry, Extra},
     smear::{self, Smear},
     theme,
 };
@@ -121,6 +121,8 @@ pub struct EditorView {
     project_symbols: Arc<Vec<Symbol>>,
     /// The packages the project loads, as of the last package check.
     loaded_packages: Arc<Loaded>,
+    /// What those packages define and what the project already uses.
+    package_extra: Arc<Extra>,
 }
 
 impl EventEmitter<EditorEvent> for EditorView {}
@@ -158,6 +160,7 @@ impl EditorView {
             auto_suggestions: false,
             project_symbols: Arc::default(),
             loaded_packages: Arc::default(),
+            package_extra: Arc::default(),
         };
         view.schedule_parse(cx);
         view
@@ -274,8 +277,9 @@ impl EditorView {
         self.project_symbols = symbols;
     }
 
-    pub fn set_loaded_packages(&mut self, loaded: Arc<Loaded>) {
+    pub fn set_loaded_packages(&mut self, loaded: Arc<Loaded>, extra: Arc<Extra>) {
         self.loaded_packages = loaded;
+        self.package_extra = extra;
     }
 
     pub fn symbols(&self) -> &[Symbol] {
@@ -437,7 +441,7 @@ impl EditorView {
         // A `\usepackage` typed since the last check counts at once.
         let packages = symbols().filter(|symbol| symbol.kind == SymbolKind::Package).flat_map(|symbol| symbol.name.split(','));
         let loaded = self.loaded_packages.with(packages);
-        let items = completion::suggestions(language, trigger.kind, &before[trigger.start..], symbols(), &loaded);
+        let items = completion::suggestions(language, trigger.kind, &before[trigger.start..], symbols(), &loaded, &self.package_extra);
         if !items.is_empty() {
             self.completion = Some(Completion { start: line_start + trigger.start, head, items, selected: 0 });
         }

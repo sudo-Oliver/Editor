@@ -33,6 +33,7 @@ use crate::{
     addon_panel::{AddonPanel, AddonPanelEvent, doi_suggestion},
     addons::{self, Installed},
     bib,
+    completion::Extra,
     marketplace::{self, CatalogEntry},
     editor_view::{EditorEvent, EditorView, FormatKind},
     export::{self, DraftFormat, PdfState},
@@ -41,7 +42,7 @@ use crate::{
     outline::{self, OutlineItem},
     image_view::{ImageView, ImageViewEvent, include_snippet, is_image, relative_path},
     pdf_view::{PdfView, PdfViewEvent, ZOOM_STEP},
-    nvim_themes,
+    nvim_themes, package_commands,
     picker::{self, Picker, PickerKind},
     package_check::{self, PackageHint},
     problems::{self, Problem},
@@ -326,6 +327,7 @@ pub struct Workspace {
     package_hints: Vec<PackageHint>,
     /// What the project loads, for the suggestions of every document.
     loaded_packages: Arc<Loaded>,
+    package_extra: Arc<Extra>,
     package_check_task: Option<Task<()>>,
     show_file_panel: bool,
     left_panel: LeftPanel,
@@ -477,6 +479,7 @@ impl Workspace {
             symbols_version: (usize::MAX, 0),
             package_hints: Vec::new(),
             loaded_packages: Arc::default(),
+            package_extra: Arc::default(),
             package_check_task: None,
             show_file_panel: true,
             left_panel: LeftPanel::Files,
@@ -692,12 +695,12 @@ impl Workspace {
     /// Opens a tab without switching to it.
     fn add_document(&mut self, path: PathBuf, text: &str, cx: &mut Context<Self>) {
         let settings = self.settings.clone();
-        let loaded = self.loaded_packages.clone();
+        let (loaded, extra) = (self.loaded_packages.clone(), self.package_extra.clone());
         let view = cx.new(|cx| {
             let mut view = EditorView::new(text, Some(path), cx);
             view.set_vim_mode(settings.vim_mode, settings.smooth_cursor, cx);
             view.set_auto_suggestions(settings.auto_suggestions, cx);
-            view.set_loaded_packages(loaded);
+            view.set_loaded_packages(loaded, extra);
             view
         });
         let subscription = cx.subscribe(&view, |this, view, event, cx| match event {
@@ -1481,7 +1484,7 @@ impl Workspace {
         };
         if Language::from_path(&main) != Language::Latex {
             self.package_check_task = None;
-            self.show_package_hints(Vec::new(), Loaded::default(), cx);
+            self.show_package_hints(Vec::new(), Loaded::default(), Extra::default(), cx);
             return;
         }
         // The suggestions need what the project loads even without the hints.
@@ -1496,13 +1499,17 @@ impl Workspace {
             .collect();
         self.package_check_task = Some(cx.spawn(async move |this, cx| {
             let versions: Vec<(PathBuf, u64)> = open.iter().map(|(path, _, version)| (path.clone(), *version)).collect();
-            let (hints, loaded) = cx
+            let (report, extra) = cx
                 .background_spawn(async move {
                     let mut sources: Vec<(PathBuf, String)> = Vec::new();
                     let mut has_own_style_files = false;
+                    let mut own_styles = Vec::new();
                     for entry in file_tree::scan(&root, &HashSet::new()) {
                         let extension = entry.path.extension().and_then(|extension| extension.to_str());
                         has_own_style_files |= !entry.is_dir && matches!(extension, Some("sty" | "cls"));
+                        if !entry.is_dir && extension == Some("sty") {
+                            own_styles.push(entry.path.clone());
+                        }
                         if entry.is_dir || !matches!(extension, Some("tex" | "latex")) {
                             continue;
                         }
@@ -1514,7 +1521,10 @@ impl Workspace {
                             sources.push((entry.path, text));
                         }
                     }
-                    package_check::hints(&main, &sources, has_own_style_files)
+                    let report = package_check::hints(&main, &sources, has_own_style_files);
+                    let (commands, environments) = package_commands::collect(&report.packages, &own_styles);
+                    let used = report.used.clone();
+                    (report, Extra { commands, environments, used })
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -1525,18 +1535,19 @@ impl Workspace {
                     })
                 });
                 if unchanged {
-                    this.show_package_hints(if show_hints { hints } else { Vec::new() }, loaded, cx);
+                    let hints = if show_hints { report.hints } else { Vec::new() };
+                    this.show_package_hints(hints, report.loaded, extra, cx);
                 }
             })
             .ok();
         }));
     }
 
-    fn show_package_hints(&mut self, hints: Vec<PackageHint>, loaded: Loaded, cx: &mut Context<Self>) {
-        let loaded = Arc::new(loaded);
+    fn show_package_hints(&mut self, hints: Vec<PackageHint>, loaded: Loaded, extra: Extra, cx: &mut Context<Self>) {
+        let (loaded, extra) = (Arc::new(loaded), Arc::new(extra));
         for document in &self.documents {
             document.view.update(cx, |view, cx| {
-                view.set_loaded_packages(loaded.clone());
+                view.set_loaded_packages(loaded.clone(), extra.clone());
                 let marks = hints
                     .iter()
                     .filter(|hint| view.path.as_deref() == Some(hint.path.as_path()))
@@ -1547,6 +1558,7 @@ impl Workspace {
         }
         self.package_hints = hints;
         self.loaded_packages = loaded;
+        self.package_extra = extra;
         cx.notify();
     }
 
@@ -1573,8 +1585,8 @@ impl Workspace {
         // The hint is done, and the next build checks again.
         let mut hints = std::mem::take(&mut self.package_hints);
         hints.retain(|hint| hint.fix != *fix);
-        let loaded = (*self.loaded_packages).clone();
-        self.show_package_hints(hints, loaded, cx);
+        let (loaded, extra) = ((*self.loaded_packages).clone(), (*self.package_extra).clone());
+        self.show_package_hints(hints, loaded, extra, cx);
         let done = match fix {
             Fix::AddPackage(package) => format!("Added {package}"),
             Fix::RemovePackage(package) => format!("Removed {package}"),

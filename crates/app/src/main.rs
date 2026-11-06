@@ -13,6 +13,7 @@ mod marketplace;
 mod nvim_themes;
 mod outline;
 mod package_check;
+mod package_commands;
 mod pdf_text;
 mod pdf_view;
 mod picker;
