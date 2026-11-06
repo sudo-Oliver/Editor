@@ -209,6 +209,12 @@ pub fn opens_citation(before: &str) -> bool {
     head.ends_with('\\') && name.to_ascii_lowercase().contains("cite")
 }
 
+/// Whether `before` ends in the `@` of a Typst reference or citation, not in
+/// a mail address or a comment.
+pub fn opens_reference(before: &str) -> bool {
+    before.strip_suffix('@').is_some_and(|rest| !rest.ends_with(char::is_alphanumeric) && !rest.contains("//"))
+}
+
 /// Whether a figure in `language` can show this file.
 pub fn is_figure_file(language: Language, path: &Path) -> bool {
     let extension = path.extension().and_then(|extension| extension.to_str()).unwrap_or_default().to_ascii_lowercase();
@@ -298,6 +304,15 @@ mod tests {
             .output()
             .unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
+    }
+
+    #[test]
+    fn a_bare_at_opens_typst_references() {
+        assert!(opens_reference("see @"));
+        assert!(opens_reference("@"));
+        assert!(!opens_reference("mail me@"));
+        assert!(!opens_reference("// see @"));
+        assert!(!opens_reference("see @fig"));
     }
 
     #[test]

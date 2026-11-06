@@ -14,7 +14,7 @@ use std::{
 use build::{BuildEvent, BuildManager, BuildOutcome, BuildRequest, Config, Diagnostic, Engine, Fix, Severity, Trigger, find_main};
 use addon_api::{ActiveFile, DiagnosticInfo, Reply, Request, SearchHit};
 use editor_core::{
-    Symbol,
+    Symbol, SymbolKind,
     Language, Mark, MarkSeverity,
     snippet::Snippet,
     vim::{self, Effect, Key, Leader, Mode},
@@ -32,6 +32,7 @@ use crate::{
     actions::*,
     addon_panel::{AddonPanel, AddonPanelEvent, doi_suggestion},
     addons::{self, Installed},
+    bib,
     marketplace::{self, CatalogEntry},
     editor_view::{EditorEvent, EditorView, FormatKind},
     export::{self, DraftFormat, PdfState},
@@ -2630,6 +2631,15 @@ impl Workspace {
         let scan_root = root.clone();
         let language = self.active_language(cx);
         let offered = if kind == PickerKind::Citations { self.offered_citations(cx) } else { Vec::new() };
+        // The letters of the last LaTeX build, and the labels that `@` cites in Typst.
+        let bbl = (kind == PickerKind::Citations && language == Some(Language::Latex))
+            .then(|| {
+                let active = self.active_view().and_then(|view| view.read(cx).path.clone());
+                find_main(&root, &self.config, active.as_deref())
+            })
+            .flatten()
+            .and_then(|main| bib::bbl_path(&main));
+        let labels = if kind == PickerKind::Citations && language == Some(Language::Typst) { self.document_labels(cx) } else { Vec::new() };
         let repository = self.git_panel.read(cx).repository();
         if kind == PickerKind::Branches && repository.is_none() {
             return;
@@ -2665,7 +2675,10 @@ impl Workspace {
                         })
                         .collect::<Vec<_>>();
                     let entries = if kind == PickerKind::Citations {
-                        picker::merge_citations(picker::read_citations(&files), offered)
+                        let bbl = bbl.and_then(|path| std::fs::read_to_string(path).ok());
+                        let mut entries = picker::merge_citations(bib::citation_items(&files, bbl.as_deref()), offered);
+                        entries.extend(picker::label_items(labels));
+                        entries
                     } else {
                         Vec::new()
                     };
@@ -2769,7 +2782,7 @@ impl Workspace {
                 picker.selected = 0;
             }
             PickerKind::Citations => {
-                picker.items = picker::match_entries(&picker.entries, &picker.query);
+                picker.items = picker::match_in_order(&picker.entries, &picker.query);
                 picker.selected = 0;
             }
             PickerKind::Branches => {
@@ -2777,7 +2790,7 @@ impl Workspace {
                 picker.selected = 0;
             }
             PickerKind::Themes => {
-                picker.items = picker::match_themes(&picker.entries, &picker.query);
+                picker.items = picker::match_in_order(&picker.entries, &picker.query);
                 // Without a query the list starts at the theme in use.
                 let current = self.settings.theme.as_deref().unwrap_or(theme::DEFAULT_THEME);
                 picker.selected = if picker.query.trim().is_empty() {
@@ -2881,6 +2894,13 @@ impl Workspace {
             }
             return format!("Cited {key} at the cursor.");
         }
+        // The `@` that opened the picker is already there.
+        if self.active_language(cx) == Some(Language::Typst)
+            && self.active_view().and_then(|view| Self::around_cursor(view.read(cx))).is_some_and(|(_, before, _)| snippets::opens_reference(&before))
+        {
+            self.insert_snippet(&snippets::citation_key(key, false), false, cx);
+            return format!("Cited {key} at the cursor.");
+        }
         match self.active_language(cx) {
             Some(language @ (Language::Latex | Language::Typst)) => {
                 self.insert_snippet(&snippets::citation(language, key), false, cx);
@@ -2978,6 +2998,20 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// The labels of all open documents, once each.
+    fn document_labels(&self, cx: &App) -> Vec<String> {
+        let mut labels: Vec<String> = self
+            .documents
+            .iter()
+            .flat_map(|document| document.view.read(cx).symbols().to_vec())
+            .filter(|symbol| symbol.kind == SymbolKind::Label)
+            .map(|symbol| symbol.name)
+            .collect();
+        labels.sort();
+        labels.dedup();
+        labels
+    }
+
     fn offered_citations(&self, cx: &App) -> Vec<(String, String)> {
         self.addon_panels
             .iter()
@@ -3010,10 +3044,12 @@ impl Workspace {
         snippets::opens_citation(&before).then(|| !after.starts_with('}'))
     }
 
-    /// Opens the picker when `\cite{` was typed and there is something to pick.
-    /// Taking the key back with Backspace does not open it again at that place.
+    /// Opens the picker when `\cite{`, or `@` in Typst, was typed and there is
+    /// something to pick. Taking the key back with Backspace does not open it
+    /// again at that place.
     fn check_citation_trigger(&mut self, view: &Entity<EditorView>, cx: &mut Context<Self>) {
-        if self.picker.is_some() || self.active_view().as_ref() != Some(view) || self.active_language(cx) != Some(Language::Latex) {
+        let language = self.active_language(cx);
+        if self.picker.is_some() || self.active_view().as_ref() != Some(view) || !matches!(language, Some(Language::Latex | Language::Typst)) {
             return;
         }
         let Some((head, before, _)) = Self::around_cursor(view.read(cx)) else {
@@ -3023,14 +3059,15 @@ impl Workspace {
         if self.citation_trigger.is_some_and(|(view, offset)| view != id || head < offset) {
             self.citation_trigger = None;
         }
-        if !snippets::opens_citation(&before) || self.citation_trigger == Some((id, head)) {
+        let opens = if language == Some(Language::Typst) { snippets::opens_reference(&before) } else { snippets::opens_citation(&before) };
+        if !opens || self.citation_trigger == Some((id, head)) {
             return;
         }
         self.citation_trigger = Some((id, head));
         let Some(root) = self.root.clone() else {
             return;
         };
-        let offered = !self.offered_citations(cx).is_empty();
+        let offered = !self.offered_citations(cx).is_empty() || (language == Some(Language::Typst) && !self.document_labels(cx).is_empty());
         let view = view.clone();
         self.citation_check_task = Some(cx.spawn(async move |this, cx| {
             let available = offered
@@ -3041,7 +3078,7 @@ impl Workspace {
                             .filter(|entry| !entry.is_dir && entry.path.extension().is_some_and(|extension| extension == "bib"))
                             .map(|entry| entry.path)
                             .collect();
-                        !picker::read_citations(&files).is_empty()
+                        !bib::citation_items(&files, None).is_empty()
                     })
                     .await;
             this.update(cx, |this, cx| {
@@ -5351,17 +5388,47 @@ impl Workspace {
                                     Some((line, _)) => format!("{}:{}", item.label, line + 1),
                                     None => item.label.clone(),
                                 };
-                                div()
+                                let row = div()
                                     .id(("picker-item", index))
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(12.))
-                                    .h(px(26.))
                                     .px(px(12.))
                                     .cursor_pointer()
                                     .when(index == picker.selected, |style| style.bg(theme::color(theme::palette().accent_soft)))
                                     .when(index != picker.selected, |style| style.hover(|style| style.bg(theme::color(theme::palette().divider))))
-                                    .on_click(cx.listener(move |this, _, window, cx| this.accept_picker(index, window, cx)))
+                                    .on_click(cx.listener(move |this, _, window, cx| this.accept_picker(index, window, cx)));
+                                let muted = theme::color(theme::palette().ui_muted);
+                                // A citation: who and when above the key, then title and venue.
+                                if let Some(summary) = item.summary.clone() {
+                                    return row
+                                        .flex()
+                                        .flex_col()
+                                        .justify_center()
+                                        .h(px(44.))
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(12.))
+                                                .child(div().flex_1().min_w_0().truncate().font_weight(FontWeight::SEMIBOLD).child(summary))
+                                                .child(
+                                                    div()
+                                                        .flex_none()
+                                                        .max_w(px(220.))
+                                                        .truncate()
+                                                        .font_family(theme::CODE_FONT)
+                                                        .text_size(px(theme::CODE_FONT_SIZE))
+                                                        .text_color(muted)
+                                                        .child(location),
+                                                ),
+                                        )
+                                        .when_some(item.detail.clone(), |element, detail| {
+                                            element.child(div().truncate().text_color(muted).child(detail))
+                                        })
+                                        .into_any_element();
+                                }
+                                row.flex()
+                                    .items_center()
+                                    .gap(px(12.))
+                                    .h(px(26.))
                                     .child(div().flex_none().max_w(px(320.)).truncate().child(location))
                                     .when_some(item.detail.clone(), |element, detail| {
                                         element.child(
@@ -5371,10 +5438,11 @@ impl Workspace {
                                                 .truncate()
                                                 .font_family(theme::CODE_FONT)
                                                 .text_size(px(theme::CODE_FONT_SIZE))
-                                                .text_color(theme::color(theme::palette().ui_muted))
+                                                .text_color(muted)
                                                 .child(detail),
                                         )
                                     })
+                                    .into_any_element()
                             })),
                     ),
             )

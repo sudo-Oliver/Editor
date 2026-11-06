@@ -90,9 +90,10 @@ fn typst_trigger(before: &str) -> Option<Trigger> {
         return (!rest.ends_with('\\')).then_some(Trigger { kind: TriggerKind::Code, start });
     }
     let rest = name.strip_suffix('@')?;
-    // `a@b` is a mail address, not a reference.
+    // `a@b` is a mail address, not a reference. A bare `@` opens the citation
+    // picker instead, see `snippets::opens_reference`.
     let joined = rest.chars().next_back().is_some_and(char::is_alphanumeric);
-    (!joined).then_some(Trigger { kind: TriggerKind::Label, start })
+    (!joined && start < before.len()).then_some(Trigger { kind: TriggerKind::Label, start })
 }
 
 /// The best suggestions for `prefix`, the text that accepting one replaces.
@@ -379,6 +380,7 @@ mod tests {
         assert_eq!(at(Language::Typst, "#fig"), Some((TriggerKind::Code, "fig")));
         assert_eq!(at(Language::Typst, "#"), Some((TriggerKind::Code, "")));
         assert_eq!(at(Language::Typst, "see @fig-a"), Some((TriggerKind::Label, "fig-a")));
+        assert_eq!(at(Language::Typst, "see @"), None);
     }
 
     #[test]
