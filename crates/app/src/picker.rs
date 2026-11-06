@@ -12,7 +12,7 @@ use std::{
 use editor_core::vim::find_literal;
 use gpui::Task;
 
-use crate::{nvim_themes::Themes, theme};
+use crate::{bib, nvim_themes::Themes, theme};
 
 const MAX_RESULTS: usize = 200;
 const MAX_SEARCHED_FILE_BYTES: u64 = 4 << 20;
@@ -40,6 +40,8 @@ pub struct PickerItem {
     pub label: String,
     /// Zero-based line and byte column of a text hit.
     pub position: Option<(usize, usize)>,
+    /// A line above the detail, such as the authors and year of a citation.
+    pub summary: Option<String>,
     pub detail: Option<String>,
 }
 
@@ -71,28 +73,11 @@ pub fn match_files(files: &[PathBuf], root: &Path, query: &str) -> Vec<PickerIte
         .filter_map(|path| {
             let label = relative_label(path, root);
             let score = fuzzy_score(query, &label)?;
-            Some((score, PickerItem { path: path.clone(), label, position: None, detail: None }))
+            Some((score, PickerItem { path: path.clone(), label, position: None, summary: None, detail: None }))
         })
         .collect();
     scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.label.cmp(&right.1.label)));
     scored.into_iter().take(MAX_RESULTS).map(|(_, item)| item).collect()
-}
-
-/// The entries of the `.bib` files. `label` is the key, `detail` the title.
-pub fn read_citations(files: &[PathBuf]) -> Vec<PickerItem> {
-    let mut items = Vec::new();
-    for path in files {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        items.extend(parse_bib(&text).into_iter().map(|(label, title)| PickerItem {
-            path: path.clone(),
-            label,
-            position: None,
-            detail: title,
-        }));
-    }
-    items
 }
 
 /// Adds what add-ons offer to the `.bib` entries. A key in both keeps its place
@@ -101,36 +86,15 @@ pub fn merge_citations(mut items: Vec<PickerItem>, offered: Vec<(String, String)
     for (key, detail) in offered {
         match items.iter_mut().find(|item| item.label == key) {
             Some(item) => item.detail = Some(detail),
-            None => items.push(PickerItem { path: PathBuf::new(), label: key, position: None, detail: Some(detail) }),
+            None => items.push(PickerItem { path: PathBuf::new(), label: key, position: None, summary: None, detail: Some(detail) }),
         }
     }
     items
 }
 
-/// Reads keys and titles line by line, which fits how `.bib` files are written.
-fn parse_bib(text: &str) -> Vec<(String, Option<String>)> {
-    let mut entries: Vec<(String, Option<String>)> = Vec::new();
-    for line in text.lines().map(str::trim) {
-        if let Some((kind, rest)) = line.strip_prefix('@').and_then(|rest| rest.split_once(['{', '('])) {
-            let kind = kind.trim().to_ascii_lowercase();
-            let key = rest.split(',').next().unwrap_or_default().trim();
-            if !key.is_empty() && !matches!(kind.as_str(), "comment" | "string" | "preamble") {
-                entries.push((key.to_string(), None));
-            }
-        } else if let Some((name, value)) = line.split_once('=')
-            && name.trim().eq_ignore_ascii_case("title")
-            && let Some((_, title)) = entries.last_mut()
-        {
-            let value = value.trim().trim_end_matches(',').replace(['{', '}', '"'], "");
-            *title = Some(value.trim().to_string());
-        }
-    }
-    entries
-}
-
 /// The branches as picker items.
 pub fn branch_items(branches: Vec<String>) -> Vec<PickerItem> {
-    branches.into_iter().map(|label| PickerItem { path: PathBuf::new(), label, position: None, detail: None }).collect()
+    branches.into_iter().map(|label| PickerItem { path: PathBuf::new(), label, position: None, summary: None, detail: None }).collect()
 }
 
 /// Branches that match `query`, then the offer to create one by that name.
@@ -142,6 +106,7 @@ pub fn match_branches(branches: &[PickerItem], query: &str) -> Vec<PickerItem> {
             path: PathBuf::new(),
             label: query.to_string(),
             position: None,
+            summary: None,
             detail: Some(CREATE_BRANCH.to_string()),
         });
     }
@@ -154,6 +119,7 @@ pub fn theme_items(themes: &Themes) -> Vec<PickerItem> {
         path: PathBuf::new(),
         label: label.to_string(),
         position: None,
+        summary: None,
         detail: detail.map(str::to_string),
     };
     theme::BUILT_IN
@@ -163,9 +129,17 @@ pub fn theme_items(themes: &Themes) -> Vec<PickerItem> {
         .collect()
 }
 
-/// Themes keep their order until the query asks for something.
-pub fn match_themes(themes: &[PickerItem], query: &str) -> Vec<PickerItem> {
-    if query.trim().is_empty() { themes.to_vec() } else { match_entries(themes, query) }
+/// The labels of the documents, which `@` in Typst cites like `.bib` entries.
+pub fn label_items(labels: Vec<String>) -> Vec<PickerItem> {
+    labels
+        .into_iter()
+        .map(|label| PickerItem { path: PathBuf::new(), label, position: None, summary: None, detail: Some("Label".to_string()) })
+        .collect()
+}
+
+/// Entries keep their order until the query asks for something.
+pub fn match_in_order(entries: &[PickerItem], query: &str) -> Vec<PickerItem> {
+    if query.trim().is_empty() { entries.to_vec() } else { match_entries(entries, query) }
 }
 
 /// Entries that match `query` in the label or detail, best first.
@@ -173,7 +147,12 @@ pub fn match_entries(entries: &[PickerItem], query: &str) -> Vec<PickerItem> {
     let mut scored: Vec<(i64, &PickerItem)> = entries
         .iter()
         .filter_map(|item| {
-            let text = format!("{} {}", item.label, item.detail.as_deref().unwrap_or_default());
+            let text = bib::fold(&format!(
+                "{} {} {}",
+                item.label,
+                item.summary.as_deref().unwrap_or_default(),
+                item.detail.as_deref().unwrap_or_default()
+            ));
             Some((fuzzy_score(query, &text)?, item))
         })
         .collect();
@@ -230,6 +209,7 @@ pub fn search_text(files: &[PathBuf], root: &Path, query: &str, cancel: &AtomicB
                 path: path.clone(),
                 label: label.clone(),
                 position: Some((line, hit.start)),
+                summary: None,
                 detail: Some(content.trim().to_string()),
             });
             if items.len() >= MAX_RESULTS {
@@ -246,7 +226,7 @@ mod tests {
 
     #[test]
     fn offered_citations_join_the_bib_entries_without_doubles() {
-        let bib = PickerItem { path: PathBuf::from("a.bib"), label: "a".to_string(), position: None, detail: Some("Title".to_string()) };
+        let bib = PickerItem { path: PathBuf::from("a.bib"), label: "a".to_string(), position: None, summary: None, detail: Some("Title".to_string()) };
         let merged = merge_citations(vec![bib], vec![("a".to_string(), "Ada 2024".to_string()), ("b".to_string(), "Bob".to_string())]);
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].path, PathBuf::from("a.bib"));
@@ -304,20 +284,12 @@ mod tests {
     }
 
     #[test]
-    fn bib_entries_give_key_and_title() {
-        let text = "@comment{skip,}\n@string{a = \"b\"}\n@article{one,\n  booktitle = {No},\n  TITLE = \"The {C}omprehensive\",\n}\n@book{two, year = 1}\n";
-        assert_eq!(
-            parse_bib(text),
-            vec![("one".to_string(), Some("The Comprehensive".to_string())), ("two".to_string(), None)]
-        );
-    }
-
-    #[test]
     fn citations_match_key_and_title() {
         let item = |label: &str, title: &str| PickerItem {
             path: PathBuf::new(),
             label: label.to_string(),
             position: None,
+            summary: None,
             detail: Some(title.to_string()),
         };
         let citations = [item("knuth", "Art"), item("greenwade", "Network")];
@@ -330,9 +302,9 @@ mod tests {
         let palette = theme::Palette::OVERLEAF_DARK;
         let themes = Themes::from([("vesper".to_string(), palette), ("koda".to_string(), palette)]);
         let items = theme_items(&themes);
-        let labels: Vec<String> = match_themes(&items, "").into_iter().map(|item| item.label).collect();
+        let labels: Vec<String> = match_in_order(&items, "").into_iter().map(|item| item.label).collect();
         assert_eq!(labels, ["overleaf-dark", "overleaf-light", "koda", "vesper"]);
-        assert_eq!(match_themes(&items, "ves")[0].label, "vesper");
+        assert_eq!(match_in_order(&items, "ves")[0].label, "vesper");
     }
 
     #[test]
