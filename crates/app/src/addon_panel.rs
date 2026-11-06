@@ -574,6 +574,8 @@ impl AddonPanel {
                 .gap(px(2.))
                 .rounded(px(6.))
                 .bg(theme::color(theme::palette().panel))
+                .border_1()
+                .border_color(theme::color(theme::palette().divider))
                 .children(options.iter().enumerate().map(|(index, option)| {
                     let select = id.clone();
                     let chosen = index == *selected;
@@ -583,7 +585,12 @@ impl AddonPanel {
                         .py(px(2.))
                         .rounded(px(4.))
                         .cursor_pointer()
-                        .when(chosen, |style| style.bg(theme::color(theme::palette().accent_soft)).font_weight(FontWeight::SEMIBOLD))
+                        .when(chosen, |style| {
+                            style
+                                .bg(theme::color(theme::palette().accent))
+                                .text_color(theme::color(theme::palette().on_accent))
+                                .font_weight(FontWeight::SEMIBOLD)
+                        })
                         .when(!chosen, |style| style.hover(|style| style.bg(theme::color(theme::palette().divider))))
                         .on_click(cx.listener(move |this, _, _, _| {
                             this.send(HostMessage::Select { id: select.clone(), selected: index });

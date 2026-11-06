@@ -69,6 +69,12 @@ pub struct Palette {
 const TEXT_CONTRAST: f32 = 4.5;
 /// Enough for marks, muted labels and large text.
 const MARK_CONTRAST: f32 = 3.0;
+/// Lines and the fill of secondary buttons and switches against their ground.
+const LINE_CONTRAST: f32 = 1.35;
+/// A selected row or tab against its neighbors.
+const SURFACE_CONTRAST: f32 = 1.3;
+/// A filled accent, such as a switch that is on, against the panel it sits on.
+const FILL_CONTRAST: f32 = 2.0;
 
 impl Palette {
     /// The familiar dark look, with the statusline in the tokyodark colors of base46.
@@ -77,7 +83,7 @@ impl Palette {
         panel: 0x313a4b,
         divider: 0x4b5364,
         tab_active: 0x313a4b,
-        tab_inactive: 0x262d3a,
+        tab_inactive: 0x1f2530,
         ui_text: 0xf4f5f6,
         ui_muted: 0xa8abae,
         folder: 0xf4f5f6,
@@ -124,15 +130,15 @@ impl Palette {
     pub const OVERLEAF_LIGHT: Self = Self {
         bg: 0xffffff,
         panel: 0xf2f4f7,
-        divider: 0xd5d9e0,
+        divider: 0xc8cdd6,
         tab_active: 0xffffff,
-        tab_inactive: 0xe4e7ec,
+        tab_inactive: 0xdbdfe6,
         ui_text: 0x1b222c,
         ui_muted: 0x5d6879,
         folder: 0x1b222c,
         accent: 0x098842,
         on_accent: 0xffffff,
-        accent_soft: 0xd3eedd,
+        accent_soft: 0xb5e0c4,
         focus: 0x2f6bc4,
         error: 0xb42318,
         on_error: 0xffffff,
@@ -178,8 +184,11 @@ impl Palette {
         let back = bg(&["Normal"]).unwrap_or(base.bg);
         let text = fg(&["Normal"]).unwrap_or(base.code_text);
         let tint = |amount: f32| mix(back, text, amount);
-        // A scheme often gives floats and tabs the same background as the editor.
-        let apart = |color: Option<u32>, amount: f32| color.filter(|color| *color != back).unwrap_or_else(|| tint(amount));
+        // A scheme often gives floats and tabs the same background as the editor,
+        // and some a dark selection in a light theme, which no text reads on
+        // together with the rest.
+        let fits = |color: &u32| *color != back && is_light(*color) == is_light(back);
+        let apart = |color: Option<u32>, amount: f32| color.filter(fits).unwrap_or_else(|| tint(amount));
         let keyword = fg(&["@keyword", "Keyword", "Statement"]).unwrap_or(base.keyword);
         let function = fg(&["@function", "Function"]).unwrap_or(base.function);
         let string = fg(&["@string", "String"]).unwrap_or(base.string);
@@ -203,7 +212,7 @@ impl Palette {
             folder: fg(&["Directory"]).unwrap_or(text),
             accent,
             on_accent: text,
-            accent_soft: bg(&["PmenuSel", "Visual"]).unwrap_or_else(|| mix(back, accent, 0.3)),
+            accent_soft: bg(&["PmenuSel"]).filter(fits).or(bg(&["Visual"]).filter(fits)).unwrap_or_else(|| mix(back, accent, 0.3)),
             focus: accent,
             error,
             on_error: text,
@@ -250,6 +259,15 @@ impl Palette {
     fn make_readable(&mut self) {
         self.ui_text = readable(self.ui_text, self.bg, TEXT_CONTRAST);
         self.code_text = readable(self.code_text, self.bg, TEXT_CONTRAST);
+        self.panel = settle(self.panel, self.ui_text, self.bg, TEXT_CONTRAST);
+        // Controls have to stand out from what they sit on, or a switch and the
+        // halves of a choice blur into one field. Then the text follows them.
+        let (bg, panel, text) = (self.bg, self.panel, self.ui_text);
+        self.divider = distinct(self.divider, [bg, panel], text, LINE_CONTRAST);
+        self.accent_soft = distinct(self.accent_soft, [bg, panel], text, SURFACE_CONTRAST);
+        self.tab_active = distinct(self.tab_active, [self.tab_inactive, self.tab_inactive], text, SURFACE_CONTRAST);
+        self.ui_text = readable_on(self.ui_text, &[self.bg, self.panel, self.divider, self.tab_active, self.accent_soft]);
+        // Where no text color reads on all of them, readable text wins.
         for surface in [&mut self.panel, &mut self.divider, &mut self.tab_active, &mut self.accent_soft, &mut self.error_panel] {
             *surface = settle(*surface, self.ui_text, self.bg, TEXT_CONTRAST);
         }
@@ -262,6 +280,7 @@ impl Palette {
         for mark in [&mut self.accent, &mut self.focus, &mut self.caret, &mut self.error, &mut self.warning, &mut self.line_number] {
             *mark = readable(*mark, self.bg, MARK_CONTRAST);
         }
+        self.accent = readable(self.accent, self.panel, FILL_CONTRAST);
         // Buttons and badges: the best theme color for the label, then the
         // fill moves until even that one reads.
         let (ui_text, bg) = (self.ui_text, self.bg);
@@ -324,10 +343,30 @@ fn contrast(left: u32, right: u32) -> f32 {
     (left.max(right) + 0.05) / (left.min(right) + 0.05)
 }
 
-/// `color`, moved toward white or black until it stands out from `back`.
+/// `color`, moved toward white or black until it stands out from `back`. It
+/// keeps its side: dark text gets darker, light text lighter.
 fn readable(color: u32, back: u32, wanted: f32) -> u32 {
-    let extreme = if luminance(back) > 0.4 { 0x000000 } else { 0xffffff };
-    (0..=10).map(|step| mix(color, extreme, step as f32 / 10.)).find(|color| contrast(*color, back) >= wanted).unwrap_or(extreme)
+    let toward = |extreme: u32| (0..=10).map(|step| mix(color, extreme, step as f32 / 10.)).find(|color| contrast(*color, back) >= wanted);
+    let (first, second) = if luminance(color) < luminance(back) { (0x000000, 0xffffff) } else { (0xffffff, 0x000000) };
+    toward(first).or_else(|| toward(second)).unwrap_or(if is_light(back) { 0x000000 } else { 0xffffff })
+}
+
+/// `color`, moved toward white or black until it reads on all `backs`, of which
+/// the first is the ground of the app and must work.
+fn readable_on(color: u32, backs: &[u32]) -> u32 {
+    let reads = |color: &u32| backs.iter().all(|back| contrast(*color, *back) >= TEXT_CONTRAST);
+    let toward = |extreme: u32| (0..=10).map(|step| mix(color, extreme, step as f32 / 10.)).find(reads);
+    let (first, second) = if luminance(color) < luminance(backs[0]) { (0x000000, 0xffffff) } else { (0xffffff, 0x000000) };
+    toward(first).or_else(|| toward(second)).unwrap_or_else(|| readable(color, backs[0], TEXT_CONTRAST))
+}
+
+/// `surface`, moved toward `text` until it stands apart from both `grounds`.
+/// It stops at 60 percent, so that the text keeps room to stay readable.
+fn distinct(surface: u32, grounds: [u32; 2], text: u32, wanted: f32) -> u32 {
+    (0..=6)
+        .map(|step| mix(surface, text, step as f32 / 10.))
+        .find(|surface| grounds.iter().all(|ground| contrast(*surface, *ground) >= wanted))
+        .unwrap_or_else(|| mix(surface, text, 0.6))
 }
 
 /// `color` as a mark that stands out from `back`, for colors outside the palette.
@@ -433,6 +472,32 @@ pub(crate) mod tests {
         for (index, (fg, bg)) in text.into_iter().enumerate() {
             assert!(contrast(fg, bg) >= TEXT_CONTRAST - 0.05, "{name}: pair {index} {fg:06x} on {bg:06x}");
         }
+    }
+
+    /// The surfaces `make_readable` keeps apart, where the scheme leaves room for it.
+    pub(crate) fn assert_distinct(palette: &Palette, name: &str) {
+        let apart = [
+            (palette.divider, palette.bg, LINE_CONTRAST),
+            (palette.divider, palette.panel, LINE_CONTRAST),
+            (palette.accent_soft, palette.bg, SURFACE_CONTRAST),
+            (palette.accent_soft, palette.panel, SURFACE_CONTRAST),
+            (palette.tab_active, palette.tab_inactive, SURFACE_CONTRAST),
+            (palette.accent, palette.bg, MARK_CONTRAST),
+            (palette.accent, palette.panel, FILL_CONTRAST),
+        ];
+        for (index, (surface, ground, wanted)) in apart.into_iter().enumerate() {
+            assert!(contrast(surface, ground) >= wanted - 0.05, "{name}: surface {index} {surface:06x} on {ground:06x}");
+        }
+    }
+
+    /// Everything a real theme has to give.
+    pub(crate) fn assert_theme(palette: &Palette, name: &str) {
+        assert_readable(palette, name);
+        assert_distinct(palette, name);
+        assert_marks(palette, name);
+    }
+
+    fn assert_marks(palette: &Palette, name: &str) {
         for mark in [palette.comment, palette.keyword, palette.function, palette.string, palette.caret, palette.focus, palette.line_number] {
             assert!(contrast(mark, palette.bg) >= MARK_CONTRAST - 0.05, "{name}: {mark:06x} on {:06x}", palette.bg);
         }
@@ -441,7 +506,7 @@ pub(crate) mod tests {
     #[test]
     fn built_in_themes_are_readable() {
         for (name, palette) in BUILT_IN {
-            assert_readable(&palette, name);
+            assert_theme(&palette, name);
         }
     }
 
@@ -456,7 +521,7 @@ pub(crate) mod tests {
         ]));
         assert_eq!(palette.on_accent, 0x101010);
         assert_eq!(palette.caret, 0xcccccc);
-        assert_readable(&palette, "vesper-like");
+        assert_theme(&palette, "vesper-like");
     }
 
     #[test]
@@ -468,7 +533,9 @@ pub(crate) mod tests {
             HashMap::new(),
         ];
         for (index, scheme) in schemes.iter().enumerate() {
-            assert_readable(&Palette::from_groups(scheme), &format!("scheme {index}"));
+            let palette = Palette::from_groups(scheme);
+            assert_readable(&palette, &format!("scheme {index}"));
+            assert_marks(&palette, &format!("scheme {index}"));
         }
     }
 
