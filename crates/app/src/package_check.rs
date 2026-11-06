@@ -17,9 +17,18 @@ pub struct PackageHint {
     pub fix: Fix,
 }
 
+/// What one check finds, for the hints and for the suggestions.
+pub struct Report {
+    pub hints: Vec<PackageHint>,
+    pub loaded: Loaded,
+    /// Every package the project loads, by name.
+    pub packages: Vec<String>,
+    /// Every command the project uses, sorted.
+    pub used: Vec<String>,
+}
+
 /// `sources` holds every LaTeX file of the project. `main` gets a new package.
-/// Also gives what the project loads, for the suggestions.
-pub fn hints(main: &Path, sources: &[(PathBuf, String)], has_own_style_files: bool) -> (Vec<PackageHint>, Loaded) {
+pub fn hints(main: &Path, sources: &[(PathBuf, String)], has_own_style_files: bool) -> Report {
     let files: Vec<(&Path, LatexUsage)> = sources.iter().map(|(path, text)| (path.as_path(), latex_usage(text))).collect();
     let mut project = ProjectUsage { has_own_style_files, ..Default::default() };
     for (_, usage) in &files {
@@ -62,7 +71,12 @@ pub fn hints(main: &Path, sources: &[(PathBuf, String)], has_own_style_files: bo
             }
         })
         .collect();
-    (hints, loaded(&project))
+    let mut packages = project.packages.clone();
+    packages.sort();
+    packages.dedup();
+    let mut used: Vec<String> = project.commands.iter().cloned().collect();
+    used.sort();
+    Report { hints, loaded: loaded(&project), packages, used }
 }
 
 /// The edit that `fix` makes in `text`, or `None` when the file has no place for it.
@@ -93,13 +107,13 @@ mod tests {
     #[test]
     fn use_in_another_file_keeps_a_package() {
         let sources = files(&[("main.tex", MAIN), ("part.tex", "\\toprule\n")]);
-        assert_eq!(hints(Path::new("main.tex"), &sources, false).0, []);
+        assert_eq!(hints(Path::new("main.tex"), &sources, false).hints, []);
     }
 
     #[test]
     fn an_unused_package_is_marked_where_it_is_loaded() {
         let sources = files(&[("main.tex", MAIN), ("part.tex", "text\n")]);
-        let found = hints(Path::new("main.tex"), &sources, false).0;
+        let found = hints(Path::new("main.tex"), &sources, false).hints;
         assert_eq!(found.len(), 1);
         assert_eq!(&MAIN[found[0].range.clone()], "booktabs");
         assert_eq!(found[0].fix, Fix::RemovePackage("booktabs".to_string()));
@@ -110,7 +124,7 @@ mod tests {
         let main = "\\documentclass{article}\n\\begin{document}\n\\input{part}\n\\end{document}\n";
         let part = "a \\toprule\n";
         let sources = files(&[("main.tex", main), ("part.tex", part)]);
-        let found = hints(Path::new("main.tex"), &sources, false).0;
+        let found = hints(Path::new("main.tex"), &sources, false).hints;
         assert_eq!(found[0].path, Path::new("part.tex"));
         assert_eq!(&part[found[0].range.clone()], "\\toprule");
         assert_eq!(found[0].fix, Fix::AddPackage("booktabs".to_string()));
@@ -119,14 +133,14 @@ mod tests {
     #[test]
     fn a_main_without_a_preamble_gets_no_add_hint() {
         let sources = files(&[("root.tex", "\\documentclass{article}\n"), ("main.tex", "\\toprule\n")]);
-        assert_eq!(hints(Path::new("main.tex"), &sources, false).0, []);
+        assert_eq!(hints(Path::new("main.tex"), &sources, false).hints, []);
     }
 
     #[test]
     fn the_shipped_sample_gets_no_hint() {
         let text = include_str!("../../../examples/overleaf-sample/main.tex");
         let sources = files(&[("main.tex", text)]);
-        assert_eq!(hints(Path::new("main.tex"), &sources, false).0, []);
+        assert_eq!(hints(Path::new("main.tex"), &sources, false).hints, []);
     }
 
     #[test]

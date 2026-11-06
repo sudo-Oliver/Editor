@@ -170,13 +170,13 @@ pub fn fuzzy_score(query: &str, candidate: &str) -> Option<i64> {
     // The index of the next char of `chars`, and the char before it.
     let (mut index, mut before) = (0usize, None);
     for wanted in query.chars().filter(|ch| !ch.is_whitespace()) {
-        let wanted = wanted.to_lowercase().next().unwrap_or(wanted);
+        let wanted = lower(wanted);
         loop {
             let ch = chars.next()?;
             let (found, prior) = (index, before);
             index += 1;
             before = Some(ch);
-            if ch.to_lowercase().next() != Some(wanted) {
+            if lower(ch) != wanted {
                 continue;
             }
             score += 1;
@@ -192,6 +192,11 @@ pub fn fuzzy_score(query: &str, candidate: &str) -> Option<i64> {
     }
     // Among equal matches, shorter paths win.
     Some(score * 16 - (index + chars.count()) as i64)
+}
+
+/// The first char of the lowercase form, with a fast path for ASCII.
+fn lower(ch: char) -> char {
+    if ch.is_ascii() { ch.to_ascii_lowercase() } else { ch.to_lowercase().next().unwrap_or(ch) }
 }
 
 /// Finds literal text in the given files. Stops early when `cancel` is set.
