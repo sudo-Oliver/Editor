@@ -10,7 +10,7 @@ use gpui::{
     MouseUpEvent, NavigationDirection, Pixels, Render, RenderImage, ScrollEvent, Task, Window, canvas, div, fill,
     point, prelude::*, px, rgba, size,
 };
-use pdf::{LinkTarget, PageContent, PageRequest, PdfEvent, PdfWorker, Rect};
+use pdf::{LinkTarget, PageContent, PageRequest, PdfEvent, PdfWorker, Recolor, Rect};
 use synctex::PdfLocation;
 
 use crate::{
@@ -737,9 +737,20 @@ impl PdfView {
         PaintList { pages: paint, selection: selection_bounds, hovered_link, highlight }
     }
 
+    /// The colors of dark pages. A light theme borrows the dark one, so that the
+    /// button always gives dark pages.
+    fn recolor(&self) -> Option<Recolor> {
+        self.invert.then(|| {
+            let palette = theme::palette();
+            let palette = if theme::is_light(palette.bg) { theme::Palette::OVERLEAF_DARK } else { palette };
+            Recolor { paper: palette.bg, ink: palette.code_text }
+        })
+    }
+
     /// Asks for visible pages first, then their neighbors, at the current resolution.
     fn request_pages(&mut self, first: usize, last: usize, scale: f32) {
         let is_zooming = self.zoomed_at.is_some();
+        let recolor = self.recolor();
         let before = first.saturating_sub(1)..first;
         let after = (last + 1)..(last + 2).min(self.pages.len());
         let wanted: Vec<PageRequest> = (first..=last)
@@ -749,11 +760,11 @@ impl PdfView {
                 let request = PageRequest {
                     page,
                     width_px: (self.pages[page].0 * self.zoom * scale).min(MAX_RENDER_WIDTH).round() as u32,
-                    invert: self.invert,
+                    recolor,
                 };
                 let up_to_date = self.images.get(&page).is_some_and(|image| {
                     image.generation == self.generation
-                        && (image.request == request || (is_zooming && image.request.invert == self.invert))
+                        && (image.request == request || (is_zooming && image.request.recolor == recolor))
                 });
                 (!up_to_date && request.width_px > 0).then_some(request)
             })
@@ -876,7 +887,7 @@ impl Render for PdfView {
                         .items_center()
                         .justify_center()
                         .p(px(16.))
-                        .text_color(theme::color(theme::UI_MUTED))
+                        .text_color(theme::color(theme::palette().ui_muted))
                         .child(message),
                 )
             })

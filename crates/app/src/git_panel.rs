@@ -25,7 +25,10 @@ const MAX_FILES_SHOWN: usize = 500;
 const MAX_REFS_SHOWN: usize = 2;
 /// How close to the end of the list the next page starts to load.
 const LOAD_MARGIN: usize = 40;
-const LANE_COLORS: [u32; 6] = [theme::CYAN, theme::PINK, theme::ORANGE, theme::ST_GREEN, theme::CARET, theme::ST_INSERT];
+fn lane_colors() -> [u32; 6] {
+    let palette = theme::palette();
+    [palette.function, palette.keyword, palette.string, palette.st_green, palette.focus, palette.st_insert]
+}
 
 type Handler = Box<dyn Fn(&mut GitPanel, &mut Context<GitPanel>)>;
 /// The icon and the action of a button in a list row.
@@ -369,7 +372,7 @@ impl GitPanel {
             .justify_center()
             .size(px(22.))
             .rounded(px(4.))
-            .when(!busy, |style| style.cursor_pointer().hover(|style| style.bg(theme::color(theme::DIVIDER))))
+            .when(!busy, |style| style.cursor_pointer().hover(|style| style.bg(theme::color(theme::palette().divider))))
             .when(busy, |style| style.opacity(0.5))
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
@@ -377,7 +380,7 @@ impl GitPanel {
                     handler(this, cx);
                 }
             }))
-            .child(Self::icon(icon, 14., theme::UI_TEXT))
+            .child(Self::icon(icon, 14., theme::palette().ui_text))
     }
 
     fn render_head(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -408,12 +411,12 @@ impl GitPanel {
                     .rounded(px(4.))
                     .cursor_pointer()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .hover(|style| style.bg(theme::color(theme::DIVIDER)))
+                    .hover(|style| style.bg(theme::color(theme::palette().divider)))
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(GitPanelEvent::PickBranch)))
-                    .child(Self::icon("git-branch", 14., theme::UI_TEXT))
+                    .child(Self::icon("git-branch", 14., theme::palette().ui_text))
                     .child(div().min_w_0().truncate().child(branch)),
             )
-            .children(counts.map(|counts| div().flex_none().px(px(3.)).text_color(theme::color(theme::UI_MUTED)).child(counts)))
+            .children(counts.map(|counts| div().flex_none().px(px(3.)).text_color(theme::color(theme::palette().ui_muted)).child(counts)))
             .child(self.icon_button("git-pull", "download", cx, |this, cx| {
                 this.change_with_saved_files(cx, Repository::pull);
             }))
@@ -439,7 +442,7 @@ impl GitPanel {
             .pl(px(10.))
             .pr(px(6.))
             .font_weight(FontWeight::SEMIBOLD)
-            .text_color(theme::color(theme::UI_MUTED))
+            .text_color(theme::color(theme::palette().ui_muted))
             .child(format!("{title} ({count})"))
             .children(action.map(|(icon, handler)| {
                 self.icon_button(id, icon, cx, move |this, cx| handler(this, cx))
@@ -459,10 +462,10 @@ impl GitPanel {
         let path = self.repository().map(|repository| repository.root().join(&file.path));
         let deleted = letter == 'D';
         let color = match letter {
-            'A' | '?' => theme::ST_GREEN,
-            'D' | 'U' => theme::ST_RED,
-            'R' | 'C' => theme::CYAN,
-            _ => theme::ORANGE,
+            'A' | '?' => theme::palette().st_green,
+            'D' | 'U' => theme::palette().st_red,
+            'R' | 'C' => theme::palette().function,
+            _ => theme::palette().string,
         };
         div()
             .id((id, index))
@@ -473,7 +476,7 @@ impl GitPanel {
             .pl(px(10.))
             .pr(px(6.))
             .when(!deleted, |style| style.cursor_pointer())
-            .hover(|style| style.bg(theme::color(theme::PANEL)))
+            .hover(|style| style.bg(theme::color(theme::palette().panel)))
             .on_click(cx.listener(move |_, _, _, cx| {
                 if let Some(path) = path.clone().filter(|_| !deleted) {
                     cx.emit(GitPanelEvent::OpenFile(path));
@@ -487,7 +490,7 @@ impl GitPanel {
                     .min_w_0()
                     .gap(px(5.))
                     .child(div().flex_none().max_w(gpui::relative(0.75)).truncate().child(name))
-                    .child(div().min_w_0().truncate().text_color(theme::color(theme::UI_MUTED)).child(directory)),
+                    .child(div().min_w_0().truncate().text_color(theme::color(theme::palette().ui_muted)).child(directory)),
             )
             .children(action.map(|(icon, handler)| {
                 self.icon_button(("git-file-action", index_of(id, index)), icon, cx, move |this, cx| handler(this, cx))
@@ -508,7 +511,7 @@ impl GitPanel {
             .min_h_0()
             .overflow_y_scroll();
         if nothing {
-            list = list.child(div().p(px(10.)).text_color(theme::color(theme::UI_MUTED)).child("No changes."));
+            list = list.child(div().p(px(10.)).text_color(theme::color(theme::palette().ui_muted)).child("No changes."));
         }
         if !conflicts.is_empty() {
             list = list.child(self.render_group_title("git-conflicts", "Conflicts", conflicts.len(), None, cx));
@@ -544,7 +547,7 @@ impl GitPanel {
         }
         let hidden = conflicts.len().max(staged.len()).max(changed.len()).saturating_sub(MAX_FILES_SHOWN);
         if hidden > 0 {
-            list = list.child(div().p(px(10.)).text_color(theme::color(theme::UI_MUTED)).child(format!("{hidden} more not shown.")));
+            list = list.child(div().p(px(10.)).text_color(theme::color(theme::palette().ui_muted)).child(format!("{hidden} more not shown.")));
         }
         list
     }
@@ -559,14 +562,14 @@ impl GitPanel {
             .gap(px(6.))
             .p(px(8.))
             .border_t_1()
-            .border_color(theme::color(theme::PANEL))
+            .border_color(theme::color(theme::palette().panel))
             .child(
                 div()
                     .relative()
                     .h(px(62.))
                     .rounded(px(4.))
                     .border_1()
-                    .border_color(theme::color(theme::DIVIDER))
+                    .border_color(theme::color(theme::palette().divider))
                     .overflow_hidden()
                     .child(self.commit_box.clone())
                     .when(empty, |element| {
@@ -578,7 +581,7 @@ impl GitPanel {
                                 .font_family(theme::CODE_FONT)
                                 .text_size(px(theme::CODE_FONT_SIZE))
                                 .line_height(px(theme::CODE_LINE_HEIGHT))
-                                .text_color(theme::color(theme::UI_MUTED))
+                                .text_color(theme::color(theme::palette().ui_muted))
                                 .child("Commit message"),
                         )
                     }),
@@ -592,9 +595,10 @@ impl GitPanel {
                     .h(px(26.))
                     .rounded(px(4.))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .bg(theme::color(if enabled { theme::GREEN } else { theme::DIVIDER }))
+                    .bg(theme::color(if enabled { theme::palette().accent } else { theme::palette().divider }))
+                    .when(enabled, |style| style.text_color(theme::color(theme::palette().on_accent)))
                     .when(enabled, |style| style.cursor_pointer())
-                    .when(!enabled, |style| style.text_color(theme::color(theme::UI_MUTED)))
+                    .when(!enabled, |style| style.text_color(theme::color(theme::palette().ui_muted)))
                     .on_click(cx.listener(|this, _, _, cx| this.commit(cx)))
                     .child("Commit"),
             )
@@ -611,7 +615,7 @@ impl GitPanel {
                 .truncate()
                 .px(px(4.))
                 .rounded(px(3.))
-                .bg(theme::color(theme::GREEN_DARK))
+                .bg(theme::color(theme::palette().accent_soft))
                 .text_size(px(11.))
                 .child(name)
         });
@@ -650,7 +654,7 @@ impl GitPanel {
                         div()
                             .truncate()
                             .text_size(px(11.))
-                            .text_color(theme::color(theme::UI_MUTED))
+                            .text_color(theme::color(theme::palette().ui_muted))
                             .child(format!("{} · {}", commit.author, commit.age)),
                     ),
             )
@@ -666,7 +670,7 @@ impl GitPanel {
             .when(open, |style| style.flex_1().min_h_0())
             .when(!open, |style| style.flex_none())
             .border_t_1()
-            .border_color(theme::color(theme::PANEL))
+            .border_color(theme::color(theme::palette().panel))
             .child(
                 div()
                     .id("git-history-header")
@@ -683,7 +687,7 @@ impl GitPanel {
                         this.load_history(cx);
                         cx.notify();
                     }))
-                    .child(Self::icon(if open { "chevron-down" } else { "chevron-right" }, 12., theme::UI_TEXT))
+                    .child(Self::icon(if open { "chevron-down" } else { "chevron-right" }, 12., theme::palette().ui_text))
                     .child("History"),
             )
             .when(open, |element| {
@@ -711,7 +715,7 @@ impl GitPanel {
             .flex_col()
             .gap(px(10.))
             .p(px(10.))
-            .child(div().text_color(theme::color(theme::UI_MUTED)).child(message))
+            .child(div().text_color(theme::color(theme::palette().ui_muted)).child(message))
             .children(action.map(|(label, button)| button.child(label)))
     }
 }
@@ -771,7 +775,8 @@ fn lane_x(lane: usize, bounds: &Bounds<Pixels>) -> Pixels {
 }
 
 fn lane_color(lane: usize) -> gpui::Hsla {
-    theme::color(LANE_COLORS[lane % LANE_COLORS.len()])
+    let colors = lane_colors();
+    theme::color(colors[lane % colors.len()])
 }
 
 fn paint_graph_row(row: &GraphRow, bounds: Bounds<Pixels>, window: &mut Window) {
@@ -814,7 +819,7 @@ impl Render for GitPanel {
                 .max_h(px(120.))
                 .overflow_hidden()
                 .p(px(8.))
-                .bg(theme::color(theme::ERROR_PANEL))
+                .bg(theme::color(theme::palette().error_panel))
                 .text_size(px(12.))
                 .child(error)
         });
@@ -834,7 +839,8 @@ impl Render for GitPanel {
                     .rounded(px(4.))
                     .text_center()
                     .cursor_pointer()
-                    .bg(theme::color(theme::GREEN))
+                    .bg(theme::color(theme::palette().accent))
+                    .text_color(theme::color(theme::palette().on_accent))
                     .font_weight(FontWeight::SEMIBOLD)
                     .on_click(cx.listener(|this, _, _, cx| this.init(cx)));
                 panel

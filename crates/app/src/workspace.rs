@@ -12,10 +12,10 @@ use std::{
     time::Duration,
 };
 
-use build::{BuildEvent, BuildManager, BuildOutcome, BuildRequest, Config, Diagnostic, Engine, Fix, Severity, Trigger, find_main};
+use build::{BuildEvent, BuildManager, BuildOutcome, BuildRequest, Config, Diagnostic, Engine, Fix, Loaded, Severity, Trigger, find_main};
 use addon_api::{ActiveFile, DiagnosticInfo, Reply, Request, SearchHit};
 use editor_core::{
-    Symbol,
+    Symbol, SymbolKind,
     Language, Mark, MarkSeverity,
     snippet::Snippet,
     vim::{self, Effect, Key, Leader, Mode},
@@ -33,6 +33,8 @@ use crate::{
     actions::*,
     addon_panel::{AddonPanel, AddonPanelEvent, doi_suggestion},
     addons::{self, Installed},
+    bib,
+    completion::Extra,
     marketplace::{self, CatalogEntry},
     editor_view::{EditorEvent, EditorView, FormatKind, is_save_conflict},
     export::{self, DraftFormat, PdfState},
@@ -41,6 +43,7 @@ use crate::{
     outline::{self, OutlineItem},
     image_view::{ImageView, ImageViewEvent, include_snippet, is_image, relative_path},
     pdf_view::{PdfView, PdfViewEvent, ZOOM_STEP},
+    nvim_themes, package_commands,
     picker::{self, Picker, PickerKind},
     package_check::{self, PackageHint},
     problems::{self, Problem},
@@ -325,6 +328,9 @@ pub struct Workspace {
     /// got the names of the others.
     symbols_version: (usize, usize),
     package_hints: Vec<PackageHint>,
+    /// What the project loads, for the suggestions of every document.
+    loaded_packages: Arc<Loaded>,
+    package_extra: Arc<Extra>,
     package_check_task: Option<Task<()>>,
     conflict_task: Option<Task<()>>,
     recovery_task: Option<Task<()>>,
@@ -472,6 +478,13 @@ impl Workspace {
         });
         let settings_path = settings::default_path();
         let settings = settings_path.as_deref().map(Settings::load).unwrap_or_default();
+        // Only the cache, so that starting never waits for Neovim.
+        if let Some(name) = &settings.theme
+            && let Some(palette) = theme::built_in(name)
+                .or_else(|| nvim_themes::cache_path().and_then(|path| nvim_themes::load_cache(&path).remove(name)))
+        {
+            theme::set_palette(palette);
+        }
         let mut workspace = Self {
             root: None,
             entries: Vec::new(),
@@ -482,6 +495,8 @@ impl Workspace {
             outline_version: (usize::MAX, 0),
             symbols_version: (usize::MAX, 0),
             package_hints: Vec::new(),
+            loaded_packages: Arc::default(),
+            package_extra: Arc::default(),
             package_check_task: None,
             conflict_task: None,
             recovery_task: None,
@@ -765,11 +780,13 @@ impl Workspace {
 
     /// Opens a tab without switching to it.
     fn add_document(&mut self, path: PathBuf, text: &str, cx: &mut Context<Self>) {
-        let settings = self.settings;
+        let settings = self.settings.clone();
+        let (loaded, extra) = (self.loaded_packages.clone(), self.package_extra.clone());
         let view = cx.new(|cx| {
             let mut view = EditorView::new(text, Some(path), cx);
             view.set_vim_mode(settings.vim_mode, settings.smooth_cursor, cx);
             view.set_auto_suggestions(settings.auto_suggestions, cx);
+            view.set_loaded_packages(loaded, extra);
             view
         });
         let subscription = cx.subscribe(&view, |this, view, event, cx| match event {
@@ -1773,11 +1790,13 @@ impl Workspace {
         let (Some(root), Some(main)) = (self.root.clone(), self.last_main.clone()) else {
             return;
         };
-        if !self.settings.package_hints || Language::from_path(&main) != Language::Latex {
+        if Language::from_path(&main) != Language::Latex {
             self.package_check_task = None;
-            self.show_package_hints(Vec::new(), cx);
+            self.show_package_hints(Vec::new(), Loaded::default(), Extra::default(), cx);
             return;
         }
+        // The suggestions need what the project loads even without the hints.
+        let show_hints = self.settings.package_hints;
         let open: Vec<(PathBuf, String, u64)> = self
             .documents
             .iter()
@@ -1788,13 +1807,17 @@ impl Workspace {
             .collect();
         self.package_check_task = Some(cx.spawn(async move |this, cx| {
             let versions: Vec<(PathBuf, u64)> = open.iter().map(|(path, _, version)| (path.clone(), *version)).collect();
-            let hints = cx
+            let (report, extra) = cx
                 .background_spawn(async move {
                     let mut sources: Vec<(PathBuf, String)> = Vec::new();
                     let mut has_own_style_files = false;
+                    let mut own_styles = Vec::new();
                     for entry in file_tree::scan(&root, &HashSet::new()) {
                         let extension = entry.path.extension().and_then(|extension| extension.to_str());
                         has_own_style_files |= !entry.is_dir && matches!(extension, Some("sty" | "cls"));
+                        if !entry.is_dir && extension == Some("sty") {
+                            own_styles.push(entry.path.clone());
+                        }
                         if entry.is_dir || !matches!(extension, Some("tex" | "latex")) {
                             continue;
                         }
@@ -1806,7 +1829,10 @@ impl Workspace {
                             sources.push((entry.path, text));
                         }
                     }
-                    package_check::hints(&main, &sources, has_own_style_files)
+                    let report = package_check::hints(&main, &sources, has_own_style_files);
+                    let (commands, environments) = package_commands::collect(&report.packages, &own_styles);
+                    let used = report.used.clone();
+                    (report, Extra { commands, environments, used })
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -1817,16 +1843,19 @@ impl Workspace {
                     })
                 });
                 if unchanged {
-                    this.show_package_hints(hints, cx);
+                    let hints = if show_hints { report.hints } else { Vec::new() };
+                    this.show_package_hints(hints, report.loaded, extra, cx);
                 }
             })
             .ok();
         }));
     }
 
-    fn show_package_hints(&mut self, hints: Vec<PackageHint>, cx: &mut Context<Self>) {
+    fn show_package_hints(&mut self, hints: Vec<PackageHint>, loaded: Loaded, extra: Extra, cx: &mut Context<Self>) {
+        let (loaded, extra) = (Arc::new(loaded), Arc::new(extra));
         for document in &self.documents {
             document.view.update(cx, |view, cx| {
+                view.set_loaded_packages(loaded.clone(), extra.clone());
                 let marks = hints
                     .iter()
                     .filter(|hint| view.path.as_deref() == Some(hint.path.as_path()))
@@ -1836,6 +1865,8 @@ impl Workspace {
             });
         }
         self.package_hints = hints;
+        self.loaded_packages = loaded;
+        self.package_extra = extra;
         cx.notify();
     }
 
@@ -1862,7 +1893,8 @@ impl Workspace {
         // The hint is done, and the next build checks again.
         let mut hints = std::mem::take(&mut self.package_hints);
         hints.retain(|hint| hint.fix != *fix);
-        self.show_package_hints(hints, cx);
+        let (loaded, extra) = ((*self.loaded_packages).clone(), (*self.package_extra).clone());
+        self.show_package_hints(hints, loaded, extra, cx);
         let done = match fix {
             Fix::AddPackage(package) => format!("Added {package}"),
             Fix::RemovePackage(package) => format!("Removed {package}"),
@@ -2079,7 +2111,7 @@ impl Workspace {
         {
             self.set_status(format!("Cannot save settings: {error}"), cx);
         }
-        let settings = self.settings;
+        let settings = self.settings.clone();
         for document in &self.documents {
             document.view.update(cx, |view, cx| {
                 view.set_vim_mode(settings.vim_mode, settings.smooth_cursor, cx);
@@ -2257,6 +2289,7 @@ impl Workspace {
             Effect::TogglePreview => self.show_preview = !self.show_preview,
             Effect::FindFiles => self.open_picker(PickerKind::Files, window, cx),
             Effect::FindText => self.open_picker(PickerKind::Text, window, cx),
+            Effect::PickTheme => self.open_theme_picker(window, cx),
             Effect::LookupDoi => self.lookup_doi(cx),
             Effect::QuickFix => self.quick_fix(cx),
             Effect::ShowError => {
@@ -2394,7 +2427,7 @@ impl Workspace {
     }
 
     fn render_word_count(&self) -> Vec<AnyElement> {
-        let note = |text: String| div().text_color(theme::color(theme::UI_MUTED)).mt(px(12.)).child(text).into_any_element();
+        let note = |text: String| div().text_color(theme::color(theme::palette().ui_muted)).mt(px(12.)).child(text).into_any_element();
         let row = |label: String, value: usize, strong: bool| {
             div()
                 .flex()
@@ -2929,6 +2962,15 @@ impl Workspace {
         let scan_root = root.clone();
         let language = self.active_language(cx);
         let offered = if kind == PickerKind::Citations { self.offered_citations(cx) } else { Vec::new() };
+        // The letters of the last LaTeX build, and the labels that `@` cites in Typst.
+        let bbl = (kind == PickerKind::Citations && language == Some(Language::Latex))
+            .then(|| {
+                let active = self.active_view().and_then(|view| view.read(cx).path.clone());
+                find_main(&root, &self.config, active.as_deref())
+            })
+            .flatten()
+            .and_then(|main| bib::bbl_path(&main));
+        let labels = if kind == PickerKind::Citations && language == Some(Language::Typst) { self.document_labels(cx) } else { Vec::new() };
         let repository = self.git_panel.read(cx).repository();
         if kind == PickerKind::Branches && repository.is_none() {
             return;
@@ -2943,6 +2985,8 @@ impl Workspace {
             entries: Arc::new(Vec::new()),
             cancel: Arc::new(AtomicBool::new(false)),
             task: None,
+            themes: Arc::new(nvim_themes::Themes::new()),
+            original: None,
         });
         window.focus(&self.picker_focus, cx);
         self.picker_files_task = Some(cx.spawn(async move |this, cx| {
@@ -2956,13 +3000,16 @@ impl Workspace {
                         .filter(|entry| !entry.is_dir)
                         .map(|entry| entry.path)
                         .filter(|path| match kind {
-                            PickerKind::Files | PickerKind::Text | PickerKind::Branches => true,
+                            PickerKind::Files | PickerKind::Text | PickerKind::Branches | PickerKind::Themes => true,
                             PickerKind::Figures => language.is_some_and(|language| snippets::is_figure_file(language, path)),
                             PickerKind::Citations => path.extension().is_some_and(|extension| extension == "bib"),
                         })
                         .collect::<Vec<_>>();
                     let entries = if kind == PickerKind::Citations {
-                        picker::merge_citations(picker::read_citations(&files), offered)
+                        let bbl = bbl.and_then(|path| std::fs::read_to_string(path).ok());
+                        let mut entries = picker::merge_citations(bib::citation_items(&files, bbl.as_deref()), offered);
+                        entries.extend(picker::label_items(labels));
+                        entries
                     } else {
                         Vec::new()
                     };
@@ -2981,9 +3028,75 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Lists the cached themes at once and asks Neovim for the current ones.
+    fn open_theme_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let cache = nvim_themes::cache_path();
+        let themes = cache.as_deref().map(nvim_themes::load_cache).unwrap_or_default();
+        self.picker = Some(Picker {
+            kind: PickerKind::Themes,
+            query: String::new(),
+            items: Vec::new(),
+            selected: 0,
+            root: PathBuf::new(),
+            files: Arc::new(Vec::new()),
+            entries: Arc::new(picker::theme_items(&themes)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            task: None,
+            themes: Arc::new(themes),
+            original: Some(theme::palette()),
+        });
+        window.focus(&self.picker_focus, cx);
+        self.refresh_picker(cx);
+        self.picker_files_task = Some(cx.spawn(async move |this, cx| {
+            let scanned = cx
+                .background_spawn(async move {
+                    let themes = nvim_themes::scan()?;
+                    if let Some(cache) = &cache {
+                        nvim_themes::save_cache(cache, &themes).ok();
+                    }
+                    Ok::<_, String>(themes)
+                })
+                .await;
+            this.update(cx, |this, cx| match scanned {
+                Ok(themes) => {
+                    if let Some(picker) = this.picker.as_mut().filter(|picker| picker.kind == PickerKind::Themes) {
+                        picker.entries = Arc::new(picker::theme_items(&themes));
+                        picker.themes = Arc::new(themes);
+                        this.refresh_picker(cx);
+                    }
+                }
+                Err(message) => this.set_status(message, cx),
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Shows the selected theme, so that moving through the list previews it.
+    fn preview_theme(&mut self, cx: &mut Context<Self>) {
+        let Some(picker) = self.picker.as_ref().filter(|picker| picker.kind == PickerKind::Themes) else {
+            return;
+        };
+        let Some(palette) = picker
+            .items
+            .get(picker.selected)
+            .and_then(|item| theme::built_in(&item.label).or_else(|| picker.themes.get(&item.label).copied()))
+        else {
+            return;
+        };
+        if palette != theme::palette() {
+            theme::set_palette(palette);
+            cx.refresh_windows();
+        }
+    }
+
     fn close_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(picker) = self.picker.take() {
             picker.cancel.store(true, Ordering::Relaxed);
+            if let Some(original) = picker.original {
+                theme::set_palette(original);
+                cx.refresh_windows();
+            }
         }
         self.picker_files_task = None;
         self.focus_active(window, cx);
@@ -3000,12 +3113,24 @@ impl Workspace {
                 picker.selected = 0;
             }
             PickerKind::Citations => {
-                picker.items = picker::match_entries(&picker.entries, &picker.query);
+                picker.items = picker::match_in_order(&picker.entries, &picker.query);
                 picker.selected = 0;
             }
             PickerKind::Branches => {
                 picker.items = picker::match_branches(&picker.entries, &picker.query);
                 picker.selected = 0;
+            }
+            PickerKind::Themes => {
+                picker.items = picker::match_in_order(&picker.entries, &picker.query);
+                // Without a query the list starts at the theme in use.
+                let current = self.settings.theme.as_deref().unwrap_or(theme::DEFAULT_THEME);
+                picker.selected = if picker.query.trim().is_empty() {
+                    picker.items.iter().position(|item| item.label == current).unwrap_or(0)
+                } else {
+                    0
+                };
+                self.picker_scroll.scroll_to_item(picker.selected);
+                self.preview_theme(cx);
             }
             PickerKind::Text => {
                 picker.cancel.store(true, Ordering::Relaxed);
@@ -3044,6 +3169,7 @@ impl Workspace {
             picker.selected = if forward { (picker.selected + 1) % count } else { (picker.selected + count - 1) % count };
             self.picker_scroll.scroll_to_item(picker.selected);
         }
+        self.preview_theme(cx);
         cx.notify();
     }
 
@@ -3051,9 +3177,17 @@ impl Workspace {
         let Some((kind, item)) = self.picker.as_ref().and_then(|picker| Some((picker.kind, picker.items.get(index).cloned()?))) else {
             return;
         };
+        if let Some(picker) = &mut self.picker {
+            // The previewed theme stays.
+            picker.original = None;
+        }
         self.close_picker(window, cx);
         match kind {
             PickerKind::Files | PickerKind::Text => {}
+            PickerKind::Themes => {
+                let name = (item.label != theme::DEFAULT_THEME).then_some(item.label);
+                return self.update_settings(|settings| settings.theme = name, window, cx);
+            }
             PickerKind::Figures => return self.insert_figure(&item.path, cx),
             PickerKind::Branches => {
                 if self.save_all(cx) {
@@ -3089,6 +3223,13 @@ impl Workspace {
             if !closing {
                 self.with_active(cx, |view, cx| view.step_forward(cx));
             }
+            return format!("Cited {key} at the cursor.");
+        }
+        // The `@` that opened the picker is already there.
+        if self.active_language(cx) == Some(Language::Typst)
+            && self.active_view().and_then(|view| Self::around_cursor(view.read(cx))).is_some_and(|(_, before, _)| snippets::opens_reference(&before))
+        {
+            self.insert_snippet(&snippets::citation_key(key, false), false, cx);
             return format!("Cited {key} at the cursor.");
         }
         match self.active_language(cx) {
@@ -3179,13 +3320,27 @@ impl Workspace {
                     .p(px(12.))
                     .rounded(px(8.))
                     .overflow_hidden()
-                    .bg(theme::color(theme::BG))
+                    .bg(theme::color(theme::palette().bg))
                     .border_1()
-                    .border_color(theme::color(theme::DIVIDER))
+                    .border_color(theme::color(theme::palette().divider))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .children(content),
             )
             .into_any_element()
+    }
+
+    /// The labels of all open documents, once each.
+    fn document_labels(&self, cx: &App) -> Vec<String> {
+        let mut labels: Vec<String> = self
+            .documents
+            .iter()
+            .flat_map(|document| document.view.read(cx).symbols().to_vec())
+            .filter(|symbol| symbol.kind == SymbolKind::Label)
+            .map(|symbol| symbol.name)
+            .collect();
+        labels.sort();
+        labels.dedup();
+        labels
     }
 
     fn offered_citations(&self, cx: &App) -> Vec<(String, String)> {
@@ -3220,10 +3375,12 @@ impl Workspace {
         snippets::opens_citation(&before).then(|| !after.starts_with('}'))
     }
 
-    /// Opens the picker when `\cite{` was typed and there is something to pick.
-    /// Taking the key back with Backspace does not open it again at that place.
+    /// Opens the picker when `\cite{`, or `@` in Typst, was typed and there is
+    /// something to pick. Taking the key back with Backspace does not open it
+    /// again at that place.
     fn check_citation_trigger(&mut self, view: &Entity<EditorView>, cx: &mut Context<Self>) {
-        if self.picker.is_some() || self.active_view().as_ref() != Some(view) || self.active_language(cx) != Some(Language::Latex) {
+        let language = self.active_language(cx);
+        if self.picker.is_some() || self.active_view().as_ref() != Some(view) || !matches!(language, Some(Language::Latex | Language::Typst)) {
             return;
         }
         let Some((head, before, _)) = Self::around_cursor(view.read(cx)) else {
@@ -3233,14 +3390,15 @@ impl Workspace {
         if self.citation_trigger.is_some_and(|(view, offset)| view != id || head < offset) {
             self.citation_trigger = None;
         }
-        if !snippets::opens_citation(&before) || self.citation_trigger == Some((id, head)) {
+        let opens = if language == Some(Language::Typst) { snippets::opens_reference(&before) } else { snippets::opens_citation(&before) };
+        if !opens || self.citation_trigger == Some((id, head)) {
             return;
         }
         self.citation_trigger = Some((id, head));
         let Some(root) = self.root.clone() else {
             return;
         };
-        let offered = !self.offered_citations(cx).is_empty();
+        let offered = !self.offered_citations(cx).is_empty() || (language == Some(Language::Typst) && !self.document_labels(cx).is_empty());
         let view = view.clone();
         self.citation_check_task = Some(cx.spawn(async move |this, cx| {
             let available = offered
@@ -3251,7 +3409,7 @@ impl Workspace {
                             .filter(|entry| !entry.is_dir && entry.path.extension().is_some_and(|extension| extension == "bib"))
                             .map(|entry| entry.path)
                             .collect();
-                        !picker::read_citations(&files).is_empty()
+                        !bib::citation_items(&files, None).is_empty()
                     })
                     .await;
             this.update(cx, |this, cx| {
@@ -3553,9 +3711,9 @@ impl Workspace {
             .size(px(26.))
             .rounded(px(4.))
             .cursor_pointer()
-            .hover(|style| style.bg(theme::color(theme::DIVIDER)))
+            .hover(|style| style.bg(theme::color(theme::palette().divider)))
             .on_click(cx.listener(move |this, _, window, cx| handler(this, window, cx)))
-            .child(Self::icon(name, 16., theme::UI_TEXT))
+            .child(Self::icon(name, 16., theme::palette().ui_text))
     }
 
     fn menu_button(&self, menu: Menu, label: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3568,8 +3726,8 @@ impl Workspace {
             .items_center()
             .rounded(px(4.))
             .cursor_pointer()
-            .when(open, |style| style.bg(theme::color(theme::PANEL)))
-            .hover(|style| style.bg(theme::color(theme::PANEL)))
+            .when(open, |style| style.bg(theme::color(theme::palette().panel)))
+            .hover(|style| style.bg(theme::color(theme::palette().panel)))
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 this.toggle_menu(menu, event.position(), TOP_BAR_HEIGHT, window, cx);
             }))
@@ -3590,20 +3748,23 @@ impl Workspace {
                         .min_w(px(220.))
                         .py(px(4.))
                         .rounded(px(4.))
-                        .bg(theme::color(theme::PANEL))
+                        .bg(theme::color(theme::palette().panel))
+                        // A menu can open inside an accent button, whose text would carry over.
+                        .text_color(theme::color(theme::palette().ui_text))
+                        .font_weight(FontWeight::NORMAL)
                         .border_1()
-                        .border_color(theme::color(theme::DIVIDER))
+                        .border_color(theme::color(theme::palette().divider))
                         .shadow_lg()
                         .children(items.into_iter().enumerate().map(|(index, item)| {
                             match item.kind {
                                 MenuEntryKind::Separator => {
-                                    return div().my(px(4.)).h(px(1.)).bg(theme::color(theme::DIVIDER)).into_any_element();
+                                    return div().my(px(4.)).h(px(1.)).bg(theme::color(theme::palette().divider)).into_any_element();
                                 }
                                 MenuEntryKind::Heading => {
                                     return div()
                                         .px(px(12.))
                                         .py(px(3.))
-                                        .text_color(theme::color(theme::UI_MUTED))
+                                        .text_color(theme::color(theme::palette().ui_muted))
                                         .child(item.label.clone())
                                         .into_any_element();
                                 }
@@ -3618,7 +3779,7 @@ impl Workspace {
                                 .px(px(12.))
                                 .py(px(5.))
                                 .cursor_pointer()
-                                .hover(|style| style.bg(theme::color(theme::GREEN_DARK)))
+                                .hover(|style| style.bg(theme::color(theme::palette().accent_soft)))
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.close_menu(window, cx);
                                     handler(this, window, cx);
@@ -3627,7 +3788,7 @@ impl Workspace {
                                 .child(item.label.clone())
                                 .child(
                                     div()
-                                        .text_color(theme::color(theme::UI_MUTED))
+                                        .text_color(theme::color(theme::palette().ui_muted))
                                         .child(item.shortcut),
                                 )
                                 .into_any_element()
@@ -3653,7 +3814,7 @@ impl Workspace {
             .pl(px(TRAFFIC_LIGHT_SPACE))
             .pr(px(10.))
             .border_b_1()
-            .border_color(theme::color(theme::PANEL))
+            .border_color(theme::color(theme::palette().panel))
             .child(
                 div()
                     .flex()
@@ -3695,14 +3856,14 @@ impl Workspace {
                 .size(px(32.))
                 .rounded(px(4.))
                 .cursor_pointer()
-                .when(on, |style| style.bg(theme::color(theme::GREEN_DARK)))
-                .hover(|style| style.bg(theme::color(theme::DIVIDER)))
+                .when(on, |style| style.bg(theme::color(theme::palette().accent_soft)))
+                .hover(|style| style.bg(theme::color(theme::palette().divider)))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.show_file_panel = !(this.show_file_panel && this.left_panel == panel);
                     this.left_panel = panel;
                     cx.notify();
                 }))
-                .child(Self::icon(icon, 18., theme::UI_TEXT))
+                .child(Self::icon(icon, 18., theme::palette().ui_text))
         };
         div()
             .flex()
@@ -3714,7 +3875,7 @@ impl Workspace {
             .h_full()
             .py(px(4.))
             .border_r_1()
-            .border_color(theme::color(theme::PANEL))
+            .border_color(theme::color(theme::palette().panel))
             .child(
                 div()
                     .flex()
@@ -3737,14 +3898,14 @@ impl Workspace {
                             .size(px(32.))
                             .rounded(px(4.))
                             .cursor_pointer()
-                            .when(on, |style| style.bg(theme::color(theme::GREEN_DARK)))
-                            .hover(|style| style.bg(theme::color(theme::DIVIDER)))
+                            .when(on, |style| style.bg(theme::color(theme::palette().accent_soft)))
+                            .hover(|style| style.bg(theme::color(theme::palette().divider)))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.show_file_panel = !(this.show_file_panel && this.left_panel == panel);
                                 this.left_panel = panel;
                                 cx.notify();
                             }))
-                            .child(svg().path(path).size(px(18.)).flex_none().text_color(theme::color(theme::UI_TEXT)))
+                            .child(svg().path(path).size(px(18.)).flex_none().text_color(theme::color(theme::palette().ui_text)))
                     })),
             )
             .child(
@@ -3819,14 +3980,14 @@ impl Workspace {
                     .cursor_pointer()
                     .when(selected, |style| {
                         style
-                            .bg(theme::color(theme::GREEN_DARK))
+                            .bg(theme::color(theme::palette().accent_soft))
                             .font_weight(FontWeight::SEMIBOLD)
                     })
                     .when(!selected, |style| {
-                        style.hover(|style| style.bg(theme::color(theme::PANEL)))
+                        style.hover(|style| style.bg(theme::color(theme::palette().panel)))
                     })
                     .when(tree_cursor == Some(index), |style| {
-                        style.border_1().border_color(theme::color(theme::CARET))
+                        style.border_1().border_color(theme::color(theme::palette().focus))
                     })
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.tree_target = Some(path.clone());
@@ -3843,11 +4004,11 @@ impl Workspace {
                         element.child(Self::icon(
                             if collapsed { "chevron-right" } else { "chevron-down" },
                             12.,
-                            theme::UI_TEXT,
+                            theme::palette().ui_text,
                         ))
                     })
-                    .child(Self::icon(Self::file_icon(entry), 16., theme::UI_TEXT))
-                    .child(div().truncate().child(entry.name.clone()))
+                    .child(Self::icon(Self::file_icon(entry), 16., if is_dir { theme::palette().folder } else { theme::palette().ui_text }))
+                    .child(div().truncate().when(is_dir, |name| name.text_color(theme::color(theme::palette().folder))).child(entry.name.clone()))
             })
             .collect()
     }
@@ -3870,7 +4031,7 @@ impl Workspace {
                     .pl(px(OUTLINE_INSET + item.depth as f32 * OUTLINE_INDENT))
                     .pr(px(8.))
                     .cursor_pointer()
-                    .hover(|style| style.bg(theme::color(theme::PANEL)))
+                    .hover(|style| style.bg(theme::color(theme::palette().panel)))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if let Some(view) = this.active_view() {
                             view.update(cx, |view, cx| view.go_to_line(line, 0, window, cx));
@@ -3884,7 +4045,7 @@ impl Workspace {
                             .bottom_0()
                             .left(px(OUTLINE_INSET + OUTLINE_CHEVRON / 2. + depth as f32 * OUTLINE_INDENT))
                             .w(px(1.))
-                            .bg(theme::color(theme::DIVIDER))
+                            .bg(theme::color(theme::palette().divider))
                     }))
                     .child(
                         div()
@@ -3899,7 +4060,7 @@ impl Workspace {
                                     .child(Self::icon(
                                         if item.collapsed { "chevron-right" } else { "chevron-down" },
                                         12.,
-                                        theme::UI_TEXT,
+                                        theme::palette().ui_text,
                                     ))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         cx.stop_propagation();
@@ -3937,7 +4098,7 @@ impl Workspace {
             .child(Self::icon(
                 if open { "chevron-down" } else { "chevron-right" },
                 12.,
-                theme::UI_TEXT,
+                theme::palette().ui_text,
             ))
             .child(div().flex_1().min_w_0().truncate().child(title))
     }
@@ -3959,12 +4120,12 @@ impl Workspace {
             .size(px(22.))
             .rounded(px(4.))
             .cursor_pointer()
-            .hover(|style| style.bg(theme::color(theme::DIVIDER)))
+            .hover(|style| style.bg(theme::color(theme::palette().divider)))
             .on_click(cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
                 handler(this, window, cx);
             }))
-            .child(Self::icon(name, 14., theme::UI_TEXT))
+            .child(Self::icon(name, 14., theme::palette().ui_text))
     }
 
     fn render_tree_input(&self, input: &TreeInput, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3985,7 +4146,7 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .text_color(theme::color(theme::UI_MUTED))
+                    .text_color(theme::color(theme::palette().ui_muted))
                     .child(div().flex_1().min_w_0().truncate().child(label))
                     .child(self.header_button("tree-input-cancel", "close", cx, |this, window, cx| {
                         this.close_tree_input(window, cx);
@@ -3997,9 +4158,9 @@ impl Workspace {
                     .px(px(6.))
                     .rounded(px(4.))
                     .overflow_hidden()
-                    .bg(theme::color(theme::BG))
+                    .bg(theme::color(theme::palette().bg))
                     .border_1()
-                    .border_color(theme::color(theme::DIVIDER))
+                    .border_color(theme::color(theme::palette().divider))
                     .child(input.view.clone()),
             )
     }
@@ -4050,7 +4211,7 @@ impl Workspace {
                                 .px(px(10.))
                                 .pb(px(6.))
                                 .cursor_pointer()
-                                .text_color(theme::color(theme::ERROR))
+                                .text_color(theme::color(theme::palette().error))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.tree_error = None;
                                     cx.notify();
@@ -4084,7 +4245,7 @@ impl Workspace {
             .id("outline-divider")
             .flex_none()
             .h(px(6.))
-            .bg(theme::color(theme::DIVIDER))
+            .bg(theme::color(theme::palette().divider))
             .cursor(CursorStyle::ResizeUpDown)
             .on_mouse_down(
                 MouseButton::Left,
@@ -4101,7 +4262,7 @@ impl Workspace {
             .flex_none()
             .w(px(DIVIDER_WIDTH))
             .h_full()
-            .bg(theme::color(theme::DIVIDER))
+            .bg(theme::color(theme::palette().divider))
             .cursor(CursorStyle::ResizeLeftRight)
             .on_mouse_down(
                 MouseButton::Left,
@@ -4131,10 +4292,10 @@ impl Workspace {
                 path.line_to(top_left);
                 path.line_to(top_right);
                 path.line_to(point(edge(right, right_forward, false), bounds.bottom()));
-                window.paint_path(path, theme::color(if active { theme::PANEL } else { theme::TAB_INACTIVE }));
+                window.paint_path(path, theme::color(if active { theme::palette().tab_active } else { theme::palette().tab_inactive }));
                 if active {
                     let line = Bounds::new(top_left, size(top_right.x - top_left.x, px(1.)));
-                    window.paint_quad(fill(line, theme::color(theme::CARET)));
+                    window.paint_quad(fill(line, theme::color(theme::palette().focus)));
                 }
             },
         )
@@ -4154,7 +4315,7 @@ impl Workspace {
             .flex_none()
             .items_end()
             .h(px(TAB_BAR_HEIGHT))
-            .bg(theme::color(theme::BG))
+            .bg(theme::color(theme::palette().bg))
             .pl(px(TAB_SLANT / 2. + 4.))
             .children(tabs.into_iter().enumerate().map(|(position, tab)| {
                 let active = current_position == Some(position);
@@ -4181,7 +4342,7 @@ impl Workspace {
                     .h(px(TAB_HEIGHT))
                     .px(px(TAB_SLANT / 2. + 8.))
                     .cursor_pointer()
-                    .when(!active, |style| style.text_color(theme::color(theme::UI_MUTED)))
+                    .when(!active, |style| style.text_color(theme::color(theme::palette().ui_muted)))
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         let bounds = box_bounds.get();
                         let click = event.position();
@@ -4192,10 +4353,10 @@ impl Workspace {
                         }
                     }))
                     .child(Self::tab_shape(active, edges, shape_bounds))
-                    .child(Self::icon(icon, 14., if active { theme::UI_TEXT } else { theme::UI_MUTED }))
+                    .child(Self::icon(icon, 14., if active { theme::palette().ui_text } else { theme::palette().ui_muted }))
                     .child(title)
                     .when(dirty, |element| {
-                        element.child(div().size(px(6.)).rounded_full().bg(theme::color(theme::UI_TEXT)))
+                        element.child(div().size(px(6.)).rounded_full().bg(theme::color(theme::palette().ui_text)))
                     })
                     .child(
                         div()
@@ -4204,7 +4365,7 @@ impl Workspace {
                                 cx.stop_propagation();
                                 this.close_tab(tab, window, cx);
                             }))
-                            .child(Self::icon("close", 12., theme::UI_MUTED)),
+                            .child(Self::icon("close", 12., theme::palette().ui_muted)),
                     )
             }))
     }
@@ -4224,7 +4385,7 @@ impl Workspace {
             .size(px(26.))
             .rounded(px(4.))
             .cursor_pointer()
-            .hover(|style| style.bg(theme::color(theme::DIVIDER)))
+            .hover(|style| style.bg(theme::color(theme::palette().divider)))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.with_active(cx, |view, cx| view.format(kind, cx));
             }))
@@ -4250,13 +4411,13 @@ impl Workspace {
             .size(px(26.))
             .rounded(px(4.))
             .cursor_pointer()
-            .when(open, |style| style.bg(theme::color(theme::DIVIDER)))
-            .hover(|style| style.bg(theme::color(theme::DIVIDER)))
+            .when(open, |style| style.bg(theme::color(theme::palette().divider)))
+            .hover(|style| style.bg(theme::color(theme::palette().divider)))
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 let bottom = TOP_BAR_HEIGHT + TAB_BAR_HEIGHT + TOOLBAR_HEIGHT;
                 this.toggle_menu(menu, event.position(), bottom, window, cx);
             }))
-            .child(Self::icon(icon, 16., theme::UI_TEXT))
+            .child(Self::icon(icon, 16., theme::palette().ui_text))
             .children(element)
     }
 
@@ -4268,9 +4429,9 @@ impl Workspace {
                     .occlude()
                     .p(px(8.))
                     .rounded(px(4.))
-                    .bg(theme::color(theme::PANEL))
+                    .bg(theme::color(theme::palette().panel))
                     .border_1()
-                    .border_color(theme::color(theme::DIVIDER))
+                    .border_color(theme::color(theme::palette().divider))
                     .shadow_lg()
                     .child(content),
             ),
@@ -4287,8 +4448,8 @@ impl Workspace {
                 .py(px(3.))
                 .rounded(px(4.))
                 .cursor_pointer()
-                .when(index == self.symbol_group, |style| style.bg(theme::color(theme::GREEN_DARK)))
-                .when(index != self.symbol_group, |style| style.hover(|style| style.bg(theme::color(theme::DIVIDER))))
+                .when(index == self.symbol_group, |style| style.bg(theme::color(theme::palette().accent_soft)))
+                .when(index != self.symbol_group, |style| style.hover(|style| style.bg(theme::color(theme::palette().divider))))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.symbol_group = index;
                     this.symbol_hover = None;
@@ -4307,7 +4468,7 @@ impl Workspace {
                 .rounded(px(4.))
                 .cursor_pointer()
                 .font_family(theme::CODE_FONT)
-                .hover(|style| style.bg(theme::color(theme::DIVIDER)))
+                .hover(|style| style.bg(theme::color(theme::palette().divider)))
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                     if *hovered {
                         this.symbol_hover = Some(template);
@@ -4336,7 +4497,7 @@ impl Workspace {
                         .truncate()
                         .font_family(theme::CODE_FONT)
                         .text_size(px(theme::CODE_FONT_SIZE))
-                        .text_color(theme::color(theme::UI_MUTED))
+                        .text_color(theme::color(theme::palette().ui_muted))
                         .child(preview),
                 ),
         )
@@ -4353,8 +4514,8 @@ impl Workspace {
                     .rounded(px(2.))
                     .cursor_pointer()
                     .border_1()
-                    .border_color(theme::color(theme::DIVIDER))
-                    .when(selected, |style| style.bg(theme::color(theme::GREEN_DARK)))
+                    .border_color(theme::color(theme::palette().divider))
+                    .when(selected, |style| style.bg(theme::color(theme::palette().accent_soft)))
                     .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                         if *hovered && this.table_hover != (row, column) {
                             this.table_hover = (row, column);
@@ -4374,12 +4535,12 @@ impl Workspace {
                 .flex_col()
                 .gap(px(2.))
                 .children(rows)
-                .child(div().pt(px(4.)).text_color(theme::color(theme::UI_MUTED)).child(format!("{hover_rows} × {hover_columns}"))),
+                .child(div().pt(px(4.)).text_color(theme::color(theme::palette().ui_muted)).child(format!("{hover_rows} × {hover_columns}"))),
         )
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let separator = || div().w(px(1.)).h(px(18.)).mx(px(4.)).bg(theme::color(theme::DIVIDER));
+        let separator = || div().w(px(1.)).h(px(18.)).mx(px(4.)).bg(theme::color(theme::palette().divider));
         let language = self.active_language(cx);
         let markup = matches!(language, Some(Language::Latex | Language::Typst));
         let formats = matches!(language, Some(Language::Latex | Language::Typst | Language::Markdown));
@@ -4389,7 +4550,7 @@ impl Workspace {
             .items_center()
             .h(px(TOOLBAR_HEIGHT))
             .px(px(6.))
-            .bg(theme::color(theme::PANEL))
+            .bg(theme::color(theme::palette().panel))
             .child(self.icon_button("undo", "undo", cx, |this, _, cx| {
                 this.with_active(cx, |view, cx| view.undo_edit(cx));
             }))
@@ -4418,7 +4579,7 @@ impl Workspace {
                     "math",
                     FormatKind::Math,
                     cx,
-                    Self::icon("math", 16., theme::UI_TEXT),
+                    Self::icon("math", 16., theme::palette().ui_text),
                 ))
             })
             .when(formats, |element| {
@@ -4426,7 +4587,7 @@ impl Workspace {
                     "link",
                     FormatKind::Link,
                     cx,
-                    Self::icon("link", 16., theme::UI_TEXT),
+                    Self::icon("link", 16., theme::palette().ui_text),
                 ))
             })
             .when_some(language.filter(|_| markup), |element, language| {
@@ -4457,7 +4618,7 @@ impl Workspace {
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_color(theme::color(theme::UI_MUTED))
+                .text_color(theme::color(theme::palette().ui_muted))
                 .child(if self.root.is_some() {
                     "Select a file in the file tree."
                 } else {
@@ -4489,7 +4650,7 @@ impl Workspace {
             .gap(px(8.))
             .h(px(28.))
             .px(px(10.))
-            .bg(theme::color(theme::DIVIDER))
+            .bg(theme::color(theme::palette().divider))
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| this.apply_fix(&fix, Some(&path), cx)))
             .child(div().flex_1().min_w_0().truncate().child(hint.message.clone()))
@@ -4512,13 +4673,13 @@ impl Workspace {
             .gap(px(8.))
             .h(px(28.))
             .px(px(10.))
-            .bg(theme::color(theme::ERROR_PANEL))
+            .bg(theme::color(theme::palette().error_panel))
             .border_t_1()
-            .border_color(theme::color(theme::ERROR))
+            .border_color(theme::color(theme::palette().error))
             .cursor_pointer()
             .on_click(cx.listener(|this, _, window, cx| this.go_to_diagnostic(0, window, cx)))
             .child(div().flex_1().min_w_0().truncate().child(label))
-            .child(div().flex_none().text_color(theme::color(theme::UI_MUTED)).child("Go to line"))
+            .child(div().flex_none().text_color(theme::color(theme::palette().ui_muted)).child("Go to line"))
     }
 
     fn render_preview_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -4540,7 +4701,7 @@ impl Workspace {
             .gap(px(8.))
             .h(px(PREVIEW_TOOLBAR_HEIGHT))
             .px(px(8.))
-            .bg(theme::color(theme::PANEL))
+            .bg(theme::color(theme::palette().panel))
             .child(
                 div()
                     .flex()
@@ -4553,7 +4714,8 @@ impl Workspace {
                             .items_center()
                             .h(px(24.))
                             .rounded(px(12.))
-                            .bg(theme::color(theme::GREEN))
+                            .bg(theme::color(theme::palette().accent))
+                            .text_color(theme::color(theme::palette().on_accent))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(
                                 div()
@@ -4573,13 +4735,13 @@ impl Workspace {
                                     .pl(px(6.))
                                     .pr(px(8.))
                                     .border_l_1()
-                                    .border_color(theme::color(theme::GREEN_DARK))
+                                    .border_color(theme::color(theme::palette().on_accent).opacity(0.3))
                                     .cursor_pointer()
                                     .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
                                         let bottom = TOP_BAR_HEIGHT + PREVIEW_TOOLBAR_HEIGHT;
                                         this.toggle_menu(Menu::Compile, event.position(), bottom, window, cx);
                                     }))
-                                    .child(Self::icon("chevron-down", 12., theme::UI_TEXT))
+                                    .child(Self::icon("chevron-down", 12., theme::palette().on_accent))
                                     .when(open, |element| element.child(self.render_menu(Menu::Compile, cx))),
                             ),
                     )
@@ -4592,7 +4754,8 @@ impl Workspace {
                             div()
                                 .px(px(5.))
                                 .rounded(px(8.))
-                                .bg(theme::color(theme::ERROR))
+                                .bg(theme::color(theme::palette().error))
+                                .text_color(theme::color(theme::palette().on_error))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .child(errors.to_string()),
                         )
@@ -4602,8 +4765,8 @@ impl Workspace {
                             div()
                                 .px(px(5.))
                                 .rounded(px(8.))
-                                .bg(theme::color(theme::WARNING))
-                                .text_color(theme::color(theme::BG))
+                                .bg(theme::color(theme::palette().warning))
+                                .text_color(theme::color(theme::palette().on_warning))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .child(warnings.to_string()),
                         )
@@ -4617,7 +4780,7 @@ impl Workspace {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_color(theme::color(theme::UI_MUTED))
+                    .text_color(theme::color(theme::palette().ui_muted))
                     .child(self.status.clone().unwrap_or_default()),
             )
             .child(
@@ -4658,7 +4821,7 @@ impl Workspace {
                     .child(
                         div()
                             .rounded(px(4.))
-                            .when(self.settings.auto_scroll_pdf, |element| element.bg(theme::color(theme::GREEN_DARK)))
+                            .when(self.settings.auto_scroll_pdf, |element| element.bg(theme::color(theme::palette().accent_soft)))
                             .child(self.icon_button("auto-scroll-pdf", "position", cx, |this, window, cx| {
                                 this.toggle_auto_scroll(window, cx);
                             })),
@@ -4690,7 +4853,8 @@ impl Workspace {
             .py(px(4.))
             .rounded(px(4.))
             .cursor_pointer()
-            .bg(theme::color(if primary { theme::GREEN } else { theme::DIVIDER }))
+            .bg(theme::color(if primary { theme::palette().accent } else { theme::palette().divider }))
+            .when(primary, |style| style.text_color(theme::color(theme::palette().on_accent)))
             .font_weight(FontWeight::SEMIBOLD)
             .on_click(cx.listener(move |this, _, window, cx| handler(this, window, cx)))
             .child(label.into())
@@ -4704,14 +4868,14 @@ impl Workspace {
             .gap(px(8.))
             .child(div().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).child(problem.title.clone()))
             .when_some(problem.location.clone(), |element, location| {
-                element.child(div().text_color(theme::color(theme::UI_MUTED)).child(location))
+                element.child(div().text_color(theme::color(theme::palette().ui_muted)).child(location))
             })
             .when(!problem.excerpt.is_empty(), |element| {
                 element.child(
                     div()
                         .p(px(8.))
                         .rounded(px(4.))
-                        .bg(theme::color(theme::BG))
+                        .bg(theme::color(theme::palette().bg))
                         .font_family(theme::CODE_FONT)
                         .text_size(px(theme::CODE_FONT_SIZE))
                         .overflow_hidden()
@@ -4719,13 +4883,13 @@ impl Workspace {
                         .children(problem.excerpt.iter().flat_map(|line| {
                             let number = format!("{:>5}  ", line.number);
                             let text = div()
-                                .when(!line.target, |style| style.text_color(theme::color(theme::UI_MUTED)))
+                                .when(!line.target, |style| style.text_color(theme::color(theme::palette().ui_muted)))
                                 .when(line.target, |style| style.font_weight(FontWeight::SEMIBOLD))
                                 .child(format!("{number}{}", line.text));
                             // Non-breaking spaces, because plain ones collapse in a text run.
                             let marker = problem.marker.filter(|_| line.target).map(|(before, width)| {
                                 div()
-                                    .text_color(theme::color(theme::ERROR))
+                                    .text_color(theme::color(theme::palette().error))
                                     .font_weight(FontWeight::BOLD)
                                     .child(format!("{}{}", "\u{a0}".repeat(number.len() + before), "^".repeat(width)))
                             });
@@ -4740,7 +4904,7 @@ impl Workspace {
                 element.child(
                     div()
                         .text_size(px(11.))
-                        .text_color(theme::color(theme::UI_MUTED))
+                        .text_color(theme::color(theme::palette().ui_muted))
                         .child(format!("Compiler message: {message}")),
                 )
             })
@@ -4789,15 +4953,15 @@ impl Workspace {
             .overflow_y_scroll()
             .gap(px(8.))
             .p(px(12.))
-            .bg(theme::color(theme::ERROR_PANEL))
+            .bg(theme::color(theme::palette().error_panel))
             .border_b_2()
-            .border_color(theme::color(theme::ERROR))
+            .border_color(theme::color(theme::palette().error))
             .child(div().font_weight(FontWeight::SEMIBOLD).child(self.preview_message()))
             .when_some(self.problems.first(), |element, problem| {
                 element.child(self.render_first_error(problem, cx))
             })
             .when(errors > 1, |element| {
-                element.child(div().text_color(theme::color(theme::UI_MUTED)).child(format!(
+                element.child(div().text_color(theme::color(theme::palette().ui_muted)).child(format!(
                     "{} more. Fix this one first and save, because later errors often come from it.",
                     errors - 1
                 )))
@@ -4813,7 +4977,7 @@ impl Workspace {
             .items_center()
             .h(px(28.))
             .px(px(10.))
-            .bg(theme::color(theme::ERROR_PANEL))
+            .bg(theme::color(theme::palette().error_panel))
             .cursor_pointer()
             .on_click(cx.listener(|this, _, _, cx| {
                 this.error_card_dismissed = false;
@@ -4824,8 +4988,8 @@ impl Workspace {
 
     fn render_problem_row(&self, index: usize, problem: &Problem, cx: &mut Context<Self>) -> impl IntoElement {
         let color = match self.diagnostics[index].severity {
-            Severity::Error => theme::ERROR,
-            Severity::Warning => theme::WARNING,
+            Severity::Error => theme::palette().error,
+            Severity::Warning => theme::palette().warning,
         };
         div()
             .id(("diagnostic", index))
@@ -4836,13 +5000,13 @@ impl Workspace {
             .rounded(px(4.))
             .border_l_2()
             .border_color(theme::color(color))
-            .bg(theme::color(theme::PANEL))
+            .bg(theme::color(theme::palette().panel))
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, window, cx| this.go_to_diagnostic(index, window, cx)))
             .child(problem.title.clone())
             .child(
                 div()
-                    .text_color(theme::color(theme::UI_MUTED))
+                    .text_color(theme::color(theme::palette().ui_muted))
                     .child(problem.location.clone().unwrap_or_default()),
             )
     }
@@ -4861,7 +5025,7 @@ impl Workspace {
             .id("logs")
             .size_full()
             .overflow_y_scroll()
-            .bg(theme::color(theme::BG))
+            .bg(theme::color(theme::palette().bg))
             .p(px(10.))
             .child(
                 div()
@@ -4896,7 +5060,7 @@ impl Workspace {
                 element.child(
                     div()
                         .mb(px(4.))
-                        .text_color(theme::color(theme::UI_MUTED))
+                        .text_color(theme::color(theme::palette().ui_muted))
                         .child(format!("{} more are not shown.", self.diagnostics.len() - MAX_DIAGNOSTICS_SHOWN)),
                 )
             })
@@ -4921,7 +5085,7 @@ impl Workspace {
                                     .py(px(4.))
                                     .rounded(px(4.))
                                     .cursor_pointer()
-                                    .bg(theme::color(theme::DIVIDER))
+                                    .bg(theme::color(theme::palette().divider))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .on_click(cx.listener(move |this, _, _, cx| this.apply_fix(&fix, Some(&path), cx)))
                                     .child(hint.fix.label()),
@@ -4944,7 +5108,7 @@ impl Workspace {
                         .mt(px(8.))
                         .font_family(theme::CODE_FONT)
                         .text_size(px(11.))
-                        .text_color(theme::color(theme::UI_MUTED))
+                        .text_color(theme::color(theme::palette().ui_muted))
                         .children(shown.iter().map(|line| div().child(line.to_string()))),
                 )
             })
@@ -4996,14 +5160,14 @@ impl Workspace {
             .p(px(2.))
             .rounded(px(10.))
             .when(on, |style| style.justify_end())
-            .bg(theme::color(if on { theme::GREEN } else { theme::DIVIDER }))
+            .bg(theme::color(if on { theme::palette().accent } else { theme::palette().divider }))
             .when(enabled, |style| {
                 style
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, window, cx| handler(this, window, cx)))
             })
             .when(!enabled, |style| style.opacity(0.4))
-            .child(div().size(px(16.)).rounded_full().bg(theme::color(theme::UI_TEXT)))
+            .child(div().size(px(16.)).rounded_full().bg(theme::color(if on { theme::palette().on_accent } else { theme::palette().ui_text })))
     }
 
     /// All choices stay visible, so one click is enough to change them.
@@ -5014,7 +5178,9 @@ impl Workspace {
             .p(px(2.))
             .gap(px(2.))
             .rounded(px(6.))
-            .bg(theme::color(theme::BG))
+            .bg(theme::color(theme::palette().bg))
+            .border_1()
+            .border_color(theme::color(theme::palette().divider))
             .children(options.into_iter().enumerate().map(|(index, (label, selected, handler))| {
                 div()
                     .id((id, index))
@@ -5022,8 +5188,14 @@ impl Workspace {
                     .py(px(3.))
                     .rounded(px(4.))
                     .cursor_pointer()
-                    .when(selected, |style| style.bg(theme::color(theme::GREEN_DARK)).font_weight(FontWeight::SEMIBOLD))
-                    .when(!selected, |style| style.hover(|style| style.bg(theme::color(theme::DIVIDER))))
+                    // The accent, so that the choice shows in any theme.
+                    .when(selected, |style| {
+                        style
+                            .bg(theme::color(theme::palette().accent))
+                            .text_color(theme::color(theme::palette().on_accent))
+                            .font_weight(FontWeight::SEMIBOLD)
+                    })
+                    .when(!selected, |style| style.hover(|style| style.bg(theme::color(theme::palette().divider))))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         handler(this, window, cx);
                         cx.notify();
@@ -5048,7 +5220,7 @@ impl Workspace {
                     .min_w_0()
                     .gap(px(2.))
                     .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
-                    .child(div().text_color(theme::color(theme::UI_MUTED)).child(description.into())),
+                    .child(div().text_color(theme::color(theme::palette().ui_muted)).child(description.into())),
             )
             .child(control)
     }
@@ -5063,6 +5235,24 @@ impl Workspace {
                 "Keybindings",
                 "Vim adds modes, Space commands, a status bar and keyboard control of the file tree.",
                 self.segmented("keybindings", vec![("None", !vim_on, handler(false)), ("Vim", vim_on, handler(true))], cx),
+            )
+            .into_any_element(),
+            Self::setting_row(
+                "Theme",
+                "Any colorscheme installed in Neovim. Moving through the list previews it.",
+                div()
+                    .id("theme-setting")
+                    .flex_none()
+                    .px(px(8.))
+                    .py(px(3.))
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .bg(theme::color(theme::palette().divider))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.close_dialog(window, cx);
+                        this.open_theme_picker(window, cx);
+                    }))
+                    .child(self.settings.theme.clone().unwrap_or_else(|| theme::DEFAULT_THEME.to_string())),
             )
             .into_any_element(),
             Self::setting_row(
@@ -5115,7 +5305,7 @@ impl Workspace {
             .rounded(px(4.))
             .cursor_pointer()
             .font_weight(FontWeight::SEMIBOLD)
-            .bg(theme::color(theme::GREEN_DARK))
+            .bg(theme::color(theme::palette().accent_soft))
             .on_click(cx.listener(move |this, _, _, cx| this.install_from_catalog(entry.clone(), cx)))
             .child(if busy { "Downloading…".to_string() } else { label })
     }
@@ -5138,13 +5328,13 @@ impl Workspace {
                     .gap(px(4.))
                     .py(px(10.))
                     .border_t_1()
-                    .border_color(theme::color(theme::PANEL))
+                    .border_color(theme::color(theme::palette().panel))
                     .child(div().font_weight(FontWeight::SEMIBOLD).child(format!("{} {}", manifest.name, manifest.version)))
-                    .child(div().text_color(theme::color(theme::UI_MUTED)).child(format!("By {}", manifest.author)))
+                    .child(div().text_color(theme::color(theme::palette().ui_muted)).child(format!("By {}", manifest.author)))
                     .when(!manifest.description.is_empty(), |element| {
-                        element.child(div().text_color(theme::color(theme::UI_MUTED)).child(manifest.description.clone()))
+                        element.child(div().text_color(theme::color(theme::palette().ui_muted)).child(manifest.description.clone()))
                     })
-                    .child(div().text_color(theme::color(theme::UI_MUTED)).child(marketplace::permission_text(&manifest.permissions)))
+                    .child(div().text_color(theme::color(theme::palette().ui_muted)).child(marketplace::permission_text(&manifest.permissions)))
                     .child(
                         div()
                             .flex()
@@ -5159,7 +5349,7 @@ impl Workspace {
                                     .rounded(px(4.))
                                     .cursor_pointer()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .bg(theme::color(if enabled { theme::GREEN_DARK } else { theme::DIVIDER }))
+                                    .bg(theme::color(if enabled { theme::palette().accent_soft } else { theme::palette().divider }))
                                     .on_click(cx.listener(move |this, _, _, cx| this.set_addon_enabled(&for_toggle, !enabled, cx)))
                                     .child(if enabled { "On" } else { "Off" }),
                             )
@@ -5171,7 +5361,7 @@ impl Workspace {
                                     .py(px(3.))
                                     .rounded(px(4.))
                                     .cursor_pointer()
-                                    .bg(theme::color(theme::DIVIDER))
+                                    .bg(theme::color(theme::palette().divider))
                                     .on_click(cx.listener(move |this, _, _, cx| this.remove_addon(&for_remove, cx)))
                                     .child("Remove"),
                             )
@@ -5195,11 +5385,11 @@ impl Workspace {
                     .gap(px(4.))
                     .py(px(10.))
                     .border_t_1()
-                    .border_color(theme::color(theme::PANEL))
+                    .border_color(theme::color(theme::palette().panel))
                     .child(div().font_weight(FontWeight::SEMIBOLD).child(format!("{} {}", entry.name, entry.version)))
-                    .child(div().text_color(theme::color(theme::UI_MUTED)).child(format!("By {}", entry.author)))
-                    .child(div().text_color(theme::color(theme::UI_MUTED)).child(entry.description.clone()))
-                    .child(div().text_color(theme::color(theme::UI_MUTED)).child(entry.permission_text()))
+                    .child(div().text_color(theme::color(theme::palette().ui_muted)).child(format!("By {}", entry.author)))
+                    .child(div().text_color(theme::color(theme::palette().ui_muted)).child(entry.description.clone()))
+                    .child(div().text_color(theme::color(theme::palette().ui_muted)).child(entry.permission_text()))
                     .child(div().flex().pt(px(4.)).child(self.catalog_button(("addon-install", index), "Install".to_string(), entry.clone(), cx)))
                     .into_any_element()
             })
@@ -5224,7 +5414,7 @@ impl Workspace {
             .child(
                 div()
                     .flex_none()
-                    .text_color(theme::color(theme::UI_MUTED))
+                    .text_color(theme::color(theme::palette().ui_muted))
                     .child("Add-ons run with your user rights and have no sandbox, so turn on only those you trust. Permissions limit their requests to the editor, not the program itself."),
             )
             .child(
@@ -5248,7 +5438,7 @@ impl Workspace {
             .child(
                 div()
                     .flex_none()
-                    .text_color(theme::color(theme::UI_MUTED))
+                    .text_color(theme::color(theme::palette().ui_muted))
                     .child("Downloads come from the repository sudo-Oliver/editor-addons. A checksum protects the download but does not say who wrote it, so installing means trusting that repository."),
             )
             .children(catalog_note.map(|note| div().flex_none().child(note)))
@@ -5330,7 +5520,7 @@ impl Workspace {
                                     .flex_none()
                                     .font_family(theme::CODE_FONT)
                                     .text_size(px(theme::CODE_FONT_SIZE))
-                                    .text_color(theme::color(theme::CYAN))
+                                    .text_color(theme::color(theme::palette().function))
                                     .child(keys),
                             )
                             .child(div().flex_1().min_w_0().child(label))
@@ -5342,7 +5532,7 @@ impl Workspace {
             elements.push(
                 div()
                     .flex_none()
-                    .text_color(theme::color(theme::UI_MUTED))
+                    .text_color(theme::color(theme::palette().ui_muted))
                     .child("Coming from Vim? Turn on the Vim keybindings in the settings.")
                     .into_any_element(),
             );
@@ -5360,8 +5550,8 @@ impl Workspace {
             .px(px(10.))
             .rounded(px(4.))
             .cursor_pointer()
-            .when(page == current, |style| style.bg(theme::color(theme::GREEN_DARK)).font_weight(FontWeight::SEMIBOLD))
-            .when(page != current, |style| style.hover(|style| style.bg(theme::color(theme::DIVIDER))))
+            .when(page == current, |style| style.bg(theme::color(theme::palette().accent_soft)).font_weight(FontWeight::SEMIBOLD))
+            .when(page != current, |style| style.hover(|style| style.bg(theme::color(theme::palette().divider))))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.dialog = Some(Dialog::Settings(page));
                 cx.notify();
@@ -5404,9 +5594,9 @@ impl Workspace {
                     .h(px(DIALOG_HEIGHT))
                     .max_h(gpui::relative(0.9))
                     .rounded(px(6.))
-                    .bg(theme::color(theme::PANEL))
+                    .bg(theme::color(theme::palette().panel))
                     .border_1()
-                    .border_color(theme::color(theme::DIVIDER))
+                    .border_color(theme::color(theme::palette().divider))
                     .shadow_lg()
                     .child(
                         div()
@@ -5417,7 +5607,7 @@ impl Workspace {
                             .h(px(52.))
                             .px(px(16.))
                             .border_b_1()
-                            .border_color(theme::color(theme::DIVIDER))
+                            .border_color(theme::color(theme::palette().divider))
                             .child(div().text_size(px(17.)).font_weight(FontWeight::SEMIBOLD).child(title))
                             .child(self.icon_button("dialog-close", "close", cx, |this, window, cx| {
                                 this.close_dialog(window, cx);
@@ -5443,7 +5633,7 @@ impl Workspace {
                                             .gap(px(2.))
                                             .p(px(6.))
                                             .border_r_1()
-                                            .border_color(theme::color(theme::DIVIDER))
+                                            .border_color(theme::color(theme::palette().divider))
                                             .child(self.settings_tab(SettingsPage::Editor, page, "Editor", cx))
                                             .child(self.settings_tab(SettingsPage::Compiler, page, "Compiler", cx)),
                                     )
@@ -5472,6 +5662,7 @@ impl Workspace {
             PickerKind::Figures => "Insert figure",
             PickerKind::Citations => "Insert citation",
             PickerKind::Branches => "Switch branch",
+            PickerKind::Themes => "Select theme",
         };
         let empty = match (picker.kind, picker.query.is_empty()) {
             (PickerKind::Text, true) => "Type to search the project.",
@@ -5503,9 +5694,9 @@ impl Workspace {
                     .h(px(PICKER_HEIGHT))
                     .max_h(gpui::relative(0.8))
                     .rounded(px(6.))
-                    .bg(theme::color(theme::PANEL))
+                    .bg(theme::color(theme::palette().panel))
                     .border_1()
-                    .border_color(theme::color(theme::DIVIDER))
+                    .border_color(theme::color(theme::palette().divider))
                     .shadow_lg()
                     .child(
                         div()
@@ -5516,15 +5707,15 @@ impl Workspace {
                             .h(px(36.))
                             .px(px(12.))
                             .border_b_1()
-                            .border_color(theme::color(theme::DIVIDER))
-                            .child(div().flex_none().text_color(theme::color(theme::UI_MUTED)).child(title))
+                            .border_color(theme::color(theme::palette().divider))
+                            .child(div().flex_none().text_color(theme::color(theme::palette().ui_muted)).child(title))
                             .child(
                                 div()
                                     .flex()
                                     .items_center()
                                     .font_family(theme::CODE_FONT)
                                     .child(picker.query.clone())
-                                    .child(div().w(px(1.5)).h(px(15.)).bg(theme::color(theme::CARET))),
+                                    .child(div().w(px(1.5)).h(px(15.)).bg(theme::color(theme::palette().focus))),
                             ),
                     )
                     .child(
@@ -5535,24 +5726,54 @@ impl Workspace {
                             .overflow_y_scroll()
                             .track_scroll(&self.picker_scroll)
                             .when(picker.items.is_empty(), |element| {
-                                element.child(div().p(px(12.)).text_color(theme::color(theme::UI_MUTED)).child(empty))
+                                element.child(div().p(px(12.)).text_color(theme::color(theme::palette().ui_muted)).child(empty))
                             })
                             .children(picker.items.iter().enumerate().map(|(index, item)| {
                                 let location = match item.position {
                                     Some((line, _)) => format!("{}:{}", item.label, line + 1),
                                     None => item.label.clone(),
                                 };
-                                div()
+                                let row = div()
                                     .id(("picker-item", index))
-                                    .flex()
+                                    .px(px(12.))
+                                    .cursor_pointer()
+                                    .when(index == picker.selected, |style| style.bg(theme::color(theme::palette().accent_soft)))
+                                    .when(index != picker.selected, |style| style.hover(|style| style.bg(theme::color(theme::palette().divider))))
+                                    .on_click(cx.listener(move |this, _, window, cx| this.accept_picker(index, window, cx)));
+                                let muted = theme::color(theme::palette().ui_muted);
+                                // A citation: who and when above the key, then title and venue.
+                                if let Some(summary) = item.summary.clone() {
+                                    return row
+                                        .flex()
+                                        .flex_col()
+                                        .justify_center()
+                                        .h(px(44.))
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(12.))
+                                                .child(div().flex_1().min_w_0().truncate().font_weight(FontWeight::SEMIBOLD).child(summary))
+                                                .child(
+                                                    div()
+                                                        .flex_none()
+                                                        .max_w(px(220.))
+                                                        .truncate()
+                                                        .font_family(theme::CODE_FONT)
+                                                        .text_size(px(theme::CODE_FONT_SIZE))
+                                                        .text_color(muted)
+                                                        .child(location),
+                                                ),
+                                        )
+                                        .when_some(item.detail.clone(), |element, detail| {
+                                            element.child(div().truncate().text_color(muted).child(detail))
+                                        })
+                                        .into_any_element();
+                                }
+                                row.flex()
                                     .items_center()
                                     .gap(px(12.))
                                     .h(px(26.))
-                                    .px(px(12.))
-                                    .cursor_pointer()
-                                    .when(index == picker.selected, |style| style.bg(theme::color(theme::GREEN_DARK)))
-                                    .when(index != picker.selected, |style| style.hover(|style| style.bg(theme::color(theme::DIVIDER))))
-                                    .on_click(cx.listener(move |this, _, window, cx| this.accept_picker(index, window, cx)))
                                     .child(div().flex_none().max_w(px(320.)).truncate().child(location))
                                     .when_some(item.detail.clone(), |element, detail| {
                                         element.child(
@@ -5562,10 +5783,11 @@ impl Workspace {
                                                 .truncate()
                                                 .font_family(theme::CODE_FONT)
                                                 .text_size(px(theme::CODE_FONT_SIZE))
-                                                .text_color(theme::color(theme::UI_MUTED))
+                                                .text_color(muted)
                                                 .child(detail),
                                         )
                                     })
+                                    .into_any_element()
                             })),
                     ),
             )
@@ -5591,7 +5813,7 @@ impl Workspace {
             .flex_none()
             .w(self.preview_width)
             .h_full()
-            .bg(theme::color(theme::PANEL))
+            .bg(theme::color(theme::palette().panel))
             .child(self.render_preview_toolbar(cx))
             .child(div().flex_1().min_h_0().child(body))
     }
@@ -5689,8 +5911,8 @@ impl Render for Workspace {
             .flex()
             .flex_col()
             .size_full()
-            .bg(theme::color(theme::BG))
-            .text_color(theme::color(theme::UI_TEXT))
+            .bg(theme::color(theme::palette().bg))
+            .text_color(theme::color(theme::palette().ui_text))
             .text_size(px(theme::UI_FONT_SIZE))
             .when(dragging.is_some(), |style| {
                 style.cursor(match dragging {

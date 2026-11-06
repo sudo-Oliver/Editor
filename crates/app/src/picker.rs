@@ -1,4 +1,4 @@
-//! The search overlay for `Space f` and `Space g`. Text search reads the files
+//! The search overlay for `Space f`, `Space g` and `Space tc`. Text search reads the files
 //! on disk, so unsaved edits do not count.
 
 use std::{
@@ -11,6 +11,8 @@ use std::{
 
 use editor_core::vim::find_literal;
 use gpui::Task;
+
+use crate::{bib, nvim_themes::Themes, theme};
 
 const MAX_RESULTS: usize = 200;
 const MAX_SEARCHED_FILE_BYTES: u64 = 4 << 20;
@@ -27,6 +29,8 @@ pub enum PickerKind {
     Citations,
     /// Branches to switch to, or a new one by the name typed.
     Branches,
+    /// Neovim colorschemes, shown while moving through them.
+    Themes,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,6 +40,8 @@ pub struct PickerItem {
     pub label: String,
     /// Zero-based line and byte column of a text hit.
     pub position: Option<(usize, usize)>,
+    /// A line above the detail, such as the authors and year of a citation.
+    pub summary: Option<String>,
     pub detail: Option<String>,
 }
 
@@ -51,6 +57,9 @@ pub struct Picker {
     /// Set to stop the running text search when the query changes.
     pub cancel: Arc<AtomicBool>,
     pub task: Option<Task<()>>,
+    pub themes: Arc<Themes>,
+    /// The palette to restore when the theme picker closes without a choice.
+    pub original: Option<theme::Palette>,
 }
 
 pub fn relative_label(path: &Path, root: &Path) -> String {
@@ -64,28 +73,11 @@ pub fn match_files(files: &[PathBuf], root: &Path, query: &str) -> Vec<PickerIte
         .filter_map(|path| {
             let label = relative_label(path, root);
             let score = fuzzy_score(query, &label)?;
-            Some((score, PickerItem { path: path.clone(), label, position: None, detail: None }))
+            Some((score, PickerItem { path: path.clone(), label, position: None, summary: None, detail: None }))
         })
         .collect();
     scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.label.cmp(&right.1.label)));
     scored.into_iter().take(MAX_RESULTS).map(|(_, item)| item).collect()
-}
-
-/// The entries of the `.bib` files. `label` is the key, `detail` the title.
-pub fn read_citations(files: &[PathBuf]) -> Vec<PickerItem> {
-    let mut items = Vec::new();
-    for path in files {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        items.extend(parse_bib(&text).into_iter().map(|(label, title)| PickerItem {
-            path: path.clone(),
-            label,
-            position: None,
-            detail: title,
-        }));
-    }
-    items
 }
 
 /// Adds what add-ons offer to the `.bib` entries. A key in both keeps its place
@@ -94,36 +86,15 @@ pub fn merge_citations(mut items: Vec<PickerItem>, offered: Vec<(String, String)
     for (key, detail) in offered {
         match items.iter_mut().find(|item| item.label == key) {
             Some(item) => item.detail = Some(detail),
-            None => items.push(PickerItem { path: PathBuf::new(), label: key, position: None, detail: Some(detail) }),
+            None => items.push(PickerItem { path: PathBuf::new(), label: key, position: None, summary: None, detail: Some(detail) }),
         }
     }
     items
 }
 
-/// Reads keys and titles line by line, which fits how `.bib` files are written.
-fn parse_bib(text: &str) -> Vec<(String, Option<String>)> {
-    let mut entries: Vec<(String, Option<String>)> = Vec::new();
-    for line in text.lines().map(str::trim) {
-        if let Some((kind, rest)) = line.strip_prefix('@').and_then(|rest| rest.split_once(['{', '('])) {
-            let kind = kind.trim().to_ascii_lowercase();
-            let key = rest.split(',').next().unwrap_or_default().trim();
-            if !key.is_empty() && !matches!(kind.as_str(), "comment" | "string" | "preamble") {
-                entries.push((key.to_string(), None));
-            }
-        } else if let Some((name, value)) = line.split_once('=')
-            && name.trim().eq_ignore_ascii_case("title")
-            && let Some((_, title)) = entries.last_mut()
-        {
-            let value = value.trim().trim_end_matches(',').replace(['{', '}', '"'], "");
-            *title = Some(value.trim().to_string());
-        }
-    }
-    entries
-}
-
 /// The branches as picker items.
 pub fn branch_items(branches: Vec<String>) -> Vec<PickerItem> {
-    branches.into_iter().map(|label| PickerItem { path: PathBuf::new(), label, position: None, detail: None }).collect()
+    branches.into_iter().map(|label| PickerItem { path: PathBuf::new(), label, position: None, summary: None, detail: None }).collect()
 }
 
 /// Branches that match `query`, then the offer to create one by that name.
@@ -135,10 +106,40 @@ pub fn match_branches(branches: &[PickerItem], query: &str) -> Vec<PickerItem> {
             path: PathBuf::new(),
             label: query.to_string(),
             position: None,
+            summary: None,
             detail: Some(CREATE_BRANCH.to_string()),
         });
     }
     items
+}
+
+/// The built-in themes first, then the Neovim ones by name.
+pub fn theme_items(themes: &Themes) -> Vec<PickerItem> {
+    let item = |label: &str, detail: Option<&str>| PickerItem {
+        path: PathBuf::new(),
+        label: label.to_string(),
+        position: None,
+        summary: None,
+        detail: detail.map(str::to_string),
+    };
+    theme::BUILT_IN
+        .iter()
+        .map(|(name, _)| item(name, Some("Built-in")))
+        .chain(themes.keys().map(|name| item(name, None)))
+        .collect()
+}
+
+/// The labels of the documents, which `@` in Typst cites like `.bib` entries.
+pub fn label_items(labels: Vec<String>) -> Vec<PickerItem> {
+    labels
+        .into_iter()
+        .map(|label| PickerItem { path: PathBuf::new(), label, position: None, summary: None, detail: Some("Label".to_string()) })
+        .collect()
+}
+
+/// Entries keep their order until the query asks for something.
+pub fn match_in_order(entries: &[PickerItem], query: &str) -> Vec<PickerItem> {
+    if query.trim().is_empty() { entries.to_vec() } else { match_entries(entries, query) }
 }
 
 /// Entries that match `query` in the label or detail, best first.
@@ -146,7 +147,12 @@ pub fn match_entries(entries: &[PickerItem], query: &str) -> Vec<PickerItem> {
     let mut scored: Vec<(i64, &PickerItem)> = entries
         .iter()
         .filter_map(|item| {
-            let text = format!("{} {}", item.label, item.detail.as_deref().unwrap_or_default());
+            let text = bib::fold(&format!(
+                "{} {} {}",
+                item.label,
+                item.summary.as_deref().unwrap_or_default(),
+                item.detail.as_deref().unwrap_or_default()
+            ));
             Some((fuzzy_score(query, &text)?, item))
         })
         .collect();
@@ -155,26 +161,42 @@ pub fn match_entries(entries: &[PickerItem], query: &str) -> Vec<PickerItem> {
 }
 
 /// Rates a subsequence match. Runs of letters and starts of names count more.
+/// It walks the candidate once and allocates nothing, since the file picker and
+/// the suggestions call it for every entry on every key.
 pub fn fuzzy_score(query: &str, candidate: &str) -> Option<i64> {
     let mut score = 0i64;
     let mut previous: Option<usize> = None;
-    let chars: Vec<char> = candidate.chars().collect();
-    let mut position = 0;
+    let mut chars = candidate.chars();
+    // The index of the next char of `chars`, and the char before it.
+    let (mut index, mut before) = (0usize, None);
     for wanted in query.chars().filter(|ch| !ch.is_whitespace()) {
-        let wanted = wanted.to_lowercase().next().unwrap_or(wanted);
-        let found = (position..chars.len()).find(|index| chars[*index].to_lowercase().next() == Some(wanted))?;
-        score += 1;
-        if previous.is_some_and(|previous| previous + 1 == found) {
-            score += 8;
+        let wanted = lower(wanted);
+        loop {
+            let ch = chars.next()?;
+            let (found, prior) = (index, before);
+            index += 1;
+            before = Some(ch);
+            if lower(ch) != wanted {
+                continue;
+            }
+            score += 1;
+            if previous.is_some_and(|previous| previous + 1 == found) {
+                score += 8;
+            }
+            if prior.is_none_or(|prior| matches!(prior, '/' | '\\' | '_' | '-' | ' ' | '.')) {
+                score += 6;
+            }
+            previous = Some(found);
+            break;
         }
-        if found == 0 || matches!(chars[found - 1], '/' | '\\' | '_' | '-' | ' ' | '.') {
-            score += 6;
-        }
-        previous = Some(found);
-        position = found + 1;
     }
     // Among equal matches, shorter paths win.
-    Some(score * 16 - chars.len() as i64)
+    Some(score * 16 - (index + chars.count()) as i64)
+}
+
+/// The first char of the lowercase form, with a fast path for ASCII.
+fn lower(ch: char) -> char {
+    if ch.is_ascii() { ch.to_ascii_lowercase() } else { ch.to_lowercase().next().unwrap_or(ch) }
 }
 
 /// Finds literal text in the given files. Stops early when `cancel` is set.
@@ -203,6 +225,7 @@ pub fn search_text(files: &[PathBuf], root: &Path, query: &str, cancel: &AtomicB
                 path: path.clone(),
                 label: label.clone(),
                 position: Some((line, hit.start)),
+                summary: None,
                 detail: Some(content.trim().to_string()),
             });
             if items.len() >= MAX_RESULTS {
@@ -219,12 +242,45 @@ mod tests {
 
     #[test]
     fn offered_citations_join_the_bib_entries_without_doubles() {
-        let bib = PickerItem { path: PathBuf::from("a.bib"), label: "a".to_string(), position: None, detail: Some("Title".to_string()) };
+        let bib = PickerItem { path: PathBuf::from("a.bib"), label: "a".to_string(), position: None, summary: None, detail: Some("Title".to_string()) };
         let merged = merge_citations(vec![bib], vec![("a".to_string(), "Ada 2024".to_string()), ("b".to_string(), "Bob".to_string())]);
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].path, PathBuf::from("a.bib"));
         assert_eq!(merged[0].detail.as_deref(), Some("Ada 2024"));
         assert_eq!(merged[1].label, "b");
+    }
+
+    /// The first version, which collected the chars, as the reference.
+    fn reference_score(query: &str, candidate: &str) -> Option<i64> {
+        let mut score = 0i64;
+        let mut previous: Option<usize> = None;
+        let chars: Vec<char> = candidate.chars().collect();
+        let mut position = 0;
+        for wanted in query.chars().filter(|ch| !ch.is_whitespace()) {
+            let wanted = wanted.to_lowercase().next().unwrap_or(wanted);
+            let found = (position..chars.len()).find(|index| chars[*index].to_lowercase().next() == Some(wanted))?;
+            score += 1;
+            if previous.is_some_and(|previous| previous + 1 == found) {
+                score += 8;
+            }
+            if found == 0 || matches!(chars[found - 1], '/' | '\\' | '_' | '-' | ' ' | '.') {
+                score += 6;
+            }
+            previous = Some(found);
+            position = found + 1;
+        }
+        Some(score * 16 - chars.len() as i64)
+    }
+
+    #[test]
+    fn fuzzy_scores_match_the_reference() {
+        let candidates = ["", "a", "\\citep", "\\citep*", "src/lang_notes.typ", "Müller et al. 2024a", "ÄÖÜ äöü", "a_b-c.d/e f", "aaaa", "\\section*{x}"];
+        let queries = ["", "a", "ab", "\\c", "\\cit", "cite", "MÜ", "ü", "aa", "aaaaa", "l n", "sec", "x}", "zz"];
+        for candidate in candidates {
+            for query in queries {
+                assert_eq!(fuzzy_score(query, candidate), reference_score(query, candidate), "{query:?} in {candidate:?}");
+            }
+        }
     }
 
     #[test]
@@ -277,25 +333,27 @@ mod tests {
     }
 
     #[test]
-    fn bib_entries_give_key_and_title() {
-        let text = "@comment{skip,}\n@string{a = \"b\"}\n@article{one,\n  booktitle = {No},\n  TITLE = \"The {C}omprehensive\",\n}\n@book{two, year = 1}\n";
-        assert_eq!(
-            parse_bib(text),
-            vec![("one".to_string(), Some("The Comprehensive".to_string())), ("two".to_string(), None)]
-        );
-    }
-
-    #[test]
     fn citations_match_key_and_title() {
         let item = |label: &str, title: &str| PickerItem {
             path: PathBuf::new(),
             label: label.to_string(),
             position: None,
+            summary: None,
             detail: Some(title.to_string()),
         };
         let citations = [item("knuth", "Art"), item("greenwade", "Network")];
         assert_eq!(match_entries(&citations, "network")[0].label, "greenwade");
         assert_eq!(match_entries(&citations, "kn")[0].label, "knuth");
+    }
+
+    #[test]
+    fn themes_list_the_built_in_one_first() {
+        let palette = theme::Palette::OVERLEAF_DARK;
+        let themes = Themes::from([("vesper".to_string(), palette), ("koda".to_string(), palette)]);
+        let items = theme_items(&themes);
+        let labels: Vec<String> = match_in_order(&items, "").into_iter().map(|item| item.label).collect();
+        assert_eq!(labels, ["overleaf-dark", "overleaf-light", "koda", "vesper"]);
+        assert_eq!(match_in_order(&items, "ves")[0].label, "vesper");
     }
 
     #[test]
