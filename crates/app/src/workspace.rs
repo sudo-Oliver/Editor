@@ -64,6 +64,10 @@ const TAB_SLANT: f32 = 12.0;
 const TAB_GAP: f32 = 1.5;
 const TAB_HEIGHT: f32 = 32.0;
 const TOOLBAR_HEIGHT: f32 = 32.0;
+const BREADCRUMB_HEIGHT: f32 = 24.0;
+/// The editor in focus mode stays this wide, for lines that read well.
+const FOCUS_WIDTH: f32 = 860.0;
+const LAYOUT_SHORTCUTS: [&str; 4] = ["⌃⌘↓", "⌃⌘←", "⌃⌘→", "⌃⌘↑"];
 const SYMBOL_CELL: f32 = 32.0;
 const SYMBOL_COLUMNS: f32 = 11.0;
 const TABLE_GRID: usize = 8;
@@ -124,6 +128,27 @@ enum Menu {
     Symbols,
     Table,
 }
+
+/// How the editor and the PDF share the window.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PaneLayout {
+    Split,
+    EditorOnly,
+    PdfOnly,
+    /// The PDF is a tab among the documents.
+    PdfTab,
+}
+
+struct PresentState {
+    /// Leaving the talk leaves full screen only when the talk entered it.
+    entered_fullscreen: bool,
+    /// The exit button shows while the mouse moves, and not over the slides otherwise.
+    controls_shown: bool,
+    hide_controls_task: Option<Task<()>>,
+}
+
+/// How long the exit button of a talk stays after the mouse stops.
+const PRESENT_CONTROLS_TIME: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsPage {
@@ -277,6 +302,7 @@ struct ImagePreview {
 enum Tab {
     Document(usize),
     Image(usize),
+    Pdf,
 }
 
 /// The tabs from left to right. `image_after` is sorted, as images only join at the end.
@@ -292,6 +318,21 @@ fn tab_order(documents: usize, image_after: &[usize]) -> Vec<Tab> {
         }
     }
     tabs
+}
+
+/// The headings that hold a line, from the outermost in. `line` is zero-based.
+fn heading_trail(items: &[OutlineItem], line: usize) -> Vec<usize> {
+    let mut trail: Vec<usize> = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        if item.line > line {
+            break;
+        }
+        while trail.last().is_some_and(|&last| items[last].depth >= item.depth) {
+            trail.pop();
+        }
+        trail.push(index);
+    }
+    trail
 }
 
 /// Which tab a click in the box of a tab belongs to, as an offset to that tab: -1, 0
@@ -352,7 +393,11 @@ pub struct Workspace {
     tracked_edits: HashMap<String, TrackedEdits>,
     /// Add-on requests that wait for the running build to end.
     compile_waiters: Vec<(Entity<AddonPanel>, u64)>,
-    show_preview: bool,
+    layout: PaneLayout,
+    /// The PDF tab is the one on screen.
+    pdf_tab_shown: bool,
+    focus_mode: bool,
+    presenting: Option<PresentState>,
     show_logs: bool,
     show_outline: bool,
     file_panel_width: Pixels,
@@ -515,7 +560,10 @@ impl Workspace {
             installing: None,
             tracked_edits: HashMap::new(),
             compile_waiters: Vec::new(),
-            show_preview: true,
+            layout: PaneLayout::Split,
+            pdf_tab_shown: false,
+            focus_mode: false,
+            presenting: None,
             show_logs: false,
             show_outline: true,
             file_panel_width: px(217.5),
@@ -831,6 +879,7 @@ impl Workspace {
 
     fn show_image(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.shown_image = Some(index);
+        self.pdf_tab_shown = false;
         let focus = self.images[index].view.read(cx).focus_handle().clone();
         window.focus(&focus, cx);
         cx.notify();
@@ -842,10 +891,17 @@ impl Workspace {
 
     fn tabs(&self) -> Vec<Tab> {
         let after: Vec<usize> = self.images.iter().map(|image| image.after).collect();
-        tab_order(self.documents.len(), &after)
+        let mut tabs = tab_order(self.documents.len(), &after);
+        if self.layout == PaneLayout::PdfTab {
+            tabs.push(Tab::Pdf);
+        }
+        tabs
     }
 
     fn active_tab(&self) -> Option<Tab> {
+        if self.pdf_tab_shown {
+            return Some(Tab::Pdf);
+        }
         self.shown_image.map(Tab::Image).or(self.active.map(Tab::Document))
     }
 
@@ -853,6 +909,11 @@ impl Workspace {
         match tab {
             Tab::Document(index) => self.activate(index, window, cx),
             Tab::Image(index) => self.show_image(index, window, cx),
+            Tab::Pdf => {
+                self.pdf_tab_shown = true;
+                self.focus_main(window, cx);
+                cx.notify();
+            }
         }
     }
 
@@ -860,6 +921,7 @@ impl Workspace {
         match tab {
             Tab::Document(index) => self.close_document(index, window, cx),
             Tab::Image(index) => self.close_image(index, window, cx),
+            Tab::Pdf => self.set_layout(PaneLayout::Split, window, cx),
         }
     }
 
@@ -871,6 +933,10 @@ impl Workspace {
 
     /// A click on the close button of another tab must not take the keys away.
     fn focus_shown_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pdf_tab_shown {
+            window.focus(&self.pdf.read(cx).focus_handle(), cx);
+            return;
+        }
         match self.image_preview().map(|image| image.view.read(cx).focus_handle().clone()) {
             Some(focus) => window.focus(&focus, cx),
             None => self.focus_active(window, cx),
@@ -911,6 +977,7 @@ impl Workspace {
 
     fn activate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.shown_image = None;
+        self.pdf_tab_shown = false;
         self.follow_line = None;
         self.active = Some(index);
         let view = self.documents[index].view.clone();
@@ -2137,6 +2204,125 @@ impl Workspace {
         cx.notify();
     }
 
+    fn reveal_in_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(path) = self.active_view().and_then(|view| view.read(cx).path.clone()) {
+            for ancestor in path.ancestors().skip(1) {
+                self.collapsed.remove(ancestor);
+            }
+            self.refresh_from_disk(cx);
+        }
+        self.focus_tree(window, cx);
+    }
+
+    // Layout
+
+    /// The PDF fills the place of the editor.
+    fn pdf_is_main(&self) -> bool {
+        !self.focus_mode && (self.layout == PaneLayout::PdfOnly || (self.layout == PaneLayout::PdfTab && self.pdf_tab_shown))
+    }
+
+    fn focus_main(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.presenting.is_some() || self.pdf_is_main() {
+            window.focus(&self.pdf.read(cx).focus_handle(), cx);
+        } else {
+            self.focus_shown_tab(window, cx);
+        }
+    }
+
+    fn set_layout(&mut self, layout: PaneLayout, window: &mut Window, cx: &mut Context<Self>) {
+        self.layout = layout;
+        self.pdf_tab_shown = layout == PaneLayout::PdfTab;
+        self.focus_mode = false;
+        self.focus_main(window, cx);
+        cx.notify();
+    }
+
+    /// Hides or shows the PDF next to the editor, as `Space p` always did.
+    fn toggle_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let layout = if self.layout == PaneLayout::EditorOnly { PaneLayout::Split } else { PaneLayout::EditorOnly };
+        self.set_layout(layout, window, cx);
+    }
+
+    fn toggle_focus_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_mode = !self.focus_mode;
+        self.focus_main(window, cx);
+        cx.notify();
+    }
+
+    fn start_presentation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.presenting.is_some() {
+            return;
+        }
+        if !self.pdf.read(cx).has_document() {
+            self.set_status("No PDF to present yet. Compile first.", cx);
+            return;
+        }
+        let entered_fullscreen = !window.is_fullscreen();
+        if entered_fullscreen {
+            window.toggle_fullscreen();
+        }
+        self.presenting = Some(PresentState { entered_fullscreen, controls_shown: false, hide_controls_task: None });
+        self.pdf.update(cx, |pdf, cx| pdf.set_presenting(true, cx));
+        self.focus_main(window, cx);
+        cx.notify();
+    }
+
+    fn exit_presentation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.presenting.take() else {
+            return;
+        };
+        if state.entered_fullscreen && window.is_fullscreen() {
+            window.toggle_fullscreen();
+        }
+        self.pdf.update(cx, |pdf, cx| pdf.set_presenting(false, cx));
+        self.focus_main(window, cx);
+        cx.notify();
+    }
+
+    /// A visible way out of focus and presentation mode, for those who do not use shortcuts.
+    fn exit_button(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        on_dark: bool,
+        cx: &mut Context<Self>,
+        handler: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> impl IntoElement {
+        let palette = theme::palette();
+        let (background, text): (gpui::Hsla, u32) =
+            if on_dark { (gpui::rgba(0x2b2b2bdd).into(), 0xffffff) } else { (theme::color(palette.divider), palette.ui_text) };
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .px(px(10.))
+            .py(px(4.))
+            .rounded(px(4.))
+            .cursor_pointer()
+            .bg(background)
+            .text_color(theme::color(text))
+            .hover(|style| style.bg(theme::color(palette.accent_soft)))
+            .on_click(cx.listener(move |this, _, window, cx| handler(this, window, cx)))
+            .child(Self::icon("close", 12., text))
+            .child(label)
+    }
+
+    fn show_tab_bar(&self) -> bool {
+        self.settings.show_tabs && !self.focus_mode
+    }
+
+    fn show_breadcrumbs(&self) -> bool {
+        self.settings.show_breadcrumbs && !self.focus_mode
+    }
+
+    /// Where the bar above the editor body ends, for popups that open below it.
+    fn editor_toolbar_bottom(&self, toolbar: f32) -> f32 {
+        let tabs = if self.show_tab_bar() { TAB_BAR_HEIGHT } else { 0. };
+        let breadcrumbs = if self.show_breadcrumbs() { BREADCRUMB_HEIGHT } else { 0. };
+        TOP_BAR_HEIGHT + tabs + breadcrumbs + toolbar
+    }
+
     fn focus_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(view) = self.active_view() {
             window.focus(&view.read(cx).focus_handle(cx), cx);
@@ -2277,16 +2463,8 @@ impl Workspace {
                     self.focus_tree(window, cx);
                 }
             }
-            Effect::RevealInTree => {
-                if let Some(path) = self.active_view().and_then(|view| view.read(cx).path.clone()) {
-                    for ancestor in path.ancestors().skip(1) {
-                        self.collapsed.remove(ancestor);
-                    }
-                    self.refresh_from_disk(cx);
-                }
-                self.focus_tree(window, cx);
-            }
-            Effect::TogglePreview => self.show_preview = !self.show_preview,
+            Effect::RevealInTree => self.reveal_in_tree(window, cx),
+            Effect::TogglePreview => self.toggle_preview(window, cx),
             Effect::FindFiles => self.open_picker(PickerKind::Files, window, cx),
             Effect::FindText => self.open_picker(PickerKind::Text, window, cx),
             Effect::PickTheme => self.open_theme_picker(window, cx),
@@ -2296,7 +2474,11 @@ impl Workspace {
                 if self.problems.is_empty() {
                     self.set_status("No errors.", cx);
                 } else {
-                    self.show_preview = true;
+                    match self.layout {
+                        PaneLayout::EditorOnly => self.layout = PaneLayout::Split,
+                        PaneLayout::PdfTab => self.pdf_tab_shown = true,
+                        PaneLayout::Split | PaneLayout::PdfOnly => {}
+                    }
                     self.show_logs = false;
                     self.error_card_dismissed = false;
                 }
@@ -3500,7 +3682,9 @@ impl Workspace {
 
     fn close_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_menu = None;
-        if let Some(view) = self.active_view() {
+        if self.pdf_is_main() {
+            window.focus(&self.pdf.read(cx).focus_handle(), cx);
+        } else if let Some(view) = self.active_view() {
             window.focus(&view.read(cx).focus_handle(cx), cx);
         }
         cx.notify();
@@ -3556,6 +3740,22 @@ impl Workspace {
     }
 
     fn on_root_mouse_move(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(state) = &mut self.presenting {
+            if !state.controls_shown {
+                state.controls_shown = true;
+                cx.notify();
+            }
+            state.hide_controls_task = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(PRESENT_CONTROLS_TIME).await;
+                this.update(cx, |this, cx| {
+                    if let Some(state) = &mut this.presenting {
+                        state.controls_shown = false;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }));
+        }
         let Some(divider) = self.dragging else {
             return;
         };
@@ -3618,20 +3818,38 @@ impl Workspace {
                     this.with_active(cx, |view, cx| view.format(FormatKind::Link, cx))
                 }),
             ],
-            Menu::View | Menu::Layout => vec![
-                entry("Toggle file panel", "", |this, _, cx| {
-                    this.show_file_panel = !this.show_file_panel;
-                    cx.notify();
-                }),
-                entry("Toggle PDF preview", "", |this, _, cx| {
-                    this.show_preview = !this.show_preview;
-                    cx.notify();
-                }),
-                entry("Toggle logs", "", |this, _, cx| {
-                    this.toggle_logs();
-                    cx.notify();
-                }),
-            ],
+            Menu::View | Menu::Layout => {
+                let layout = self.layout;
+                let layout_entry = |target: PaneLayout, label: &str, shortcut: &'static str| {
+                    entry(check(layout == target, label), shortcut, move |this, window, cx| this.set_layout(target, window, cx))
+                };
+                vec![
+                    menu_heading("Layout"),
+                    layout_entry(PaneLayout::Split, "Split view", LAYOUT_SHORTCUTS[0]),
+                    layout_entry(PaneLayout::EditorOnly, "Editor only", LAYOUT_SHORTCUTS[1]),
+                    layout_entry(PaneLayout::PdfOnly, "PDF only", LAYOUT_SHORTCUTS[2]),
+                    layout_entry(PaneLayout::PdfTab, "Open PDF in separate tab", LAYOUT_SHORTCUTS[3]),
+                    menu_separator(),
+                    entry(check(self.focus_mode, "Focus mode"), "⇧⌘M", |this, window, cx| this.toggle_focus_mode(window, cx)),
+                    entry("  Presentation mode", "", |this, window, cx| this.start_presentation(window, cx)),
+                    menu_separator(),
+                    entry(check(self.settings.show_breadcrumbs, "Show breadcrumbs"), "", |this, window, cx| {
+                        this.update_settings(|settings| settings.show_breadcrumbs = !settings.show_breadcrumbs, window, cx);
+                    }),
+                    entry(check(self.settings.show_tabs, "Show editor tabs"), "", |this, window, cx| {
+                        this.update_settings(|settings| settings.show_tabs = !settings.show_tabs, window, cx);
+                    }),
+                    menu_separator(),
+                    entry("  Toggle file panel", "", |this, _, cx| {
+                        this.show_file_panel = !this.show_file_panel;
+                        cx.notify();
+                    }),
+                    entry("  Toggle logs", "", |this, _, cx| {
+                        this.toggle_logs();
+                        cx.notify();
+                    }),
+                ]
+            }
             Menu::Format => vec![
                 entry("Bold", "⌘B", |this, _, cx| {
                     this.with_active(cx, |view, cx| view.format(FormatKind::Bold, cx))
@@ -4332,6 +4550,10 @@ impl Workspace {
                         let name = view.path().file_name().map_or_else(String::new, |name| name.to_string_lossy().into_owned());
                         (name.into(), false, "image")
                     }
+                    Tab::Pdf => {
+                        let name = self.last_pdf.as_deref().and_then(Path::file_name);
+                        (name.map_or_else(|| "PDF".to_string(), |name| name.to_string_lossy().into_owned()).into(), false, "book")
+                    }
                 };
                 div()
                     .id(("tab", position))
@@ -4414,7 +4636,7 @@ impl Workspace {
             .when(open, |style| style.bg(theme::color(theme::palette().divider)))
             .hover(|style| style.bg(theme::color(theme::palette().divider)))
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                let bottom = TOP_BAR_HEIGHT + TAB_BAR_HEIGHT + TOOLBAR_HEIGHT;
+                let bottom = this.editor_toolbar_bottom(TOOLBAR_HEIGHT);
                 this.toggle_menu(menu, event.position(), bottom, window, cx);
             }))
             .child(Self::icon(icon, 16., theme::palette().ui_text))
@@ -4608,9 +4830,102 @@ impl Workspace {
             })
     }
 
+    /// The path of the shown tab and, in a document, the headings around the cursor.
+    fn render_breadcrumbs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (path, line) = match self.active_tab() {
+            Some(Tab::Document(index)) => {
+                let view = self.documents[index].view.read(cx);
+                (view.path.clone(), Some(view.cursor_position().0 - 1))
+            }
+            Some(Tab::Image(index)) => (Some(self.images[index].view.read(cx).path().to_path_buf()), None),
+            Some(Tab::Pdf) => (self.last_pdf.clone(), None),
+            None => (None, None),
+        };
+        let relative = path.map(|path| match &self.root {
+            Some(root) if path.starts_with(root) => relative_path(root, &path),
+            _ => path.display().to_string(),
+        });
+        let trail = line.map_or_else(Vec::new, |line| heading_trail(&self.outline, line));
+        let separator = || div().text_color(theme::color(theme::palette().ui_muted)).child("›");
+        let segments: Vec<String> = relative.map_or_else(Vec::new, |relative| relative.split('/').map(str::to_string).collect());
+        let last = segments.len().saturating_sub(1);
+        div()
+            .id("breadcrumbs")
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(6.))
+            .h(px(BREADCRUMB_HEIGHT))
+            .px(px(12.))
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .bg(theme::color(theme::palette().panel))
+            .text_color(theme::color(theme::palette().ui_muted))
+            .children(segments.into_iter().enumerate().map(|(position, segment)| {
+                div()
+                    .id(("crumb-path", position))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .when(position > 0, |element| element.child(separator()))
+                    .child(
+                        div()
+                            .when(position == last, |element| {
+                                element
+                                    .text_color(theme::color(theme::palette().ui_text))
+                                    .cursor_pointer()
+                                    .hover(|style| style.underline())
+                            })
+                            .child(segment),
+                    )
+                    .when(position == last, |element| {
+                        element.on_click(cx.listener(|this, _, window, cx| {
+                            this.reveal_in_tree(window, cx);
+                            if !this.settings.vim_mode {
+                                this.focus_active(window, cx);
+                            }
+                        }))
+                    })
+            }))
+            .children(trail.into_iter().map(|index| {
+                let item = &self.outline[index];
+                let line = item.line;
+                div()
+                    .id(("crumb-heading", index))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .min_w_0()
+                    .child(separator())
+                    .child(
+                        div()
+                            .truncate()
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(theme::color(theme::palette().ui_text)))
+                            .child(item.title.clone()),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if let Some(view) = this.active_view() {
+                            view.update(cx, |view, cx| view.go_to_line(line, 0, window, cx));
+                        }
+                    }))
+            }))
+    }
+
     fn render_editor_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let active = self.active_view();
-        let body: AnyElement = match (self.image_preview(), active) {
+        let pdf_tab = self.pdf_tab_shown && !self.focus_mode;
+        let toolbar = if self.focus_mode {
+            None
+        } else if pdf_tab {
+            Some(self.render_preview_toolbar(cx).into_any_element())
+        } else {
+            Some(self.render_toolbar(cx).into_any_element())
+        };
+        let body: AnyElement = if pdf_tab {
+            self.render_preview_body(cx)
+        } else {
+            match (self.image_preview(), active) {
             (Some(preview), _) => preview.view.clone().into_any_element(),
             (None, Some(view)) => view.into_any_element(),
             (None, None) => div()
@@ -4625,6 +4940,7 @@ impl Workspace {
                     "Open a folder to start."
                 })
                 .into_any_element(),
+            }
         };
         div()
             .flex()
@@ -4632,8 +4948,9 @@ impl Workspace {
             .flex_1()
             .min_w_0()
             .h_full()
-            .child(self.render_tabs(cx))
-            .child(self.render_toolbar(cx))
+            .when(self.show_tab_bar(), |element| element.child(self.render_tabs(cx)))
+            .when(self.show_breadcrumbs(), |element| element.child(self.render_breadcrumbs(cx)))
+            .children(toolbar)
             .child(div().flex_1().min_h_0().child(body))
             .when_some(self.cursor_hint(cx).cloned(), |element, hint| element.child(self.render_hint_strip(&hint, cx)))
             .when(self.error_count() > 0, |element| element.child(self.render_error_strip(cx)))
@@ -4738,7 +5055,11 @@ impl Workspace {
                                     .border_color(theme::color(theme::palette().on_accent).opacity(0.3))
                                     .cursor_pointer()
                                     .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
-                                        let bottom = TOP_BAR_HEIGHT + PREVIEW_TOOLBAR_HEIGHT;
+                                        let bottom = if this.pdf_tab_shown {
+                                            this.editor_toolbar_bottom(PREVIEW_TOOLBAR_HEIGHT)
+                                        } else {
+                                            TOP_BAR_HEIGHT + PREVIEW_TOOLBAR_HEIGHT
+                                        };
                                         this.toggle_menu(Menu::Compile, event.position(), bottom, window, cx);
                                     }))
                                     .child(Self::icon("chevron-down", 12., theme::palette().on_accent))
@@ -5253,6 +5574,22 @@ impl Workspace {
                         this.open_theme_picker(window, cx);
                     }))
                     .child(self.settings.theme.clone().unwrap_or_else(|| theme::DEFAULT_THEME.to_string())),
+            )
+            .into_any_element(),
+            Self::setting_row(
+                "Breadcrumbs",
+                "Shows the path of the file and the headings around the cursor above the editor.",
+                self.toggle_switch("breadcrumbs-setting", self.settings.show_breadcrumbs, true, cx, |this, window, cx| {
+                    this.update_settings(|settings| settings.show_breadcrumbs = !settings.show_breadcrumbs, window, cx);
+                }),
+            )
+            .into_any_element(),
+            Self::setting_row(
+                "Editor tabs",
+                "Shows the open files as tabs. Without them, the file tree and the picker switch files.",
+                self.toggle_switch("tabs-setting", self.settings.show_tabs, true, cx, |this, window, cx| {
+                    this.update_settings(|settings| settings.show_tabs = !settings.show_tabs, window, cx);
+                }),
             )
             .into_any_element(),
             Self::setting_row(
@@ -5793,9 +6130,10 @@ impl Workspace {
             )
     }
 
-    fn render_preview(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The logs or the PDF with the errors of the last build above it.
+    fn render_preview_body(&self, cx: &mut Context<Self>) -> AnyElement {
         let has_errors = self.error_count() > 0;
-        let body: AnyElement = if self.show_logs {
+        if self.show_logs {
             self.render_logs(cx).into_any_element()
         } else {
             div()
@@ -5806,12 +6144,18 @@ impl Workspace {
                 .when(has_errors && self.error_card_dismissed, |element| element.child(self.render_error_banner(cx)))
                 .child(div().flex_1().min_h_0().child(self.pdf.clone()))
                 .into_any_element()
-        };
+        }
+    }
+
+    /// The column beside the editor, or the whole width in `PdfOnly`.
+    fn render_preview(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let body = self.render_preview_body(cx);
+        let alone = self.layout == PaneLayout::PdfOnly;
         div()
             .flex()
             .flex_col()
-            .flex_none()
-            .w(self.preview_width)
+            .when(alone, |element| element.flex_1().min_w_0())
+            .when(!alone, |element| element.flex_none().w(self.preview_width))
             .h_full()
             .bg(theme::color(theme::palette().panel))
             .child(self.render_preview_toolbar(cx))
@@ -5890,7 +6234,10 @@ impl Render for Workspace {
         let addon_dialog = self.dialog_panel(cx).map(|panel| self.render_addon_dialog(panel, cx));
         self.tree_cursor = self.tree_cursor.min(self.entries.len().saturating_sub(1));
         let dragging = self.dragging;
-        let show_preview = self.show_preview;
+        let presenting = self.presenting.is_some();
+        let focus = self.focus_mode && !presenting;
+        let show_preview = !focus && matches!(self.layout, PaneLayout::Split | PaneLayout::PdfOnly);
+        let show_editor = focus || self.layout != PaneLayout::PdfOnly;
         let show_file_panel = self.show_file_panel;
         // Git runs only while its panel shows.
         let git_visible = show_file_panel && self.left_panel == LeftPanel::Git;
@@ -5953,7 +6300,9 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &GoToTab8, window, cx| this.go_to_tab(7, window, cx)))
             .on_action(cx.listener(|this, _: &GoToTab9, window, cx| this.go_to_tab(8, window, cx)))
             .on_action(cx.listener(|this, _: &CloseTab, window, cx| {
-                if let Some(index) = this.shown_image {
+                if this.pdf_tab_shown {
+                    this.set_layout(PaneLayout::Split, window, cx);
+                } else if let Some(index) = this.shown_image {
                     this.close_image(index, window, cx);
                 } else if let Some(index) = this.active {
                     this.close_document(index, window, cx);
@@ -5963,10 +6312,14 @@ impl Render for Workspace {
                 this.show_file_panel = !this.show_file_panel;
                 cx.notify();
             }))
-            .on_action(cx.listener(|this, _: &TogglePreview, _, cx| {
-                this.show_preview = !this.show_preview;
-                cx.notify();
-            }))
+            .on_action(cx.listener(|this, _: &TogglePreview, window, cx| this.toggle_preview(window, cx)))
+            .on_action(cx.listener(|this, _: &LayoutSplit, window, cx| this.set_layout(PaneLayout::Split, window, cx)))
+            .on_action(cx.listener(|this, _: &LayoutEditorOnly, window, cx| this.set_layout(PaneLayout::EditorOnly, window, cx)))
+            .on_action(cx.listener(|this, _: &LayoutPdfOnly, window, cx| this.set_layout(PaneLayout::PdfOnly, window, cx)))
+            .on_action(cx.listener(|this, _: &LayoutPdfTab, window, cx| this.set_layout(PaneLayout::PdfTab, window, cx)))
+            .on_action(cx.listener(|this, _: &ToggleFocusMode, window, cx| this.toggle_focus_mode(window, cx)))
+            .on_action(cx.listener(|this, _: &StartPresentation, window, cx| this.start_presentation(window, cx)))
+            .on_action(cx.listener(|this, _: &ExitPresentation, window, cx| this.exit_presentation(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleLogs, _, cx| {
                 this.toggle_logs();
                 cx.notify();
@@ -5982,8 +6335,52 @@ impl Render for Workspace {
                 this.open_dialog(Dialog::Settings(SettingsPage::Editor), window, cx);
             }))
             .on_action(|_: &Quit, _, cx: &mut App| cx.quit())
-            .child(self.render_top_bar(cx))
-            .child(
+            .when(!presenting && !focus, |element| element.child(self.render_top_bar(cx)))
+            .when(presenting, |element| {
+                let controls = self.presenting.as_ref().is_some_and(|state| state.controls_shown);
+                element.child(
+                    div()
+                        .relative()
+                        .flex_1()
+                        .min_h_0()
+                        .bg(gpui::black())
+                        .child(self.pdf.clone())
+                        .when(controls, |element| {
+                            element.child(div().absolute().top(px(12.)).right(px(12.)).child(self.exit_button(
+                                "exit-presentation",
+                                "Exit presentation",
+                                true,
+                                cx,
+                                |this, window, cx| this.exit_presentation(window, cx),
+                            )))
+                        }),
+                )
+            })
+            .when(focus, |element| {
+                element
+                    // The band keeps the window buttons off the text and holds the way out.
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .justify_end()
+                            .h(px(TOP_BAR_HEIGHT))
+                            .pr(px(10.))
+                            .child(self.exit_button("exit-focus", "Exit focus mode", false, cx, |this, window, cx| {
+                                this.toggle_focus_mode(window, cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_1()
+                            .min_h_0()
+                            .justify_center()
+                            .child(div().flex().w_full().max_w(px(FOCUS_WIDTH)).h_full().child(self.render_editor_pane(cx))),
+                    )
+            })
+            .when(!presenting && !focus, |element| element.child(
                 div()
                     .flex()
                     .flex_1()
@@ -6010,14 +6407,14 @@ impl Render for Workspace {
                             .child(panel)
                             .child(self.divider_vertical("file-divider", Divider::FilePanel, cx))
                     })
-                    .child(self.render_editor_pane(cx))
-                    .when(show_preview, |element| {
-                        element
-                            .child(self.divider_vertical("preview-divider", Divider::Preview, cx))
-                            .child(self.render_preview(cx))
-                    }),
-            )
-            .children(self.render_status_bar(cx))
+                    .when(show_editor, |element| element.child(self.render_editor_pane(cx)))
+                    .when(show_editor && show_preview, |element| {
+                        element.child(self.divider_vertical("preview-divider", Divider::Preview, cx))
+                    })
+                    .when(show_preview, |element| element.child(self.render_preview(cx))),
+            ))
+            // Vim needs its mode and command line in focus mode too.
+            .when(!presenting && (!focus || self.settings.vim_mode), |element| element.children(self.render_status_bar(cx)))
             .when_some(self.dialog, |element, dialog| element.child(self.render_dialog(dialog, cx)))
             .when_some(self.picker.as_ref(), |element, picker| element.child(self.render_picker(picker, cx)))
             .when_some(addon_dialog, |element, dialog| element.child(dialog))
@@ -6052,6 +6449,24 @@ mod tests {
         assert_eq!(tab_hit(197., 100., 200., 1., edges), 1);
         assert_eq!(tab_hit(197., 100., 200., 0., edges), 0);
         assert_eq!(tab_hit(150., 100., 200., 0.5, edges), 0);
+    }
+
+    #[test]
+    fn the_trail_holds_the_headings_around_a_line() {
+        let item = |depth: usize, line: usize, title: &str| OutlineItem {
+            level: depth,
+            title: title.to_string(),
+            line,
+            depth,
+            has_children: false,
+            collapsed: false,
+        };
+        let items = [item(0, 0, "Intro"), item(1, 5, "Motivation"), item(0, 10, "Method"), item(1, 12, "Data"), item(2, 14, "Sources")];
+        assert_eq!(heading_trail(&items, 3), [0]);
+        assert_eq!(heading_trail(&items, 7), [0, 1]);
+        assert_eq!(heading_trail(&items, 11), [2]);
+        assert_eq!(heading_trail(&items, 20), [2, 3, 4]);
+        assert!(heading_trail(&items[1..], 2).is_empty());
     }
 
     #[test]

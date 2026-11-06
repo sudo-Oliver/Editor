@@ -80,6 +80,15 @@ actions!(
         Quit,
         PdfBack,
         PdfForward,
+        LayoutSplit,
+        LayoutEditorOnly,
+        LayoutPdfOnly,
+        LayoutPdfTab,
+        ToggleFocusMode,
+        StartPresentation,
+        ExitPresentation,
+        PdfNextPage,
+        PdfPreviousPage,
     ]
 );
 
@@ -159,6 +168,22 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-9", GoToTab9, None),
         KeyBinding::new("secondary-q", Quit, None),
         KeyBinding::new("secondary-,", OpenSettings, None),
+        KeyBinding::new("secondary-shift-m", ToggleFocusMode, None),
+    ]);
+    // The slides of a talk turn with every key a clicker or a hand reaches first.
+    let presentation = Some("Presentation");
+    cx.bind_keys([
+        KeyBinding::new("j", PdfNextPage, presentation),
+        KeyBinding::new("space", PdfNextPage, presentation),
+        KeyBinding::new("down", PdfNextPage, presentation),
+        KeyBinding::new("right", PdfNextPage, presentation),
+        KeyBinding::new("pagedown", PdfNextPage, presentation),
+        KeyBinding::new("k", PdfPreviousPage, presentation),
+        KeyBinding::new("shift-space", PdfPreviousPage, presentation),
+        KeyBinding::new("up", PdfPreviousPage, presentation),
+        KeyBinding::new("left", PdfPreviousPage, presentation),
+        KeyBinding::new("pageup", PdfPreviousPage, presentation),
+        KeyBinding::new("escape", ExitPresentation, presentation),
     ]);
     #[cfg(target_os = "macos")]
     cx.bind_keys([
@@ -171,6 +196,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-up", SelectDocumentStart, editor),
         KeyBinding::new("cmd-shift-down", SelectDocumentEnd, editor),
         KeyBinding::new("cmd-backspace", DeleteToLineStart, editor),
+        KeyBinding::new("ctrl-cmd-down", LayoutSplit, None),
+        KeyBinding::new("ctrl-cmd-left", LayoutEditorOnly, None),
+        KeyBinding::new("ctrl-cmd-right", LayoutPdfOnly, None),
+        KeyBinding::new("ctrl-cmd-up", LayoutPdfTab, None),
     ]);
     #[cfg(not(target_os = "macos"))]
     cx.bind_keys([
@@ -182,5 +211,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-right", SelectWordRight, editor),
         KeyBinding::new("ctrl-backspace", DeleteWordLeft, editor),
         KeyBinding::new("ctrl-delete", DeleteWordRight, editor),
+        KeyBinding::new("ctrl-alt-down", LayoutSplit, None),
+        KeyBinding::new("ctrl-alt-left", LayoutEditorOnly, None),
+        KeyBinding::new("ctrl-alt-right", LayoutPdfOnly, None),
+        KeyBinding::new("ctrl-alt-up", LayoutPdfTab, None),
     ]);
 }

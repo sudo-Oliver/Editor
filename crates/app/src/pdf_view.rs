@@ -39,6 +39,10 @@ const LINK_MARGIN: f32 = 16.0;
 const LINK_FLASH_HEIGHT: f32 = 14.0;
 const SELECTION_COLOR: u32 = 0x4a9cd466;
 const LINK_HOVER_COLOR: u32 = 0x4a9cd426;
+/// How far a wheel or trackpad moves to turn a slide.
+const SLIDE_SCROLL: f32 = 60.0;
+/// The swing of a trackpad after one slide turn must not turn the next.
+const SLIDE_PAUSE: Duration = Duration::from_millis(350);
 
 pub enum PdfViewEvent {
     /// A secondary click at a position in PDF points on a zero-based page.
@@ -139,6 +143,13 @@ pub struct PdfView {
     back: Vec<ViewPosition>,
     forward: Vec<ViewPosition>,
     focus: FocusHandle,
+    /// One page fills the view, for a talk.
+    presenting: bool,
+    present_page: usize,
+    /// Zoom and fit from before the talk.
+    before_present: (f32, bool),
+    slide_scroll: f32,
+    slide_turned_at: Option<Instant>,
 }
 
 impl EventEmitter<PdfViewEvent> for PdfView {}
@@ -175,6 +186,11 @@ impl PdfView {
             back: Vec::new(),
             forward: Vec::new(),
             focus: cx.focus_handle(),
+            presenting: false,
+            present_page: 0,
+            before_present: (1.0, true),
+            slide_scroll: 0.0,
+            slide_turned_at: None,
         };
         match PdfWorker::spawn(&library_directory()) {
             Ok((worker, mut events)) => {
@@ -228,6 +244,10 @@ impl PdfView {
         cx.notify();
     }
 
+    pub fn focus_handle(&self) -> FocusHandle {
+        self.focus.clone()
+    }
+
     pub fn is_focused(&self, window: &Window) -> bool {
         self.focus.is_focused(window)
     }
@@ -245,6 +265,9 @@ impl PdfView {
     }
 
     pub fn current_page(&self) -> usize {
+        if self.presenting {
+            return self.present_page;
+        }
         let Some(bounds) = self.bounds else {
             return 0;
         };
@@ -279,6 +302,40 @@ impl PdfView {
         self.zoomed_at = Some(Instant::now());
         self.schedule_settle(cx);
         cx.notify();
+    }
+
+    /// Shows one page at a time, as large as it fits. Leaving goes back to the
+    /// zoom from before, at the page the talk ended on.
+    pub fn set_presenting(&mut self, on: bool, cx: &mut Context<Self>) {
+        if on == self.presenting {
+            return;
+        }
+        if on {
+            self.present_page = self.current_page();
+            self.before_present = (self.zoom, self.fit_width);
+            self.selection = None;
+            self.selection_rects.clear();
+            self.press = None;
+            self.hovered_link = None;
+            self.slide_scroll = 0.0;
+        } else {
+            (self.zoom, self.fit_width) = self.before_present;
+            self.pending_scroll = Some(ScrollRequest { page: self.present_page, y: 0.0, placement: Placement::Top(PAGE_GAP) });
+        }
+        self.presenting = on;
+        self.scroll_animation = None;
+        self.zoomed_at = Some(Instant::now());
+        self.schedule_settle(cx);
+        cx.notify();
+    }
+
+    fn turn_slide(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let last = self.pages.len().saturating_sub(1);
+        let page = if forward { (self.present_page + 1).min(last) } else { self.present_page.saturating_sub(1) };
+        if page != self.present_page {
+            self.present_page = page;
+            cx.notify();
+        }
     }
 
     pub fn toggle_invert(&mut self, cx: &mut Context<Self>) {
@@ -415,6 +472,18 @@ impl PdfView {
 
     fn on_scroll(&mut self, event: &ScrollEvent, _: &mut Window, cx: &mut Context<Self>) {
         let delta = event.delta.pixel_delta(px(theme::CODE_LINE_HEIGHT));
+        if self.presenting {
+            if self.slide_turned_at.is_some_and(|at| at.elapsed() < SLIDE_PAUSE) {
+                return;
+            }
+            self.slide_scroll -= f32::from(delta.y);
+            if self.slide_scroll.abs() >= SLIDE_SCROLL {
+                self.turn_slide(self.slide_scroll > 0.0, cx);
+                self.slide_scroll = 0.0;
+                self.slide_turned_at = Some(Instant::now());
+            }
+            return;
+        }
         if event.modifiers.secondary() {
             let anchor = self.bounds.map_or(point(px(0.), px(0.)), |bounds| {
                 point(event.position.x - bounds.left(), event.position.y - bounds.top())
@@ -442,7 +511,11 @@ impl PdfView {
         Some((last, top - self.pages[last].1 * self.zoom - PAGE_GAP))
     }
 
+    /// None during a talk, where the pages are not where scrolling puts them.
     fn page_point(&self, position: gpui::Point<Pixels>) -> Option<PagePoint> {
+        if self.presenting {
+            return None;
+        }
         let bounds = self.bounds?;
         let content_x = f32::from(position.x - bounds.left() + self.scroll.x);
         let content_y = f32::from(position.y - bounds.top() + self.scroll.y);
@@ -657,6 +730,9 @@ impl PdfView {
         if self.pages.is_empty() {
             return PaintList { pages: Vec::new(), selection: Vec::new(), hovered_link: None, highlight: None };
         }
+        if self.presenting {
+            return self.prepare_slide(bounds, window);
+        }
         if self.fit_width {
             let widest = self.pages.iter().map(|(width, _)| *width).fold(1.0, f32::max);
             self.zoom = ((f32::from(bounds.size.width) - SIDE_MARGIN * 2.0) / widest).clamp(MIN_ZOOM, MAX_ZOOM);
@@ -717,6 +793,28 @@ impl PdfView {
 
         let first = visible.first().copied().unwrap_or(0);
         let last = visible.last().copied().unwrap_or(0);
+        self.keep_near(first, last, window.scale_factor());
+        PaintList { pages: paint, selection: selection_bounds, hovered_link, highlight }
+    }
+
+    fn prepare_slide(&mut self, bounds: Bounds<Pixels>, window: &mut Window) -> PaintList {
+        let page = self.present_page.min(self.pages.len() - 1);
+        self.present_page = page;
+        let viewport = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+        let (zoom, left, top) = fit_page(self.pages[page], viewport);
+        self.zoom = zoom;
+        let (width, height) = self.pages[page];
+        let slide = Bounds::new(
+            point(bounds.left() + px(left), bounds.top() + px(top)),
+            size(px(width * zoom), px(height * zoom)),
+        );
+        let image = self.images.get(&page).map(|image| image.image.clone());
+        self.keep_near(page, page, window.scale_factor());
+        PaintList { pages: vec![(slide, image)], selection: Vec::new(), hovered_link: None, highlight: None }
+    }
+
+    /// Lets go of pages far from `first..=last` and asks for the ones in it.
+    fn keep_near(&mut self, first: usize, last: usize, scale: f32) {
         let far: Vec<usize> = self
             .images
             .keys()
@@ -733,8 +831,7 @@ impl PdfView {
             self.content.retain(|page, _| *page + KEEP_PAGES >= first && *page <= last + KEEP_PAGES);
             self.requested_content.retain(|page| *page + KEEP_PAGES >= first && *page <= last + KEEP_PAGES);
         }
-        self.request_pages(first, last, window.scale_factor());
-        PaintList { pages: paint, selection: selection_bounds, hovered_link, highlight }
+        self.request_pages(first, last, scale);
     }
 
     /// The colors of dark pages. A light theme borrows the dark one, so that the
@@ -776,6 +873,16 @@ impl PdfView {
             self.last_requested = wanted;
         }
     }
+}
+
+/// The zoom that fits a whole page into the viewport, and where the page then
+/// starts so that it sits in the middle.
+fn fit_page((width, height): (f32, f32), (view_width, view_height): (f32, f32)) -> (f32, f32, f32) {
+    if width <= 0.0 || height <= 0.0 {
+        return (1.0, 0.0, 0.0);
+    }
+    let zoom = (view_width / width).min(view_height / height).clamp(MIN_ZOOM, MAX_ZOOM);
+    (zoom, (view_width - width * zoom) / 2.0, (view_height - height * zoom) / 2.0)
 }
 
 fn push_position(positions: &mut Vec<ViewPosition>, position: ViewPosition) {
@@ -822,18 +929,21 @@ impl Render for PdfView {
         let view = cx.entity();
         let has_pages = !self.pages.is_empty();
         let over_link = self.hovered_link.is_some();
+        let presenting = self.presenting;
         div()
             .id("pdf")
             .relative()
             .size_full()
             .overflow_hidden()
             .track_focus(&self.focus)
-            .key_context("PdfView")
-            .when(has_pages && !over_link, |element| element.cursor_text())
+            .key_context(if presenting { "PdfView Presentation" } else { "PdfView" })
+            .when(has_pages && !over_link && !presenting, |element| element.cursor_text())
             .when(over_link, |element| element.cursor_pointer())
             .on_action(cx.listener(|this, _: &actions::Copy, _, cx| this.copy_selection(cx)))
             .on_action(cx.listener(|this, _: &actions::PdfBack, _, cx| this.go_back(cx)))
             .on_action(cx.listener(|this, _: &actions::PdfForward, _, cx| this.go_forward(cx)))
+            .on_action(cx.listener(|this, _: &actions::PdfNextPage, _, cx| this.turn_slide(true, cx)))
+            .on_action(cx.listener(|this, _: &actions::PdfPreviousPage, _, cx| this.turn_slide(false, cx)))
             .on_scroll(cx.listener(Self::on_scroll))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
@@ -891,5 +1001,30 @@ impl Render for PdfView {
                         .child(message),
                 )
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_slide_fits_whole_and_sits_in_the_middle() {
+        // A 4:3 Beamer slide on a 16:10 screen leaves room left and right.
+        let (zoom, left, top) = fit_page((364.0, 273.0), (1440.0, 900.0));
+        assert!((273.0 * zoom - 900.0).abs() < 0.01);
+        assert!(364.0 * zoom <= 1440.0);
+        assert!((left * 2.0 + 364.0 * zoom - 1440.0).abs() < 0.01);
+        assert!(top.abs() < 0.01);
+        // A portrait page in a wide view fits by height, a landscape one in a tall view by width.
+        let (zoom, left, _) = fit_page((595.0, 842.0), (1000.0, 500.0));
+        assert!((842.0 * zoom - 500.0).abs() < 0.01 && left > 0.0);
+        let (zoom, _, top) = fit_page((842.0, 595.0), (500.0, 1000.0));
+        assert!((842.0 * zoom - 500.0).abs() < 0.01 && top > 0.0);
+    }
+
+    #[test]
+    fn an_empty_page_does_not_divide_by_zero() {
+        assert_eq!(fit_page((0.0, 0.0), (800.0, 600.0)), (1.0, 0.0, 0.0));
     }
 }

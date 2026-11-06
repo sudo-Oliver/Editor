@@ -10,6 +10,15 @@ pub struct Section {
     pub rows: Vec<(String, &'static str)>,
 }
 
+#[cfg(target_os = "macos")]
+const LAYOUT_MODIFIER: &str = "⌃⌘";
+#[cfg(not(target_os = "macos"))]
+const LAYOUT_MODIFIER: &str = "Ctrl+Alt+";
+
+fn layout(key: &str) -> String {
+    format!("{LAYOUT_MODIFIER}{key}")
+}
+
 fn modified(key: &str) -> String {
     format!("{MODIFIER}{key}")
 }
@@ -44,6 +53,19 @@ pub fn sections(vim_mode: bool) -> Vec<Section> {
                 (modified("Shift+C"), "Insert citation"),
                 (modified("Shift+D"), "Cite from a DOI"),
                 (modified("."), "Apply the package fix on this line"),
+            ],
+        },
+        Section {
+            title: "View",
+            rows: vec![
+                (layout("↓"), "Editor and PDF side by side"),
+                (layout("←"), "Editor only"),
+                (layout("→"), "PDF only"),
+                (layout("↑"), "PDF in its own tab"),
+                (modified("Shift+M"), "Focus mode"),
+                ("J, Space, →".to_string(), "Next slide in presentation mode"),
+                ("K, Shift+Space, ←".to_string(), "Previous slide"),
+                ("Esc".to_string(), "End presentation mode"),
             ],
         },
         Section {
