@@ -122,7 +122,7 @@ mod tests {
         let themes = scan().unwrap();
         assert!(!themes.is_empty());
         for (name, palette) in &themes {
-            crate::theme::tests::assert_readable(palette, name);
+            crate::theme::tests::assert_theme(palette, name);
         }
     }
 

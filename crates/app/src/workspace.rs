@@ -4797,6 +4797,8 @@ impl Workspace {
             .gap(px(2.))
             .rounded(px(6.))
             .bg(theme::color(theme::palette().bg))
+            .border_1()
+            .border_color(theme::color(theme::palette().divider))
             .children(options.into_iter().enumerate().map(|(index, (label, selected, handler))| {
                 div()
                     .id((id, index))
@@ -4804,7 +4806,13 @@ impl Workspace {
                     .py(px(3.))
                     .rounded(px(4.))
                     .cursor_pointer()
-                    .when(selected, |style| style.bg(theme::color(theme::palette().accent_soft)).font_weight(FontWeight::SEMIBOLD))
+                    // The accent, so that the choice shows in any theme.
+                    .when(selected, |style| {
+                        style
+                            .bg(theme::color(theme::palette().accent))
+                            .text_color(theme::color(theme::palette().on_accent))
+                            .font_weight(FontWeight::SEMIBOLD)
+                    })
                     .when(!selected, |style| style.hover(|style| style.bg(theme::color(theme::palette().divider))))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         handler(this, window, cx);
