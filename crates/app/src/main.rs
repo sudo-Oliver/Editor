@@ -8,6 +8,7 @@ mod completion;
 mod editor_view;
 mod export;
 mod file_tree;
+mod git_login;
 mod git_panel;
 mod home_view;
 mod image_view;
@@ -21,6 +22,7 @@ mod pdf_view;
 mod picker;
 mod problems;
 mod projects;
+mod secrets;
 mod recovery;
 mod settings;
 mod shortcuts;
@@ -38,6 +40,8 @@ use gpui::{
 };
 
 fn main() {
+    // Git may start the editor only to ask for a login.
+    git_login::answer_if_asked();
     let root = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)

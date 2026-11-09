@@ -22,6 +22,11 @@ pub struct Settings {
     /// The name others see in a live session. Empty means the user name of
     /// the computer.
     pub collab_name: String,
+    /// Fetches now and then, and fast-forwards when nothing is in the way.
+    pub git_background_sync: bool,
+    /// Projects whose repository may run git by itself, since its config can
+    /// start programs. Opening the git panel for a project adds it.
+    pub trusted_git_roots: Vec<PathBuf>,
 }
 
 impl Default for Settings {
@@ -36,6 +41,8 @@ impl Default for Settings {
             show_breadcrumbs: true,
             show_tabs: true,
             collab_name: String::new(),
+            git_background_sync: true,
+            trusted_git_roots: Vec::new(),
         }
     }
 }
@@ -93,7 +100,7 @@ mod tests {
     fn settings_survive_a_restart() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("nested").join("settings.toml");
-        let settings = Settings { vim_mode: true, smooth_cursor: false, auto_scroll_pdf: true, auto_suggestions: false, package_hints: false, theme: Some("vesper".to_string()), show_breadcrumbs: false, show_tabs: false, collab_name: "Ada".to_string() };
+        let settings = Settings { vim_mode: true, smooth_cursor: false, auto_scroll_pdf: true, auto_suggestions: false, package_hints: false, theme: Some("vesper".to_string()), show_breadcrumbs: false, show_tabs: false, collab_name: "Ada".to_string(), git_background_sync: false, trusted_git_roots: vec![PathBuf::from("/a")] };
         settings.save(&path).unwrap();
         assert_eq!(Settings::load(&path), settings);
     }
@@ -103,6 +110,6 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.toml");
         std::fs::write(&path, "vim_mode = true").unwrap();
-        assert_eq!(Settings::load(&path), Settings { vim_mode: true, smooth_cursor: true, auto_scroll_pdf: false, auto_suggestions: true, package_hints: true, theme: None, show_breadcrumbs: true, show_tabs: true, collab_name: String::new() });
+        assert_eq!(Settings::load(&path), Settings { vim_mode: true, smooth_cursor: true, auto_scroll_pdf: false, auto_suggestions: true, package_hints: true, theme: None, show_breadcrumbs: true, show_tabs: true, collab_name: String::new(), git_background_sync: true, trusted_git_roots: Vec::new() });
     }
 }

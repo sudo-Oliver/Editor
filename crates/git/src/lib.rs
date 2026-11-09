@@ -1,7 +1,9 @@
 //! Talks to the `git` program. Every call blocks, so callers use a background thread.
 
 mod actions;
+mod history;
 mod log;
+mod remote;
 mod status;
 
 use std::{
@@ -10,7 +12,9 @@ use std::{
     process::{Command, Output, Stdio},
 };
 
+pub use history::CommittedFile;
 pub use log::{Commit, GraphRow, Lanes, PAGE_SIZE};
+pub use remote::{ASKPASS_ENV, GitError, PullOutcome};
 pub use status::{FileChange, Status};
 
 const MAX_ERROR_LINES: usize = 6;
@@ -21,6 +25,9 @@ pub struct Program {
     pub path: PathBuf,
     /// `PATH` for git, so that it finds `git-lfs` and credential helpers.
     pub path_env: OsString,
+    /// A program that answers git's questions for a user name or password,
+    /// from tokens the user gave the editor.
+    pub askpass: Option<PathBuf>,
 }
 
 impl Program {
@@ -86,15 +93,18 @@ impl Repository {
     }
 
     /// For commands that reach a remote. A dead connection then ends in an error
-    /// instead of waiting forever.
-    fn run_on_network(&self, args: &[&str]) -> Result<String, String> {
+    /// instead of waiting forever, and a missing login in `GitError::Auth`.
+    fn run_on_network(&self, args: &[&str]) -> Result<String, GitError> {
         let mut command = self.command();
         command.args(["-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=60"]);
         // These settings beat the user's own, so they stay out when the user has some.
         if std::env::var_os("GIT_SSH_COMMAND").is_none() && self.run(["config", "--get", "core.sshCommand"]).is_err() {
             command.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=4");
         }
-        Self::finish(command.args(args))
+        if let Some(askpass) = &self.program.askpass {
+            command.env("GIT_ASKPASS", askpass).env(remote::ASKPASS_ENV, "1");
+        }
+        Self::finish(command.args(args)).map_err(|error| self.classify(error))
     }
 
     fn finish(command: &mut Command) -> Result<String, String> {
@@ -121,7 +131,7 @@ pub(crate) mod test_support {
     use super::*;
 
     pub fn program() -> Program {
-        Program { path: PathBuf::from("git"), path_env: std::env::var_os("PATH").unwrap_or_default() }
+        Program { path: PathBuf::from("git"), path_env: std::env::var_os("PATH").unwrap_or_default(), askpass: None }
     }
 
     /// Runs git outside the code under test, without the user's configuration.
