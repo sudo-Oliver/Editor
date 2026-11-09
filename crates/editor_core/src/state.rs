@@ -97,6 +97,50 @@ pub struct LineChange {
     pub inserted_lines: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecorationKind {
+    /// The selection of someone else.
+    Selection,
+    /// The cursor of someone else, with their name.
+    Caret,
+    Comment,
+    /// Text suggested for insertion.
+    Inserted,
+    /// Where text was suggested for deletion.
+    Deleted,
+}
+
+/// A colored range drawn over the text that follows edits, like a mark.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Decoration {
+    pub range: Range<usize>,
+    pub kind: DecorationKind,
+    pub color: u32,
+    pub label: Option<String>,
+}
+
+/// One buffer change in the coordinates of the text right before it, for
+/// sharing edits with other editors. Changes follow each other in order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TextChange {
+    pub start: usize,
+    pub removed: usize,
+    pub inserted: String,
+    /// What `removed` covered. Only local changes know it.
+    pub removed_text: String,
+}
+
+impl TextChange {
+    pub fn new(start: usize, removed: usize, inserted: impl Into<String>) -> Self {
+        Self {
+            start,
+            removed,
+            inserted: inserted.into(),
+            removed_text: String::new(),
+        }
+    }
+}
+
 /// Document model without any UI state: text, selections, history and syntax.
 pub struct EditorState {
     buffer: Buffer,
@@ -118,6 +162,11 @@ pub struct EditorState {
     edits_since_job: Vec<InputEdit>,
     line_changes: Vec<LineChange>,
     active_snippet: Option<ActiveSnippet>,
+    /// Local changes not yet taken, while someone listens for them.
+    change_log: Option<Vec<TextChange>>,
+    decorations: Vec<Decoration>,
+    /// Edits of the user do nothing, edits of others still arrive.
+    read_only: bool,
 }
 
 /// The stops of the snippet that `Tab` is walking through, in document order.
@@ -163,6 +212,9 @@ impl EditorState {
             edits_since_job: Vec::new(),
             line_changes: Vec::new(),
             active_snippet: None,
+            change_log: None,
+            decorations: Vec::new(),
+            read_only: false,
         }
     }
 
@@ -208,8 +260,88 @@ impl EditorState {
         self.marks = marks;
     }
 
+    pub fn decorations(&self) -> &[Decoration] {
+        &self.decorations
+    }
+
+    pub fn set_decorations(&mut self, mut decorations: Vec<Decoration>) {
+        let length = self.buffer.len();
+        for decoration in &mut decorations {
+            let start = self.buffer.clip(decoration.range.start.min(length));
+            let end = self.buffer.clip(decoration.range.end.min(length)).max(start);
+            decoration.range = start..end;
+        }
+        self.decorations = decorations;
+    }
+
     pub fn take_line_changes(&mut self) -> Vec<LineChange> {
         std::mem::take(&mut self.line_changes)
+    }
+
+    /// Starts or stops collecting local changes for `take_changes`.
+    pub fn set_change_log(&mut self, on: bool) {
+        self.change_log = on.then(Vec::new);
+    }
+
+    /// Local changes since the last call, undo and redo included.
+    pub fn take_changes(&mut self) -> Vec<TextChange> {
+        self.change_log.as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
+    pub fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Puts back text that a tracked deletion took out, since the session
+    /// keeps it, struck through. The deletion leaves the undo history as if
+    /// it never happened, so that undo cannot bring the text back twice.
+    pub fn restore_deleted(&mut self, restores: &[TextChange]) {
+        let log = self.change_log.take();
+        let mut selections = self.selections.to_vec_primary_last();
+        for restore in restores {
+            let at = self.buffer.clip(restore.start.min(self.buffer.len()));
+            let inserted = restore.inserted.len();
+            self.raw_replace(at..at, &restore.inserted);
+            for selection in &mut selections {
+                selection.anchor = map_mark_offset(selection.anchor, &(at..at), inserted);
+                selection.head = map_mark_offset(selection.head, &(at..at), inserted);
+            }
+            if !self.forget_deletion(at, &restore.inserted) {
+                self.rebase_history(at..at, inserted);
+            }
+        }
+        self.change_log = log;
+        self.selections = SelectionSet::from_vec(selections);
+        self.redo_stack.clear();
+    }
+
+    /// Applies changes made by someone else. They stay out of the undo
+    /// history, and the history moves around them, so that undo only ever
+    /// reverts local edits. History that a change runs into is dropped.
+    pub fn apply_remote(&mut self, changes: &[TextChange]) {
+        let log = self.change_log.take();
+        self.active_snippet = None;
+        self.redo_stack.clear();
+        let mut selections = self.selections.to_vec_primary_last();
+        for change in changes {
+            let range = self.buffer.clip(change.start)..self.buffer.clip(change.start + change.removed);
+            let inserted = change.inserted.len();
+            self.raw_replace(range.clone(), &change.inserted);
+            for selection in &mut selections {
+                selection.anchor = map_mark_offset(selection.anchor, &range, inserted);
+                selection.head = map_mark_offset(selection.head, &range, inserted);
+            }
+            self.rebase_history(range, inserted);
+        }
+        self.change_log = log;
+        self.selections = SelectionSet::from_vec(selections);
+        self.seal_undo_group();
+        self.revision = self.next_revision;
+        self.next_revision += 1;
     }
 
     /// Starts a parse of the current text. Edits made after this call are
@@ -688,6 +820,9 @@ impl EditorState {
     }
 
     pub fn undo(&mut self) -> bool {
+        if self.read_only {
+            return false;
+        }
         self.active_snippet = None;
         let Some(transaction) = self.undo_stack.pop() else {
             return false;
@@ -706,6 +841,9 @@ impl EditorState {
     }
 
     pub fn redo(&mut self) -> bool {
+        if self.read_only {
+            return false;
+        }
         self.active_snippet = None;
         let Some(transaction) = self.redo_stack.pop() else {
             return false;
@@ -835,6 +973,9 @@ impl EditorState {
 
     /// Applies `edits` (sorted, not overlapping, in old coordinates) as one undo step.
     fn commit(&mut self, edits: Vec<Edit>, selections_after: SelectionSet, kind: GroupKind) {
+        if self.read_only {
+            return;
+        }
         let now = Instant::now();
         let selections_before = self.selections.clone();
         let mut operations = Vec::with_capacity(edits.len());
@@ -905,7 +1046,75 @@ impl EditorState {
         self.undo_dropped += dropped;
     }
 
+    /// Drops the deletion of `text` at `at` from the newest undo step, now
+    /// that the text is back. Returns false where no such deletion is there.
+    fn forget_deletion(&mut self, at: usize, text: &str) -> bool {
+        let Some(transaction) = self.undo_stack.last_mut() else {
+            return false;
+        };
+        let Some(index) = transaction.operations.iter().rposition(|operation| operation.start == at && operation.removed == text) else {
+            return false;
+        };
+        // Later operations of the step were made without the text.
+        for operation in &mut transaction.operations[index + 1..] {
+            if operation.start >= at {
+                operation.start += text.len();
+            }
+        }
+        map_selections(&mut transaction.selections_after, &(at..at), text.len());
+        self.undo_bytes -= text.len();
+        let operation = &mut transaction.operations[index];
+        if operation.inserted.is_empty() {
+            transaction.operations.remove(index);
+        } else {
+            operation.removed.clear();
+            operation.start += text.len();
+        }
+        if transaction.operations.is_empty() {
+            let transaction = self.undo_stack.pop().expect("the step was just looked at");
+            self.revision = transaction.revision_before;
+        }
+        true
+    }
+
+    /// Moves the undo history past a change in the current text. The history
+    /// is one chain of operations, so the change walks back through it,
+    /// newest first, until it runs into text that an operation touched.
+    fn rebase_history(&mut self, mut changed: Range<usize>, inserted: usize) {
+        let delta = inserted as isize - changed.len() as isize;
+        let mut keep_from = 0;
+        'transactions: for (index, transaction) in self.undo_stack.iter_mut().enumerate().rev() {
+            map_selections(&mut transaction.selections_after, &changed, inserted);
+            for operation in transaction.operations.iter_mut().rev() {
+                let operation_end = operation.start + operation.inserted.len();
+                if changed.end <= operation.start {
+                    operation.start = (operation.start as isize + delta) as usize;
+                } else if changed.start >= operation_end {
+                    let shift = operation.inserted.len() as isize - operation.removed.len() as isize;
+                    changed = (changed.start as isize - shift) as usize..(changed.end as isize - shift) as usize;
+                } else {
+                    keep_from = index + 1;
+                    break 'transactions;
+                }
+            }
+            map_selections(&mut transaction.selections_before, &changed, inserted);
+        }
+        if keep_from > 0 {
+            let dropped: Vec<_> = self.undo_stack.drain(..keep_from).collect();
+            self.undo_bytes -= dropped.iter().map(Transaction::bytes).sum::<usize>();
+            self.undo_dropped += keep_from;
+        }
+    }
+
     fn raw_replace(&mut self, range: Range<usize>, text: &str) {
+        if let Some(log) = &mut self.change_log {
+            log.push(TextChange {
+                start: range.start,
+                removed: range.len(),
+                inserted: text.to_string(),
+                removed_text: self.buffer.slice(range.clone()),
+            });
+        }
         let (start_line, start_column) = self.buffer.offset_to_point(range.start);
         let (old_end_line, old_end_column) = self.buffer.offset_to_point(range.end);
         self.buffer.replace(range.clone(), text);
@@ -936,6 +1145,10 @@ impl EditorState {
             mark.range.start = map_mark_offset(mark.range.start, &range, text.len());
             mark.range.end = map_mark_offset(mark.range.end, &range, text.len());
         }
+        for decoration in &mut self.decorations {
+            decoration.range.start = map_mark_offset(decoration.range.start, &range, text.len());
+            decoration.range.end = map_mark_offset(decoration.range.end, &range, text.len());
+        }
     }
 }
 
@@ -947,6 +1160,19 @@ fn map_mark_offset(offset: usize, removed: &Range<usize>, inserted: usize) -> us
     } else {
         removed.start + inserted
     }
+}
+
+fn map_selections(selections: &mut SelectionSet, removed: &Range<usize>, inserted: usize) {
+    let mapped = selections
+        .to_vec_primary_last()
+        .into_iter()
+        .map(|selection| Selection {
+            anchor: map_mark_offset(selection.anchor, removed, inserted),
+            head: map_mark_offset(selection.head, removed, inserted),
+            goal_x: selection.goal_x,
+        })
+        .collect();
+    *selections = SelectionSet::from_vec(mapped);
 }
 
 fn map_offset(offset: usize, edits: &[Edit]) -> usize {
@@ -1113,7 +1339,7 @@ fn opens_latex_environment(line: &str) -> bool {
 }
 
 /// The part of `old` to replace to get `new`, on character boundaries of both.
-fn changed_middle(old: &str, new: &str) -> Range<usize> {
+pub fn changed_middle(old: &str, new: &str) -> Range<usize> {
     let (old_bytes, new_bytes) = (old.as_bytes(), new.as_bytes());
     let longest = old_bytes.len().min(new_bytes.len());
     let mut start = old_bytes.iter().zip(new_bytes).take_while(|(left, right)| left == right).count();
@@ -1597,4 +1823,96 @@ mod tests {
         typst.insert_snippet("alpha", true);
         assert_eq!(typst.buffer().to_string(), "$x alpha$");
     }
+
+    fn remote(start: usize, removed: usize, inserted: &str) -> TextChange {
+        TextChange::new(start, removed, inserted)
+    }
+
+    #[test]
+    fn local_changes_are_logged_and_remote_ones_are_not() {
+        let mut state = EditorState::new("ab", Language::Plain);
+        state.type_text("x");
+        assert!(state.take_changes().is_empty());
+        state.set_change_log(true);
+        state.set_selections(vec![Selection::cursor(3)]);
+        state.type_text("ä");
+        state.apply_remote(&[remote(0, 0, "R")]);
+        state.undo();
+        let undone = TextChange {
+            removed_text: "ä".into(),
+            ..remote(4, 2, "")
+        };
+        assert_eq!(state.take_changes(), vec![remote(3, 0, "ä"), undone]);
+        assert!(state.take_changes().is_empty());
+    }
+
+    #[test]
+    fn undo_reverts_only_local_edits_around_remote_ones() {
+        let mut state = EditorState::new("hello world", Language::Plain);
+        state.set_selections(vec![Selection::cursor(5)]);
+        state.type_text(",");
+        state.seal_undo_group();
+        state.set_selections(vec![Selection::cursor(12)]);
+        state.type_text("!");
+        // Before, between and after the local edits.
+        state.apply_remote(&[remote(0, 0, ">> "), remote(9, 0, "XY"), remote(18, 0, " :)")]);
+        assert_eq!(state.buffer().to_string(), ">> hello,XY world! :)");
+        assert_eq!(state.selections().primary().head, 18);
+        assert!(state.undo());
+        assert_eq!(state.buffer().to_string(), ">> hello,XY world :)");
+        assert!(state.undo());
+        assert_eq!(state.buffer().to_string(), ">> helloXY world :)");
+        assert!(!state.undo());
+    }
+
+    #[test]
+    fn remote_edit_into_local_text_drops_older_history() {
+        let mut state = EditorState::new("", Language::Plain);
+        state.type_text("one");
+        state.seal_undo_group();
+        state.type_text(" two");
+        state.seal_undo_group();
+        state.type_text(" three");
+        // Lands inside " two": that step and everything before it go.
+        state.apply_remote(&[remote(5, 1, "W")]);
+        assert_eq!(state.buffer().to_string(), "one tWo three");
+        assert!(state.undo());
+        assert_eq!(state.buffer().to_string(), "one tWo");
+        assert!(!state.undo());
+        assert_eq!(state.undo_checkpoint(), 2);
+    }
+
+    #[test]
+    fn restored_deletions_leave_the_undo_history() {
+        let mut state = EditorState::new("abc", Language::Plain);
+        state.set_change_log(true);
+        state.set_selections(vec![Selection::cursor(2)]);
+        state.type_text("X");
+        state.seal_undo_group();
+        state.set_selections(vec![Selection::cursor(2)]);
+        state.backspace();
+        let changes = state.take_changes();
+        assert_eq!(changes.last().unwrap().removed_text, "b");
+        state.restore_deleted(&[TextChange::new(1, 0, "b")]);
+        assert_eq!(state.buffer().to_string(), "abXc");
+        // Undo takes back the typing, not the deletion that never stuck.
+        assert!(state.undo());
+        assert_eq!(state.buffer().to_string(), "abc");
+        assert!(!state.undo());
+        assert!(state.take_changes().iter().all(|change| change.inserted.is_empty() || change.inserted == "X"));
+    }
+
+    #[test]
+    fn read_only_blocks_the_user_but_not_others() {
+        let mut state = EditorState::new("ab", Language::Plain);
+        state.type_text("x");
+        state.set_read_only(true);
+        state.set_selections(vec![Selection::cursor(0)]);
+        state.type_text("y");
+        assert!(!state.undo());
+        assert_eq!(state.buffer().to_string(), "xab");
+        state.apply_remote(&[TextChange::new(0, 0, "R")]);
+        assert_eq!(state.buffer().to_string(), "Rxab");
+    }
 }
+
