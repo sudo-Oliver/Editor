@@ -9,7 +9,8 @@ use std::{
 
 use build::Loaded;
 use editor_core::{
-    EditorState, HighlightKind, Language, LineChange, Mark, MarkSeverity, Motion, Selection, Symbol, SymbolKind,
+    Decoration, DecorationKind, EditorState, HighlightKind, Language, LineChange, Mark, MarkSeverity, Motion, Selection, Symbol,
+    SymbolKind, TextChange,
     snippet::Snippet,
     vim::{Effect, Input, Key, Mode, Vim},
 };
@@ -49,6 +50,9 @@ struct Completion {
 
 pub enum EditorEvent {
     Edited,
+    /// Someone else changed the text, in a shared session.
+    #[cfg_attr(not(feature = "collab"), allow(dead_code))]
+    EditedByOthers,
     /// A plain click placed the cursor on this zero-based line.
     CursorClicked { line: usize },
 }
@@ -369,6 +373,35 @@ impl EditorView {
             self.schedule_parse(cx);
             cx.notify();
         }
+    }
+
+    /// Takes edits made by someone else. The view stays where it is.
+    #[cfg_attr(not(feature = "collab"), allow(dead_code))]
+    pub fn apply_remote(&mut self, changes: &[TextChange], cx: &mut Context<Self>) {
+        self.state.apply_remote(changes);
+        self.completion = None;
+        self.schedule_parse(cx);
+        cx.emit(EditorEvent::EditedByOthers);
+        cx.notify();
+    }
+
+    #[cfg_attr(not(feature = "collab"), allow(dead_code))]
+    pub fn set_decorations(&mut self, decorations: Vec<Decoration>, cx: &mut Context<Self>) {
+        if self.state.decorations() != decorations.as_slice() {
+            self.state.set_decorations(decorations);
+            cx.notify();
+        }
+    }
+
+    #[cfg_attr(not(feature = "collab"), allow(dead_code))]
+    pub fn select_range(&mut self, range: Range<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        let length = self.state.buffer().len();
+        self.state.set_selections(vec![Selection::new(range.start.min(length), range.end.min(length))]);
+        self.vim_after_mouse();
+        self.autoscroll = true;
+        self.center_on_scroll = true;
+        self.focus_handle.focus(window, cx);
+        cx.notify();
     }
 
     pub fn go_to_line(&mut self, line: usize, column: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -1328,6 +1361,12 @@ struct EditorPrepaint {
     trail: Option<Vec<Point<Pixels>>>,
     squiggles: Vec<(Point<Pixels>, Pixels, u32)>,
     marked: Vec<(Point<Pixels>, Pixels)>,
+    /// What others do: their selections and comments below the text, then
+    /// suggested insertions, their cursors and names above it.
+    shades: Vec<PaintQuad>,
+    underlines: Vec<(Point<Pixels>, Pixels, u32)>,
+    carets: Vec<PaintQuad>,
+    labels: Vec<(Point<Pixels>, ShapedLine, u32)>,
 }
 
 impl IntoElement for EditorElement {
@@ -1421,6 +1460,9 @@ impl Element for EditorElement {
             for quad in prepaint.search_hits.drain(..) {
                 window.paint_quad(quad);
             }
+            for quad in prepaint.shades.drain(..) {
+                window.paint_quad(quad);
+            }
             for quad in prepaint.selections.drain(..) {
                 window.paint_quad(quad);
             }
@@ -1478,6 +1520,28 @@ impl Element for EditorElement {
                         wavy: false,
                     },
                 );
+            }
+            for (origin, width, color) in &prepaint.underlines {
+                window.paint_underline(
+                    *origin,
+                    *width,
+                    &UnderlineStyle {
+                        thickness: px(2.),
+                        color: Some(theme::color(*color)),
+                        wavy: false,
+                    },
+                );
+            }
+            for quad in prepaint.carets.drain(..) {
+                window.paint_quad(quad);
+            }
+            for (origin, label, color) in &prepaint.labels {
+                let padding = px(3.);
+                window.paint_quad(fill(
+                    Bounds::new(point(origin.x - px(1.), origin.y), size(label.width + padding * 2., px(13.))),
+                    theme::color(*color),
+                ));
+                label.paint(point(origin.x + padding, origin.y), px(13.), TextAlign::Left, None, window, cx).ok();
             }
             if focus_handle.is_focused(window) {
                 for quad in prepaint.cursors.drain(..) {
@@ -1559,6 +1623,10 @@ impl EditorView {
         let mut cursors = Vec::new();
         let mut squiggles = Vec::new();
         let mut marked = Vec::new();
+        let mut shades = Vec::new();
+        let mut underlines = Vec::new();
+        let mut carets = Vec::new();
+        let mut labels = Vec::new();
         let mut cached_line: Option<(usize, String, Vec<Option<HighlightKind>>)> = None;
         let text_left = bounds.left() + self.gutter_width();
 
@@ -1677,6 +1745,54 @@ impl EditorView {
                     squiggles.push((point(text_left + left, baseline), right - left, color));
                 }
             }
+            for decoration in self.state.decorations() {
+                let range = &decoration.range;
+                let at_point = range.is_empty()
+                    && range.start >= row_start
+                    && (range.start < row_end || (range.start == row_end && is_last_segment));
+                let from = range.start.max(row_start);
+                let to = range.end.min(row_end);
+                let x = |offset: usize| text_left + shaped.x_for_index(offset - row_start);
+                match decoration.kind {
+                    DecorationKind::Selection | DecorationKind::Comment if from < to => {
+                        let alpha = if decoration.kind == DecorationKind::Comment { 0.22 } else { 0.28 };
+                        shades.push(fill(
+                            Bounds::from_corners(point(x(from), y), point(x(to), y + line_height)),
+                            theme::color(decoration.color).opacity(alpha),
+                        ));
+                    }
+                    DecorationKind::Inserted if from < to => {
+                        underlines.push((point(x(from), y + line_height - px(2.)), x(to) - x(from), decoration.color));
+                    }
+                    // Struck through, with a tint, so that it reads as going away.
+                    DecorationKind::Deleted if from < to => {
+                        let color = theme::color(decoration.color);
+                        shades.push(fill(Bounds::from_corners(point(x(from), y), point(x(to), y + line_height)), color.opacity(0.14)));
+                        carets.push(fill(Bounds::new(point(x(from), y + line_height / 2. - px(0.75)), size(x(to) - x(from), px(1.5))), color));
+                    }
+                    DecorationKind::Caret | DecorationKind::Deleted if at_point => {
+                        let left = x(range.start);
+                        let width = if decoration.kind == DecorationKind::Caret { px(2.) } else { px(3.) };
+                        carets.push(fill(Bounds::new(point(left - width / 2., y), size(width, line_height)), theme::color(decoration.color)));
+                        if let Some(label) = &decoration.label {
+                            let label: SharedString = label.clone().into();
+                            let run = TextRun {
+                                len: label.len(),
+                                font: Self::plain_font(),
+                                color: theme::color(0xffffff),
+                                background_color: None,
+                                underline: None,
+                                strikethrough: None,
+                            };
+                            let shaped_label = window.text_system().shape_line(label, px(10.), &[run], None);
+                            // Above the line, or below it where the top would cut it off.
+                            let label_y = if y - px(13.) < bounds.top() { y + line_height } else { y - px(13.) };
+                            labels.push((point(left, label_y), shaped_label, decoration.color));
+                        }
+                    }
+                    _ => {}
+                }
+            }
             if let Some(range) = &self.marked_range {
                 let from = range.start.max(row_start);
                 let to = range.end.min(row_end);
@@ -1738,6 +1854,10 @@ impl EditorView {
             trail,
             squiggles,
             marked,
+            shades,
+            underlines,
+            carets,
+            labels,
         }
     }
 }
