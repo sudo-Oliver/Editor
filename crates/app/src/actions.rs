@@ -86,6 +86,7 @@ actions!(
         LayoutPdfTab,
         ToggleFocusMode,
         ToggleHub,
+        OpenGitPanel,
         StartPresentation,
         ExitPresentation,
         PdfNextPage,
@@ -171,6 +172,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-,", OpenSettings, None),
         KeyBinding::new("secondary-shift-m", ToggleFocusMode, None),
         KeyBinding::new("secondary-shift-p", ToggleHub, None),
+        KeyBinding::new("secondary-shift-g", OpenGitPanel, None),
     ]);
     // The slides of a talk turn with every key a clicker or a hand reaches first.
     let presentation = Some("Presentation");
