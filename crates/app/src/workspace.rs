@@ -56,6 +56,10 @@ use crate::{
     theme,
 };
 
+#[cfg(feature = "collab")]
+#[path = "collab_session.rs"]
+mod collab_session;
+
 const RECOVERY_DELAY: Duration = Duration::from_secs(3);
 const TOP_BAR_HEIGHT: f32 = 40.0;
 const RAIL_WIDTH: f32 = 40.0;
@@ -114,6 +118,9 @@ enum LeftPanel {
     Addons,
     /// An index into `addon_panels`.
     Addon(usize),
+    /// The live session with others.
+    #[cfg(feature = "collab")]
+    Collab,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -172,6 +179,8 @@ enum Dialog {
     Settings(SettingsPage),
     Shortcuts,
     WordCount,
+    #[cfg(feature = "collab")]
+    JoinSession,
 }
 
 /// How the PDF on screen relates to the last build.
@@ -491,6 +500,8 @@ pub struct Workspace {
     _watch_task: Option<Task<()>>,
     refresh_task: Option<Task<()>>,
     refresh_again: bool,
+    #[cfg(feature = "collab")]
+    collab: collab_session::CollabUi,
 }
 
 impl Workspace {
@@ -531,6 +542,8 @@ impl Workspace {
             }
             HomeEvent::Close => this.close_hub(window, cx),
             HomeEvent::Trashed(path) => this.forget_trashed_root(path, cx),
+            #[cfg(feature = "collab")]
+            HomeEvent::JoinSession => this.open_join_dialog(window, cx),
         });
         let workspace_handle = cx.entity().downgrade();
         let git_panel = cx.new(|cx| GitPanel::new(workspace_handle, cx));
@@ -551,6 +564,11 @@ impl Workspace {
         {
             theme::set_palette(palette);
         }
+        #[cfg(feature = "collab")]
+        let collab = {
+            let name = if settings.collab_name.is_empty() { collab_session::default_name() } else { settings.collab_name.clone() };
+            collab_session::CollabUi::new(&name, cx)
+        };
         let mut workspace = Self {
             root: None,
             entries: Vec::new(),
@@ -660,6 +678,8 @@ impl Workspace {
             _watch_task: None,
             refresh_task: None,
             refresh_again: false,
+            #[cfg(feature = "collab")]
+            collab,
         };
         workspace.reload_addons(cx);
         match root {
@@ -744,6 +764,8 @@ impl Workspace {
         if !self.save_all(cx) {
             return;
         }
+        #[cfg(feature = "collab")]
+        self.collab_root_changing(&root, cx);
         self.cancel_refresh();
         self.entries = file_tree::scan(&root, &self.collapsed);
         self.tree_target = None;
@@ -791,6 +813,8 @@ impl Workspace {
             self.recompile(cx);
         }
         self.forget_saved_recovery(cx);
+        #[cfg(feature = "collab")]
+        self.collab_root_opened(&root, cx);
         self.offer_recovery(root, window, cx);
         cx.notify();
     }
@@ -940,9 +964,16 @@ impl Workspace {
         });
         let subscription = cx.subscribe(&view, |this, view, event, cx| match event {
             EditorEvent::Edited => {
+                #[cfg(feature = "collab")]
+                this.collab_edited(&view, cx);
                 this.schedule_recovery(cx);
                 this.schedule_type_build(cx);
                 this.check_citation_trigger(&view, cx);
+                cx.notify();
+            }
+            EditorEvent::EditedByOthers => {
+                this.schedule_recovery(cx);
+                this.schedule_type_build(cx);
                 cx.notify();
             }
             EditorEvent::CursorClicked { line } => {
@@ -951,12 +982,20 @@ impl Workspace {
                 }
             }
         });
-        let observer = cx.observe(&view, |this, view, cx| this.cursor_changed(&view, cx));
+        let observer = cx.observe(&view, |this, view, cx| {
+            this.cursor_changed(&view, cx);
+            #[cfg(feature = "collab")]
+            this.collab_cursor(&view, cx);
+        });
         self.documents.push(OpenDocument {
-            view,
+            view: view.clone(),
             _subscription: subscription,
             _observer: observer,
         });
+        #[cfg(feature = "collab")]
+        if self.collab.active() {
+            self.collab_document_opened(&view, cx);
+        }
     }
 
     fn open_image(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
@@ -1084,6 +1123,9 @@ impl Workspace {
         let view = self.documents[index].view.clone();
         window.focus(&view.read(cx).focus_handle(cx), cx);
         self.compile_if_document_changed(cx);
+        // The others see the switch, also before the cursor moves.
+        #[cfg(feature = "collab")]
+        self.collab_cursor(&view, cx);
         cx.notify();
     }
 
@@ -2480,6 +2522,10 @@ impl Workspace {
                 "tab" => cx.stop_propagation(),
                 _ => {}
             }
+            return;
+        }
+        #[cfg(feature = "collab")]
+        if self.collab_key(event, window, cx) {
             return;
         }
         if !self.settings.vim_mode {
@@ -3891,6 +3937,14 @@ impl Workspace {
     }
 
     fn menu_entries(&self, menu: Menu) -> Vec<MenuEntry> {
+        #[allow(unused_mut)]
+        let mut entries = self.base_menu_entries(menu);
+        #[cfg(feature = "collab")]
+        self.add_collab_entries(menu, &mut entries);
+        entries
+    }
+
+    fn base_menu_entries(&self, menu: Menu) -> Vec<MenuEntry> {
         let check = |on: bool, label: &str| format!("{} {label}", if on { "✓" } else { "  " });
         match menu {
             Menu::File => vec![
@@ -4210,7 +4264,7 @@ impl Workspace {
     }
 
     fn render_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let rail_button = |id: &'static str, icon: &'static str, panel: LeftPanel, cx: &mut Context<Self>| {
+        let rail_button = |id: &'static str, icon: &'static str, panel: LeftPanel, cx: &mut Context<Self>| -> gpui::Stateful<gpui::Div> {
             let on = self.show_file_panel && self.left_panel == panel;
             div()
                 .id(id)
@@ -4229,6 +4283,10 @@ impl Workspace {
                 }))
                 .child(Self::icon(icon, 18., theme::palette().ui_text))
         };
+        #[cfg(feature = "collab")]
+        let collab_rail = Some(rail_button("rail-collab", "people", LeftPanel::Collab, cx));
+        #[cfg(not(feature = "collab"))]
+        let collab_rail: Option<gpui::Stateful<gpui::Div>> = None;
         div()
             .flex()
             .flex_none()
@@ -4249,6 +4307,7 @@ impl Workspace {
                     .child(rail_button("rail-files", "file", LeftPanel::Files, cx))
                     .child(rail_button("rail-git", "git-branch", LeftPanel::Git, cx))
                     .child(rail_button("rail-addons", "addon", LeftPanel::Addons, cx))
+                    .children(collab_rail)
                     .children(self.addon_panels.iter().enumerate().map(|(index, entry)| {
                         let panel = LeftPanel::Addon(index);
                         let on = self.show_file_panel && self.left_panel == panel;
@@ -6047,12 +6106,16 @@ impl Workspace {
             Dialog::Settings(_) => "Settings",
             Dialog::Shortcuts => "Keyboard shortcuts",
             Dialog::WordCount => "Word count",
+            #[cfg(feature = "collab")]
+            Dialog::JoinSession => "Join a live session",
         };
         let content = match dialog {
             Dialog::Settings(SettingsPage::Editor) => self.render_editor_settings(cx),
             Dialog::Settings(SettingsPage::Compiler) => self.render_compiler_settings(cx),
             Dialog::Shortcuts => self.render_shortcuts(),
             Dialog::WordCount => self.render_word_count(),
+            #[cfg(feature = "collab")]
+            Dialog::JoinSession => self.render_join_dialog(cx),
         };
         div()
             .id("dialog-backdrop")
@@ -6104,7 +6167,7 @@ impl Workspace {
                             .when_some(
                                 match dialog {
                                     Dialog::Settings(page) => Some(page),
-                                    Dialog::Shortcuts | Dialog::WordCount => None,
+                                    _ => None,
                                 },
                                 |element, page| {
                                     element.child(
@@ -6377,6 +6440,8 @@ impl Render for Workspace {
         self.refresh_outline(cx);
         self.sync_project_symbols(cx);
         self.settle_addon_dialog(window, cx);
+        #[cfg(feature = "collab")]
+        self.collab_frame(window, cx);
         let addon_dialog = self.dialog_panel(cx).map(|panel| self.render_addon_dialog(panel, cx));
         self.tree_cursor = self.tree_cursor.min(self.entries.len().saturating_sub(1));
         let dragging = self.dragging;
@@ -6545,6 +6610,8 @@ impl Render for Workspace {
                                 .child(self.git_panel.clone())
                                 .into_any_element(),
                             LeftPanel::Addons => self.render_addons_panel(cx).into_any_element(),
+                            #[cfg(feature = "collab")]
+                            LeftPanel::Collab => self.render_collab_panel(cx).into_any_element(),
                             LeftPanel::Addon(index) => div()
                                 .flex_none()
                                 .w(self.file_panel_width)

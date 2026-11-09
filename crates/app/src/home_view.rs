@@ -33,6 +33,8 @@ pub enum HomeEvent {
     Close,
     /// The folder went to the trash, so a workspace showing it has to let go.
     Trashed(PathBuf),
+    #[cfg(feature = "collab")]
+    JoinSession,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -629,6 +631,10 @@ impl HomeView {
                 .on_click(cx.listener(move |this, _, window, cx| this.switch_tab(target, window, cx)))
                 .child(label)
         };
+        #[cfg(feature = "collab")]
+        let join = Some(button("hub-join", "Join live session…", false, cx, |_, _, cx| cx.emit(HomeEvent::JoinSession)).into_any_element());
+        #[cfg(not(feature = "collab"))]
+        let join: Option<gpui::AnyElement> = None;
         div()
             .flex()
             .flex_none()
@@ -637,6 +643,7 @@ impl HomeView {
             .child(tab("hub-tab-projects", "Projects", HubTab::Projects, cx))
             .child(tab("hub-tab-templates", "Templates", HubTab::Templates, cx))
             .child(div().flex_1())
+            .children(join)
             .child(button("hub-import", "Import folder as template…", false, cx, |this, window, cx| this.prompt_import_template(window, cx)))
             .child(button("hub-open", "Open folder…", false, cx, |this, _, cx| this.prompt_open_folder(cx)))
             .child(button("hub-new", "New project", true, cx, |this, window, cx| this.open_new_project(0, window, cx)))
