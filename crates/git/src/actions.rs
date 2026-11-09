@@ -1,6 +1,6 @@
 use std::{fs, io::Write, path::Path, process::Stdio};
 
-use crate::{FileChange, Program, Repository, short_error, status::WHOLE_REPOSITORY};
+use crate::{FileChange, GitError, Program, Repository, short_error, status::WHOLE_REPOSITORY};
 
 const BUILD_IGNORE: &str = ".build/";
 
@@ -87,33 +87,43 @@ impl Repository {
     }
 
     /// Publishes the branch to the only remote or `origin` on the first push.
-    pub fn push(&self) -> Result<(), String> {
-        if self.run(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]).is_ok() {
-            return self.run_on_network(&["push"]).map(drop);
+    pub fn push(&self) -> Result<(), GitError> {
+        if self.has_upstream() {
+            return self.run_on_network(&["push"]).map(drop).map_err(explain_rejection);
         }
         let remotes = self.run(["remote"])?;
         let remotes: Vec<&str> = remotes.lines().collect();
         let remote = match remotes.as_slice() {
-            [] => return Err("This repository has no remote. Add one with `git remote add`.".to_string()),
+            [] => return Err("This repository has no remote. Add one with `git remote add`.".to_string().into()),
             [only] => *only,
             _ if remotes.contains(&"origin") => "origin",
-            _ => return Err("This branch has no upstream. Set one with `git push -u`.".to_string()),
+            _ => return Err("This branch has no upstream. Set one with `git push -u`.".to_string().into()),
         };
-        self.run_on_network(&["push", "-u", remote, "HEAD"]).map(drop)
+        self.run_on_network(&["push", "-u", remote, "HEAD"]).map(drop).map_err(explain_rejection)
     }
 
-    /// Only fast-forwards, because a merge may need decisions that this panel
-    /// cannot ask for.
-    pub fn pull(&self) -> Result<(), String> {
+    /// Only fast-forwards, for pulls nobody asked for: a merge may need
+    /// decisions, which `pull_merge` leaves to the user.
+    pub fn pull(&self) -> Result<(), GitError> {
         self.run_on_network(&["pull", "--ff-only"]).map(drop).map_err(|error| {
             let counts = self.run(["rev-list", "--left-right", "--count", "HEAD...@{upstream}"]).unwrap_or_default();
             let diverged = counts.split_whitespace().filter_map(|count| count.parse::<usize>().ok()).all(|count| count > 0);
             if !counts.is_empty() && diverged {
-                "The branch and its upstream have diverged. Merge or rebase in a terminal, then try again.".to_string()
+                "The branch and its upstream have diverged. Pull to merge them.".to_string().into()
             } else {
                 error
             }
         })
+    }
+}
+
+/// The remote has commits that are not here, which git says in its own words.
+fn explain_rejection(error: GitError) -> GitError {
+    match error {
+        GitError::Other(message) if message.contains("[rejected]") || message.contains("fetch first") || message.contains("non-fast-forward") => {
+            GitError::Other("The remote has commits that are not here yet. Pull to bring them in, then push.".to_string())
+        }
+        error => error,
     }
 }
 
@@ -275,7 +285,7 @@ mod tests {
         write(&first, "a.tex", "1\n");
         repo.stage_all().unwrap();
         repo.commit("one").unwrap();
-        assert!(repo.push().unwrap_err().contains("no remote"));
+        assert!(repo.push().unwrap_err().to_string().contains("no remote"));
 
         git(&first, &["remote", "add", "origin", remote.to_str().unwrap()]);
         repo.push().unwrap();
@@ -301,7 +311,7 @@ mod tests {
         other.commit("there").unwrap();
         other.push().unwrap();
 
-        let error = repo.pull().unwrap_err();
+        let error = repo.pull().unwrap_err().to_string();
         assert!(error.contains("diverged"), "{error}");
         assert!(!first.join("c.tex").exists());
         assert!(repo.push().is_err());

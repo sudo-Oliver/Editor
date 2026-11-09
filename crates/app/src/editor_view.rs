@@ -4,13 +4,15 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use build::Loaded;
 use editor_core::{
     Decoration, DecorationKind, EditorState, HighlightKind, Language, LineChange, Mark, MarkSeverity, Motion, Selection, Symbol,
     SymbolKind, TextChange,
+    conflicts::{Choice, Conflict, conflicts},
+    line_diff::{HunkKind, LineHunk, line_diff},
     snippet::Snippet,
     vim::{Effect, Input, Key, Mode, Vim},
 };
@@ -58,6 +60,12 @@ pub enum EditorEvent {
 }
 
 const MAX_ROW_CHANGES: usize = 64;
+/// Marks of changed lines wait for typing to pause.
+const LINE_DIFF_DELAY: Duration = Duration::from_millis(300);
+const CONFLICT_START: &str = "<<<<<<<";
+const GUTTER_MARK_WIDTH: f32 = 3.0;
+const CONFLICT_OURS: u32 = 0x2b8a3e;
+const CONFLICT_THEIRS: u32 = 0x2f80ed;
 
 /// The lines of `Rows` without wrap information, and whether lines moved.
 struct RowsDirty {
@@ -196,6 +204,14 @@ pub struct EditorView {
     loaded_packages: Arc<Loaded>,
     /// What those packages define and what the project already uses.
     package_extra: Arc<Extra>,
+    /// The text as of the last commit, for marks next to changed lines.
+    diff_base: Option<Arc<str>>,
+    diff_hunks: Vec<LineHunk>,
+    diff_task: Option<Task<()>>,
+    /// Merge conflicts in the text, while it has any.
+    conflicts: Vec<Conflict>,
+    /// The text had conflict markers when it was last looked at.
+    may_conflict: bool,
 }
 
 impl EventEmitter<EditorEvent> for EditorView {}
@@ -261,9 +277,78 @@ impl EditorView {
             project_symbols: Arc::default(),
             loaded_packages: Arc::default(),
             package_extra: Arc::default(),
+            diff_base: None,
+            diff_hunks: Vec::new(),
+            diff_task: None,
+            conflicts: Vec::new(),
+            may_conflict: text.contains(CONFLICT_START),
         };
         view.schedule_parse(cx);
         view
+    }
+
+    /// Sets the text to compare with, as of the last commit, or none.
+    pub fn set_diff_base(&mut self, base: Option<Arc<str>>, cx: &mut Context<Self>) {
+        if self.diff_base.as_deref() == base.as_deref() {
+            return;
+        }
+        self.diff_base = base;
+        if self.diff_base.is_none() {
+            self.diff_hunks.clear();
+            cx.notify();
+        }
+        self.schedule_line_diff(Duration::ZERO, cx);
+    }
+
+    pub fn diff_hunks(&self) -> &[LineHunk] {
+        &self.diff_hunks
+    }
+
+    pub fn conflicts(&self) -> &[Conflict] {
+        &self.conflicts
+    }
+
+    /// Compares with the base on the background executor, once typing pauses.
+    fn schedule_line_diff(&mut self, delay: Duration, cx: &mut Context<Self>) {
+        let Some(base) = self.diff_base.clone() else {
+            return;
+        };
+        let text = self.state.buffer().to_string();
+        self.diff_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let hunks = cx.background_spawn(async move { line_diff(&base, &text).unwrap_or_default() }).await;
+            this.update(cx, |this, cx| {
+                this.diff_task = None;
+                if this.diff_hunks != hunks {
+                    this.diff_hunks = hunks;
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// Finds conflict blocks again, which only costs while a file has some.
+    fn refresh_conflicts(&mut self) {
+        if !self.may_conflict {
+            return;
+        }
+        let text = self.state.buffer().to_string();
+        self.conflicts = conflicts(&text);
+        self.may_conflict = !self.conflicts.is_empty() || text.contains(CONFLICT_START);
+    }
+
+    /// Replaces a conflict block with the chosen side, as one undo step.
+    pub fn resolve_conflict(&mut self, index: usize, choice: Choice, cx: &mut Context<Self>) {
+        let Some(conflict) = self.conflicts.get(index).cloned() else {
+            return;
+        };
+        let text = self.state.buffer().to_string();
+        let resolved = conflict.resolve(&text, choice);
+        let cursor = Selection::cursor(conflict.whole.start);
+        self.state.replace_range(conflict.whole.clone(), &resolved, cursor);
+        self.state.seal_undo_group();
+        self.changed(cx);
     }
 
     pub fn set_plain(&mut self) {
@@ -341,6 +426,7 @@ impl EditorView {
         };
         let text = std::fs::read_to_string(path)?;
         self.disk_hash = content_hash(text.as_bytes());
+        self.may_conflict = text.contains(CONFLICT_START);
         self.state.reload(&text);
         self.schedule_parse(cx);
         cx.notify();
@@ -369,6 +455,8 @@ impl EditorView {
         }
         self.disk_hash = content_hash(text.as_bytes());
         if *self.state.buffer().rope() != text {
+            // A merge writes its conflicts to disk.
+            self.may_conflict = text.contains(CONFLICT_START);
             self.state.reload(text);
             self.schedule_parse(cx);
             cx.notify();
@@ -710,6 +798,9 @@ impl EditorView {
     }
 
     fn schedule_parse(&mut self, cx: &mut Context<Self>) {
+        // Every change of the text comes through here.
+        self.refresh_conflicts();
+        self.schedule_line_diff(LINE_DIFF_DELAY, cx);
         if self.parse_task.is_some() {
             self.reparse_needed = true;
             return;
@@ -1364,6 +1455,8 @@ struct EditorPrepaint {
     /// What others do: their selections and comments below the text, then
     /// suggested insertions, their cursors and names above it.
     shades: Vec<PaintQuad>,
+    /// Changed lines since the last commit, next to the line numbers.
+    gutter_marks: Vec<PaintQuad>,
     underlines: Vec<(Point<Pixels>, Pixels, u32)>,
     carets: Vec<PaintQuad>,
     labels: Vec<(Point<Pixels>, ShapedLine, u32)>,
@@ -1461,6 +1554,9 @@ impl Element for EditorElement {
                 window.paint_quad(quad);
             }
             for quad in prepaint.shades.drain(..) {
+                window.paint_quad(quad);
+            }
+            for quad in prepaint.gutter_marks.drain(..) {
                 window.paint_quad(quad);
             }
             for quad in prepaint.selections.drain(..) {
@@ -1624,6 +1720,7 @@ impl EditorView {
         let mut squiggles = Vec::new();
         let mut marked = Vec::new();
         let mut shades = Vec::new();
+        let mut gutter_marks = Vec::new();
         let mut underlines = Vec::new();
         let mut carets = Vec::new();
         let mut labels = Vec::new();
@@ -1745,6 +1842,38 @@ impl EditorView {
                     squiggles.push((point(text_left + left, baseline), right - left, color));
                 }
             }
+            if segment == 0 && !self.plain {
+                // Deleted lines sit at a line with an empty range, so they count as one line here.
+                let index = self.diff_hunks.partition_point(|hunk| hunk.lines.end.max(hunk.lines.start + 1) <= line);
+                for hunk in &self.diff_hunks[index..] {
+                    if hunk.lines.start > line {
+                        break;
+                    }
+                    let (color, mark) = match hunk.kind {
+                        HunkKind::Added => (theme::palette().st_green, Bounds::new(point(bounds.left() + px(1.), y), size(px(GUTTER_MARK_WIDTH), line_height))),
+                        HunkKind::Modified => (theme::palette().function, Bounds::new(point(bounds.left() + px(1.), y), size(px(GUTTER_MARK_WIDTH), line_height))),
+                        // A thin bar where the lines went, between this line and the one before.
+                        HunkKind::Deleted => (theme::palette().error, Bounds::new(point(bounds.left() + px(1.), y - px(1.)), size(px(8.), px(2.)))),
+                    };
+                    if hunk.kind == HunkKind::Deleted || hunk.lines.contains(&line) {
+                        gutter_marks.push(fill(mark, theme::color(color)));
+                    }
+                }
+            }
+            if let Some(conflict) = self.conflicts.iter().find(|conflict| conflict.whole.start <= row_start && row_start < conflict.whole.end) {
+                let in_side = |side: &Range<usize>| side.start <= row_start && row_start < side.end.max(side.start + 1) && side.start < side.end;
+                let (color, alpha) = if in_side(&conflict.ours) {
+                    (CONFLICT_OURS, 0.16)
+                } else if in_side(&conflict.theirs) {
+                    (CONFLICT_THEIRS, 0.16)
+                } else if conflict.base.as_ref().is_some_and(in_side) {
+                    (theme::palette().ui_muted, 0.12)
+                } else {
+                    // A marker line.
+                    (theme::palette().ui_muted, 0.28)
+                };
+                shades.push(fill(Bounds::from_corners(point(text_left, y), point(bounds.right(), y + line_height)), theme::color(color).opacity(alpha)));
+            }
             for decoration in self.state.decorations() {
                 let range = &decoration.range;
                 let at_point = range.is_empty()
@@ -1855,6 +1984,7 @@ impl EditorView {
             squiggles,
             marked,
             shades,
+            gutter_marks,
             underlines,
             carets,
             labels,
