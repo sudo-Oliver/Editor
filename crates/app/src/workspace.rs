@@ -59,6 +59,8 @@ use crate::{
 #[cfg(feature = "collab")]
 #[path = "collab_session.rs"]
 mod collab_session;
+#[path = "git_sync.rs"]
+mod git_sync;
 
 const RECOVERY_DELAY: Duration = Duration::from_secs(3);
 const TOP_BAR_HEIGHT: f32 = 40.0;
@@ -181,6 +183,8 @@ enum Dialog {
     WordCount,
     #[cfg(feature = "collab")]
     JoinSession,
+    GitSignIn,
+    CommitDiff,
 }
 
 /// How the PDF on screen relates to the last build.
@@ -502,6 +506,7 @@ pub struct Workspace {
     refresh_again: bool,
     #[cfg(feature = "collab")]
     collab: collab_session::CollabUi,
+    git: git_sync::GitUi,
 }
 
 impl Workspace {
@@ -553,7 +558,11 @@ impl Workspace {
             GitPanelEvent::Changed(branch) => {
                 this.git_branch = branch.clone().or_else(|| this.root.as_deref().and_then(git_branch));
                 this.refresh_in_background(cx);
+                this.refresh_diff_bases(cx);
             }
+            GitPanelEvent::SignIn { host } => this.open_sign_in(host.clone(), window, cx),
+            GitPanelEvent::Conflicts(files) => this.show_conflicts(files, window, cx),
+            GitPanelEvent::ShowCommit { title, patch } => this.show_commit(title, patch, window, cx),
         });
         let settings_path = settings::default_path();
         let settings = settings_path.as_deref().map(Settings::load).unwrap_or_default();
@@ -680,6 +689,7 @@ impl Workspace {
             refresh_again: false,
             #[cfg(feature = "collab")]
             collab,
+            git: git_sync::GitUi::default(),
         };
         workspace.reload_addons(cx);
         match root {
@@ -813,6 +823,7 @@ impl Workspace {
             self.recompile(cx);
         }
         self.forget_saved_recovery(cx);
+        self.git_root_opened(cx);
         #[cfg(feature = "collab")]
         self.collab_root_opened(&root, cx);
         self.offer_recovery(root, window, cx);
@@ -897,6 +908,7 @@ impl Workspace {
                     this.entries = entries;
                 }
                 this.git_panel.update(cx, |panel, cx| panel.refresh(cx));
+                this.refresh_git(cx);
                 cx.notify();
                 if std::mem::take(&mut this.refresh_again) {
                     this.refresh_in_background(cx);
@@ -992,6 +1004,7 @@ impl Workspace {
             _subscription: subscription,
             _observer: observer,
         });
+        self.load_diff_base(&view, cx);
         #[cfg(feature = "collab")]
         if self.collab.active() {
             self.collab_document_opened(&view, cx);
@@ -2485,6 +2498,9 @@ impl Workspace {
             }
             return;
         }
+        if self.git_key(event, window, cx) {
+            return;
+        }
         if event.keystroke.modifiers.platform {
             return;
         }
@@ -3954,6 +3970,7 @@ impl Workspace {
                 entry("Make a copy", "", |this, window, cx| this.make_copy(window, cx)),
                 menu_separator(),
                 entry("Version history", "", |this, _, cx| this.show_version_history(cx)),
+                entry("Commit and sync…", "⇧⌘G", |this, window, cx| this.open_git_panel(window, cx)),
                 entry("Word count…", "", |this, window, cx| this.show_word_count(window, cx)),
                 menu_separator(),
                 menu_heading("Download"),
@@ -4392,6 +4409,7 @@ impl Workspace {
                 let path = entry.path.clone();
                 let is_dir = entry.is_dir;
                 let collapsed = self.collapsed.contains(&entry.path);
+                let git_mark = self.tree_git_mark(&entry.path, is_dir);
                 div()
                     .id(index)
                     .flex()
@@ -4431,7 +4449,18 @@ impl Workspace {
                         ))
                     })
                     .child(Self::icon(Self::file_icon(entry), 16., if is_dir { theme::palette().folder } else { theme::palette().ui_text }))
-                    .child(div().truncate().when(is_dir, |name| name.text_color(theme::color(theme::palette().folder))).child(entry.name.clone()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .when(is_dir, |name| name.text_color(theme::color(theme::palette().folder)))
+                            .when_some(git_mark.filter(|_| !is_dir), |name, (_, color)| name.text_color(theme::color(color)))
+                            .child(entry.name.clone()),
+                    )
+                    .children(git_mark.map(|(letter, color)| {
+                        div().flex_none().pr(px(8.)).font_family(theme::CODE_FONT).text_size(px(11.)).text_color(theme::color(color)).child(letter.to_string())
+                    }))
             })
             .collect()
     }
@@ -5157,6 +5186,7 @@ impl Workspace {
             .when(self.show_breadcrumbs(), |element| element.child(self.render_breadcrumbs(cx)))
             .children(toolbar)
             .child(div().flex_1().min_h_0().child(body))
+            .children(self.render_conflict_strip(cx))
             .when_some(self.cursor_hint(cx).cloned(), |element, hint| element.child(self.render_hint_strip(&hint, cx)))
             .when(self.error_count() > 0, |element| element.child(self.render_error_strip(cx)))
     }
@@ -5790,6 +5820,14 @@ impl Workspace {
             )
             .into_any_element(),
             Self::setting_row(
+                "Sync with git in the background",
+                "Fetches every few minutes and brings in new commits when nothing local is in the way. Pushing always waits for you.",
+                self.toggle_switch("git-sync-setting", self.settings.git_background_sync, true, cx, |this, window, cx| {
+                    this.update_settings(|settings| settings.git_background_sync = !settings.git_background_sync, window, cx);
+                }),
+            )
+            .into_any_element(),
+            Self::setting_row(
                 "Editor tabs",
                 "Shows the open files as tabs. Without them, the file tree and the picker switch files.",
                 self.toggle_switch("tabs-setting", self.settings.show_tabs, true, cx, |this, window, cx| {
@@ -6102,12 +6140,14 @@ impl Workspace {
     }
 
     fn render_dialog(&self, dialog: Dialog, cx: &mut Context<Self>) -> impl IntoElement {
-        let title = match dialog {
-            Dialog::Settings(_) => "Settings",
-            Dialog::Shortcuts => "Keyboard shortcuts",
-            Dialog::WordCount => "Word count",
+        let title: SharedString = match dialog {
+            Dialog::Settings(_) => "Settings".into(),
+            Dialog::Shortcuts => "Keyboard shortcuts".into(),
+            Dialog::WordCount => "Word count".into(),
             #[cfg(feature = "collab")]
-            Dialog::JoinSession => "Join a live session",
+            Dialog::JoinSession => "Join a live session".into(),
+            Dialog::GitSignIn => "Sign in".into(),
+            Dialog::CommitDiff => self.commit_title(),
         };
         let content = match dialog {
             Dialog::Settings(SettingsPage::Editor) => self.render_editor_settings(cx),
@@ -6116,6 +6156,8 @@ impl Workspace {
             Dialog::WordCount => self.render_word_count(),
             #[cfg(feature = "collab")]
             Dialog::JoinSession => self.render_join_dialog(cx),
+            Dialog::GitSignIn => self.render_sign_in(cx),
+            Dialog::CommitDiff => self.render_commit_view(),
         };
         div()
             .id("dialog-backdrop")
@@ -6454,6 +6496,9 @@ impl Render for Workspace {
         // Git runs only while its panel shows.
         let git_visible = show_file_panel && self.left_panel == LeftPanel::Git;
         self.git_panel.update(cx, |panel, cx| panel.set_visible(git_visible, cx));
+        if git_visible {
+            self.trust_git_root(window, cx);
+        }
         if show_file_panel && self.left_panel == LeftPanel::Addons && matches!(self.catalog, CatalogState::Idle) {
             self.fetch_catalog(cx);
         }
@@ -6531,6 +6576,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &LayoutPdfTab, window, cx| this.set_layout(PaneLayout::PdfTab, window, cx)))
             .on_action(cx.listener(|this, _: &ToggleFocusMode, window, cx| this.toggle_focus_mode(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleHub, window, cx| this.toggle_hub(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenGitPanel, window, cx| this.open_git_panel(window, cx)))
             .on_action(cx.listener(|this, _: &StartPresentation, window, cx| this.start_presentation(window, cx)))
             .on_action(cx.listener(|this, _: &ExitPresentation, window, cx| this.exit_presentation(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleLogs, _, cx| {
@@ -6604,10 +6650,15 @@ impl Render for Workspace {
                         let panel = match self.left_panel {
                             LeftPanel::Files => self.render_file_panel(cx).into_any_element(),
                             LeftPanel::Git => div()
+                                .flex()
+                                .flex_col()
                                 .flex_none()
                                 .w(self.file_panel_width)
                                 .h_full()
-                                .child(self.git_panel.clone())
+                                .children(self.git_note().map(|note| {
+                                    div().flex_none().px(px(10.)).py(px(6.)).text_color(theme::color(theme::palette().warning)).child(note)
+                                }))
+                                .child(div().flex_1().min_h_0().child(self.git_panel.clone()))
                                 .into_any_element(),
                             LeftPanel::Addons => self.render_addons_panel(cx).into_any_element(),
                             #[cfg(feature = "collab")]

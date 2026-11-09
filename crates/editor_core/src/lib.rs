@@ -1,5 +1,7 @@
 pub mod vim;
 pub mod buffer;
+pub mod conflicts;
+pub mod line_diff;
 pub mod latex_usage;
 pub mod word_count;
 pub mod selection;

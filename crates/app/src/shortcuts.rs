@@ -38,6 +38,7 @@ pub fn sections(vim_mode: bool) -> Vec<Section> {
                 (modified("N"), "New file"),
                 (modified("O"), "Open folder"),
                 (modified("Shift+P"), "Project hub"),
+                (modified("Shift+G"), "Git panel"),
                 (modified("W"), "Close tab"),
                 (modified("1 to 9"), "Go to tab"),
                 (modified(","), "Settings"),

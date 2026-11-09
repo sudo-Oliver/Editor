@@ -8,7 +8,7 @@ use std::{
 };
 
 use build::{child_path, find_tool};
-use git::{Commit, FileChange, GraphRow, Lanes, PAGE_SIZE, Program, Repository, Status};
+use git::{Commit, FileChange, GitError, GraphRow, Lanes, PAGE_SIZE, Program, PullOutcome, Repository, Status};
 use gpui::{
     AnyElement, Bounds, Context, Entity, EventEmitter, Focusable, FontWeight, PathBuilder, Pixels, Render,
     SharedString, Task, UniformListScrollHandle, WeakEntity, Window, canvas, div, fill, point, prelude::*, px, size, svg,
@@ -39,6 +39,20 @@ pub enum GitPanelEvent {
     PickBranch,
     /// Git changed files or the branch.
     Changed(Option<String>),
+    /// A remote at this host wants a login. The action runs again after it.
+    SignIn { host: String },
+    /// A merge stopped at conflicts in these files, by absolute path.
+    Conflicts(Vec<PathBuf>),
+    /// Show what a commit changed.
+    ShowCommit { title: String, patch: String },
+}
+
+/// What talked to a remote last, to try again after a login.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetworkAction {
+    Pull,
+    Push,
+    CommitAndPush,
 }
 
 enum RepoState {
@@ -77,6 +91,11 @@ pub struct GitPanel {
     refresh_task: Option<Task<()>>,
     refresh_again: bool,
     action_task: Option<Task<()>>,
+    /// A merge waits for its conflicts to be solved.
+    merging: bool,
+    /// A commit message made from the changes, for an empty field.
+    suggestion: Option<String>,
+    last_network: Option<NetworkAction>,
 }
 
 impl EventEmitter<GitPanelEvent> for GitPanel {}
@@ -112,6 +131,48 @@ impl GitPanel {
             refresh_task: None,
             refresh_again: false,
             action_task: None,
+            merging: false,
+            suggestion: None,
+            last_network: None,
+        }
+    }
+
+    pub fn set_suggestion(&mut self, suggestion: Option<String>, cx: &mut Context<Self>) {
+        if self.suggestion != suggestion {
+            self.suggestion = suggestion;
+            cx.notify();
+        }
+    }
+
+    /// Puts the suggestion into the empty field, to edit it. Returns whether
+    /// there was one to take.
+    pub fn take_suggestion(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(suggestion) = self.suggestion.clone() else {
+            return false;
+        };
+        if !self.commit_box.read(cx).state.buffer().is_empty() {
+            return false;
+        }
+        self.commit_box.update(cx, |view, cx| {
+            view.state.reload(&suggestion);
+            view.state.set_selections(vec![editor_core::Selection::cursor(suggestion.len())]);
+            cx.notify();
+        });
+        true
+    }
+
+    /// Focuses the commit message, for the shortcut that opens the panel.
+    pub fn focus_commit_box(&self, window: &mut Window, cx: &mut gpui::App) {
+        window.focus(&self.commit_box.read(cx).focus_handle(cx), cx);
+    }
+
+    /// Runs the network action that last asked for a login, after one.
+    pub fn retry_network(&mut self, cx: &mut Context<Self>) {
+        match self.last_network {
+            Some(NetworkAction::Pull) => self.pull(cx),
+            Some(NetworkAction::Push) => self.push(cx),
+            Some(NetworkAction::CommitAndPush) => self.push(cx),
+            None => {}
         }
     }
 
@@ -174,7 +235,7 @@ impl GitPanel {
             return;
         };
         if self.program.is_none() {
-            self.program = find_tool("git").map(|path| Program { path, path_env: child_path() });
+            self.program = program();
         }
         let Some(program) = self.program.clone() else {
             self.state = RepoState::GitMissing;
@@ -205,6 +266,7 @@ impl GitPanel {
             }
             Ok(Some(read)) => {
                 let branch_changed = self.status.branch != read.status.branch;
+                self.merging = read.merging;
                 self.state = RepoState::Ready(read.repository);
                 self.status = read.status;
                 if self.history_refs.as_deref() != Some(&read.refs) {
@@ -267,6 +329,11 @@ impl GitPanel {
 
     /// Runs one change at a time, in the background.
     pub fn run(&mut self, cx: &mut Context<Self>, action: impl FnOnce(&Repository) -> Result<(), String> + Send + 'static) {
+        self.run_networked(cx, move |repository| action(repository).map_err(GitError::from));
+    }
+
+    /// Like `run`, for actions whose failure may be a missing login.
+    fn run_networked(&mut self, cx: &mut Context<Self>, action: impl FnOnce(&Repository) -> Result<(), GitError> + Send + 'static) {
         if self.busy {
             return;
         }
@@ -285,10 +352,13 @@ impl GitPanel {
         }));
     }
 
-    fn finish_action(&mut self, result: Result<(), String>, cx: &mut Context<Self>) {
+    fn finish_action(&mut self, result: Result<(), GitError>, cx: &mut Context<Self>) {
         self.busy = false;
         self.action_task = None;
-        self.error = result.err();
+        if let Err(GitError::Auth { host }) = &result {
+            cx.emit(GitPanelEvent::SignIn { host: host.clone() });
+        }
+        self.error = result.err().map(|error| error.to_string());
         self.refresh(cx);
         cx.emit(GitPanelEvent::Changed(self.status.branch.clone()));
         cx.notify();
@@ -314,7 +384,7 @@ impl GitPanel {
         self.busy = true;
         self.error = None;
         self.action_task = Some(cx.spawn(async move |this, cx| {
-            let result = cx.background_spawn(async move { program.init(&root).map(drop) }).await;
+            let result = cx.background_spawn(async move { program.init(&root).map(drop).map_err(GitError::from) }).await;
             this.update(cx, |this, cx| this.finish_action(result, cx)).ok();
         }));
         cx.notify();
@@ -324,22 +394,49 @@ impl GitPanel {
         self.commit_box.read(cx).state.buffer().to_string().trim().to_string()
     }
 
-    fn can_commit(&self, cx: &gpui::App) -> bool {
-        !self.busy && self.status.files.iter().any(|file| file.staged.is_some()) && !self.commit_message(cx).is_empty()
+    /// The typed message, or else the suggestion.
+    fn message_or_suggestion(&self, cx: &gpui::App) -> String {
+        let typed = self.commit_message(cx);
+        if typed.is_empty() { self.suggestion.clone().unwrap_or_default() } else { typed }
     }
 
-    fn commit(&mut self, cx: &mut Context<Self>) {
+    fn can_commit(&self, cx: &gpui::App) -> bool {
+        !self.busy && !self.merging && !self.status.files.is_empty() && !self.message_or_suggestion(cx).is_empty()
+    }
+
+    /// Commits what is staged, or every change when nothing is, and pushes
+    /// after that if asked to.
+    pub fn commit_and_maybe_push(&mut self, push: bool, cx: &mut Context<Self>) {
         if !self.can_commit(cx) || !self.save_documents(cx) {
             return;
         }
         let Some(repository) = self.repository() else {
             return;
         };
-        let message = self.commit_message(cx);
+        let message = self.message_or_suggestion(cx);
+        let stage_everything = !self.status.files.iter().any(|file| file.staged.is_some());
+        if push {
+            self.last_network = Some(NetworkAction::CommitAndPush);
+        }
         self.busy = true;
         self.error = None;
         self.action_task = Some(cx.spawn(async move |this, cx| {
-            let result = cx.background_spawn(async move { repository.commit(&message) }).await;
+            let result = cx
+                .background_spawn(async move {
+                    if stage_everything {
+                        repository.stage_all()?;
+                    }
+                    repository.commit(&message)?;
+                    if push {
+                        // The commit stays, also when the push fails.
+                        repository.push().map_err(|error| match error {
+                            GitError::Auth { host } => GitError::Auth { host },
+                            GitError::Other(message) => GitError::Other(format!("Committed. The push failed: {message}")),
+                        })?;
+                    }
+                    Ok::<(), GitError>(())
+                })
+                .await;
             this.update(cx, |this, cx| {
                 // A failed commit keeps the message for the next try.
                 if result.is_ok() {
@@ -350,6 +447,86 @@ impl GitPanel {
             .ok();
         }));
         cx.notify();
+    }
+
+    fn commit(&mut self, cx: &mut Context<Self>) {
+        self.commit_and_maybe_push(false, cx);
+    }
+
+    fn push(&mut self, cx: &mut Context<Self>) {
+        self.last_network = Some(NetworkAction::Push);
+        self.run_networked(cx, Repository::push);
+    }
+
+    /// Merges what others pushed. Conflicts stop the merge for the user to
+    /// solve in the editor.
+    fn pull(&mut self, cx: &mut Context<Self>) {
+        if self.busy || !self.save_documents(cx) {
+            return;
+        }
+        let Some(repository) = self.repository() else {
+            return;
+        };
+        self.last_network = Some(NetworkAction::Pull);
+        self.busy = true;
+        self.error = None;
+        cx.notify();
+        let root = repository.root().to_path_buf();
+        self.action_task = Some(cx.spawn(async move |this, cx| {
+            let outcome = cx.background_spawn(async move { repository.pull_merge() }).await;
+            this.update(cx, |this, cx| match outcome {
+                Ok(PullOutcome::Conflicts(files)) => {
+                    this.merging = true;
+                    cx.emit(GitPanelEvent::Conflicts(files.iter().map(|file| root.join(file)).collect()));
+                    this.finish_action(Err(GitError::Other(format!("The merge stopped at conflicts in {} files. Solve them in the editor, then finish the merge.", files.len()))), cx);
+                }
+                Ok(_) => this.finish_action(Ok(()), cx),
+                Err(error) => this.finish_action(Err(error), cx),
+            })
+            .ok();
+        }));
+    }
+
+    /// Records the merge once no conflict markers are left.
+    fn finish_merge(&mut self, cx: &mut Context<Self>) {
+        if !self.save_documents(cx) {
+            return;
+        }
+        let files: Vec<String> = self.status.files.iter().filter(|file| file.conflicted).map(|file| file.path.clone()).collect();
+        self.run(cx, move |repository| {
+            let left: Vec<&String> = files
+                .iter()
+                .filter(|file| std::fs::read_to_string(repository.root().join(file)).is_ok_and(|text| !editor_core::conflicts::conflicts(&text).is_empty()))
+                .collect();
+            if !left.is_empty() {
+                let names: Vec<&str> = left.iter().map(|file| file.as_str()).collect();
+                return Err(format!("Conflicts are left in {}.", names.join(", ")));
+            }
+            repository.finish_merge(&files)
+        });
+    }
+
+    fn abort_merge(&mut self, cx: &mut Context<Self>) {
+        self.run(cx, Repository::abort_merge);
+    }
+
+    fn show_commit(&mut self, index: usize, cx: &mut Context<Self>) {
+        let (Some(repository), Some(commit)) = (self.repository(), self.commits.get(index)) else {
+            return;
+        };
+        let (oid, title) = (commit.hash.clone(), commit.subject.clone());
+        cx.spawn(async move |this, cx| {
+            let patch = cx.background_spawn(async move { repository.commit_patch(&oid) }).await;
+            this.update(cx, |this, cx| match patch {
+                Ok(patch) => cx.emit(GitPanelEvent::ShowCommit { title, patch }),
+                Err(error) => {
+                    this.error = Some(error);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn icon(name: &'static str, size: f32, color: u32) -> impl IntoElement {
@@ -417,12 +594,8 @@ impl GitPanel {
                     .child(div().min_w_0().truncate().child(branch)),
             )
             .children(counts.map(|counts| div().flex_none().px(px(3.)).text_color(theme::color(theme::palette().ui_muted)).child(counts)))
-            .child(self.icon_button("git-pull", "download", cx, |this, cx| {
-                this.change_with_saved_files(cx, Repository::pull);
-            }))
-            .child(self.icon_button("git-push", "upload", cx, |this, cx| {
-                this.run(cx, Repository::push);
-            }))
+            .child(self.icon_button("git-pull", "download", cx, |this, cx| this.pull(cx)))
+            .child(self.icon_button("git-push", "upload", cx, |this, cx| this.push(cx)))
             .child(self.icon_button("git-refresh", "refresh", cx, |this, cx| this.refresh(cx)))
     }
 
@@ -513,6 +686,45 @@ impl GitPanel {
         if nothing {
             list = list.child(div().p(px(10.)).text_color(theme::color(theme::palette().ui_muted)).child("No changes."));
         }
+        if self.merging {
+            let busy = self.busy;
+            let button = |id: &'static str, label: &'static str, primary: bool, cx: &mut Context<Self>, action: fn(&mut Self, &mut Context<Self>)| {
+                div()
+                    .id(id)
+                    .flex_none()
+                    .px(px(8.))
+                    .py(px(3.))
+                    .rounded(px(4.))
+                    .when(!busy, |style| style.cursor_pointer())
+                    .bg(theme::color(if primary { theme::palette().accent } else { theme::palette().divider }))
+                    .when(primary, |style| style.text_color(theme::color(theme::palette().on_accent)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.busy {
+                            action(this, cx);
+                        }
+                    }))
+                    .child(label)
+            };
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .p(px(10.))
+                    .child(div().text_color(theme::color(theme::palette().ui_muted)).child(if conflicts.is_empty() {
+                        "All conflicts are solved. Finish the merge to record it."
+                    } else {
+                        "A merge waits. Open each conflicted file and choose a side for every conflict."
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(6.))
+                            .child(button("git-finish-merge", "Finish merge", true, cx, Self::finish_merge))
+                            .child(button("git-abort-merge", "Abort merge", false, cx, Self::abort_merge)),
+                    ),
+            );
+        }
         if !conflicts.is_empty() {
             list = list.child(self.render_group_title("git-conflicts", "Conflicts", conflicts.len(), None, cx));
             for (index, file) in conflicts.iter().take(MAX_FILES_SHOWN).enumerate() {
@@ -555,6 +767,27 @@ impl GitPanel {
     fn render_commit_box(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let empty = self.commit_box.read(cx).state.buffer().is_empty();
         let enabled = self.can_commit(cx);
+        let placeholder: SharedString = match &self.suggestion {
+            Some(suggestion) => format!("{suggestion} (Tab to edit)").into(),
+            None => "Commit message".into(),
+        };
+        let button = |id: &'static str, label: &'static str, primary: bool, push: bool, cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .h(px(26.))
+                .rounded(px(4.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .bg(theme::color(if enabled && primary { theme::palette().accent } else { theme::palette().divider }))
+                .when(enabled && primary, |style| style.text_color(theme::color(theme::palette().on_accent)))
+                .when(enabled, |style| style.cursor_pointer())
+                .when(!enabled, |style| style.text_color(theme::color(theme::palette().ui_muted)))
+                .on_click(cx.listener(move |this, _, _, cx| this.commit_and_maybe_push(push, cx)))
+                .child(label)
+        };
         div()
             .flex()
             .flex_col()
@@ -578,33 +811,25 @@ impl GitPanel {
                                 .absolute()
                                 .top_0()
                                 .left(px(6.))
+                                .right(px(6.))
                                 .font_family(theme::CODE_FONT)
                                 .text_size(px(theme::CODE_FONT_SIZE))
                                 .line_height(px(theme::CODE_LINE_HEIGHT))
                                 .text_color(theme::color(theme::palette().ui_muted))
-                                .child("Commit message"),
+                                .child(placeholder),
                         )
                     }),
             )
             .child(
                 div()
-                    .id("git-commit")
                     .flex()
-                    .items_center()
-                    .justify_center()
-                    .h(px(26.))
-                    .rounded(px(4.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .bg(theme::color(if enabled { theme::palette().accent } else { theme::palette().divider }))
-                    .when(enabled, |style| style.text_color(theme::color(theme::palette().on_accent)))
-                    .when(enabled, |style| style.cursor_pointer())
-                    .when(!enabled, |style| style.text_color(theme::color(theme::palette().ui_muted)))
-                    .on_click(cx.listener(|this, _, _, cx| this.commit(cx)))
-                    .child("Commit"),
+                    .gap(px(6.))
+                    .child(button("git-commit", "Commit", false, false, cx))
+                    .child(button("git-commit-push", "Commit & Push  ⌘↩", true, true, cx)),
             )
     }
 
-    fn render_commit(&self, index: usize, graph_width: f32) -> AnyElement {
+    fn render_commit(&self, index: usize, graph_width: f32, cx: &mut Context<Self>) -> AnyElement {
         let commit = &self.commits[index];
         let row = self.rows[index].clone();
         let pills = commit.refs.iter().take(MAX_REFS_SHOWN).map(|name| {
@@ -625,6 +850,9 @@ impl GitPanel {
             .w_full()
             .h(px(COMMIT_ROW_HEIGHT))
             .pr(px(8.))
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::color(theme::palette().panel)))
+            .on_click(cx.listener(move |this, _, _, cx| this.show_commit(index, cx)))
             .child(
                 canvas(
                     |_, _, _| {},
@@ -699,7 +927,7 @@ impl GitPanel {
                             if range.end + LOAD_MARGIN >= this.commits.len() {
                                 this.load_history(cx);
                             }
-                            range.map(|index| this.render_commit(index, graph_width)).collect::<Vec<_>>()
+                            range.map(|index| this.render_commit(index, graph_width, cx)).collect::<Vec<_>>()
                         }),
                     )
                     .flex_1()
@@ -724,6 +952,7 @@ struct RepositoryRead {
     repository: Repository,
     status: Status,
     refs: String,
+    merging: bool,
 }
 
 fn read_repository(program: &Program, root: &Path) -> Result<Option<RepositoryRead>, String> {
@@ -732,7 +961,17 @@ fn read_repository(program: &Program, root: &Path) -> Result<Option<RepositoryRe
     };
     let status = repository.status()?;
     let refs = repository.refs_fingerprint()?;
-    Ok(Some(RepositoryRead { repository, status, refs }))
+    let merging = repository.merge_in_progress();
+    Ok(Some(RepositoryRead { repository, status, refs, merging }))
+}
+
+/// How to start git, with the editor itself answering for logins.
+pub fn program() -> Option<Program> {
+    find_tool("git").map(|path| Program {
+        path,
+        path_env: child_path(),
+        askpass: std::env::current_exe().ok(),
+    })
 }
 
 /// Whether a change on disk can matter to the tree, open files or git. Of the
