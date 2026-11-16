@@ -13,7 +13,7 @@ use std::{
 };
 
 pub use history::CommittedFile;
-pub use log::{Commit, GraphRow, Lanes, PAGE_SIZE};
+pub use log::{Commit, GraphRow, HeadSummary, Lanes, PAGE_SIZE};
 pub use remote::{ASKPASS_ENV, GitError, PullOutcome};
 pub use status::{FileChange, Status};
 

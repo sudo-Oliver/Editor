@@ -565,6 +565,11 @@ pub const CODE_LINE_HEIGHT: f32 = 19.2;
 pub const UI_FONT_SIZE: f32 = 13.0;
 /// Ships with the app for paper mode, under the SIL Open Font License.
 pub const PAPER_FONT: &str = "iA Writer Quattro S";
+/// The typewriter of the hub's project folders, from the system.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub const MONO_FONT: &str = "Courier New";
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub const MONO_FONT: &str = "Liberation Mono";
 /// A book's rhythm: lines further apart than in a code editor.
 const PAPER_LINE_SPACING: f32 = 1.7;
 
