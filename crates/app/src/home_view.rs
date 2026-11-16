@@ -4,7 +4,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, PoisonError},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -214,6 +214,9 @@ pub struct HomeView {
     columns: usize,
     /// The project whose "…" menu is open.
     card_menu: Option<PathBuf>,
+    /// Writes of the project list, counted, and the last one that reached the disk.
+    registry_saves: u64,
+    registry_written: Arc<Mutex<u64>>,
     /// Projects whose folder is gone, found off the main thread on each visit.
     missing: HashSet<PathBuf>,
     folders_task: Option<Task<()>>,
@@ -261,6 +264,8 @@ impl HomeView {
             cards: true,
             columns: 1,
             card_menu: None,
+            registry_saves: 0,
+            registry_written: Arc::new(Mutex::new(0)),
             missing: HashSet::new(),
             folders_task: None,
             preview: None,
@@ -286,9 +291,11 @@ impl HomeView {
     /// Records an opened project, so that it comes first next time.
     pub fn touch(&mut self, path: &Path, cx: &mut Context<Self>) {
         self.registry.touch(path, projects::now());
-        self.languages.insert(path.to_path_buf(), projects::detect_language(path));
         self.missing.remove(path);
-        self.save_registry();
+        self.save_registry(cx);
+        // The language can take a walk of the folder to find out.
+        self.languages.remove(path);
+        self.check_folders(cx);
         cx.notify();
     }
 
@@ -303,7 +310,7 @@ impl HomeView {
         projects::create_project(&template, &dir).map_err(|error| format!("Cannot create the welcome project: {error}"))?;
         self.registry.touch(&dir, projects::now());
         self.registry.rename(&dir, &title);
-        self.save_registry();
+        self.save_registry(cx);
         cx.notify();
         Ok(dir)
     }
@@ -391,12 +398,35 @@ impl HomeView {
         self.templates = projects::load_templates(self.library.as_deref());
     }
 
-    fn save_registry(&mut self) {
-        if let Some(path) = &self.registry_path
-            && let Err(error) = self.registry.save(path)
-        {
-            self.message = Some(format!("Cannot save the project list: {error}"));
-        }
+    /// Writes the list on a background thread, as the flush to disk takes a while.
+    /// A slow older write never lands over a newer one.
+    fn save_registry(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.registry_path.clone() else {
+            return;
+        };
+        self.registry_saves += 1;
+        let (save, registry, written) = (self.registry_saves, self.registry.clone(), self.registry_written.clone());
+        cx.spawn(async move |this, cx| {
+            let saved = cx
+                .background_spawn(async move {
+                    let mut written = written.lock().unwrap_or_else(PoisonError::into_inner);
+                    if *written > save {
+                        return Ok(());
+                    }
+                    registry.save(&path)?;
+                    *written = save;
+                    Ok::<(), std::io::Error>(())
+                })
+                .await;
+            if let Err(error) = saved {
+                this.update(cx, |this, cx| {
+                    this.message = Some(format!("Cannot save the project list: {error}"));
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     fn query(&self, cx: &Context<Self>) -> String {
@@ -522,6 +552,9 @@ impl HomeView {
     }
 
     fn switch_page(&mut self, page: HubPage, window: &mut Window, cx: &mut Context<Self>) {
+        if page == HubPage::Tools {
+            toolchain::forget_found();
+        }
         self.page = page;
         self.selected = 0;
         self.rename = None;
@@ -698,7 +731,7 @@ impl HomeView {
                             this.registry.default_location = Some(location);
                             this.registry.touch(&dir, projects::now());
                             this.registry.rename(&dir, &title);
-                            this.save_registry();
+                            this.save_registry(cx);
                             this.close_dialog(window, cx);
                             cx.emit(HomeEvent::Open(dir));
                         }
@@ -779,7 +812,7 @@ impl HomeView {
         match rename.target {
             RenameTarget::Project(path) => {
                 self.registry.rename(&path, &title);
-                self.save_registry();
+                self.save_registry(cx);
             }
             RenameTarget::Template(dir) => {
                 if let Err(error) = projects::rename_template(&dir, &title) {
@@ -826,7 +859,7 @@ impl HomeView {
             this.update(cx, |this, cx| {
                 this.registry.remove(&path);
                 this.languages.remove(&path);
-                this.save_registry();
+                this.save_registry(cx);
                 this.selected = 0;
                 if trash {
                     cx.emit(HomeEvent::Trashed(path));
@@ -939,7 +972,7 @@ impl HomeView {
                                 preview.bookmarks = entries;
                                 preview.link_pages();
                             }
-                            PdfEvent::PageContent { .. } | PdfEvent::Failed { .. } => {}
+                            PdfEvent::PageContent { .. } | PdfEvent::Failed { .. } | PdfEvent::Unavailable { .. } => {}
                         }
                         cx.notify();
                     });

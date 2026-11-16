@@ -408,7 +408,14 @@ fn tab_edges(position: usize, count: usize, active: Option<usize>) -> (bool, boo
 
 pub struct Workspace {
     root: Option<PathBuf>,
+    /// The whole project, as of the last walk.
+    all_entries: Vec<TreeEntry>,
+    /// The rows shown: `all_entries` without the insides of collapsed folders.
     entries: Vec<TreeEntry>,
+    /// The main document for each active file, see `main_document`.
+    main_cache: RefCell<HashMap<Option<PathBuf>, Option<PathBuf>>>,
+    /// An entry to select once the walk that follows its creation is done.
+    pending_select: Option<PathBuf>,
     collapsed: HashSet<PathBuf>,
     documents: Vec<OpenDocument>,
     active: Option<usize>,
@@ -544,6 +551,8 @@ pub struct Workspace {
     _quit_subscription: Subscription,
     build_task: Option<Task<()>>,
     debounce_task: Option<Task<()>>,
+    /// Saves on their way to disk, with what follows them, such as a build.
+    save_task: Option<Task<()>>,
     synctex_task: Option<Task<()>>,
     _pdf_subscription: Subscription,
     _watcher: Option<RecommendedWatcher>,
@@ -650,7 +659,10 @@ impl Workspace {
         };
         let mut workspace = Self {
             root: None,
+            all_entries: Vec::new(),
             entries: Vec::new(),
+            pending_select: None,
+            main_cache: RefCell::default(),
             collapsed: HashSet::new(),
             documents: Vec::new(),
             active: None,
@@ -758,6 +770,7 @@ impl Workspace {
             _quit_subscription: quit_subscription,
             build_task: None,
             debounce_task: None,
+            save_task: None,
             synctex_task: None,
             _pdf_subscription: pdf_subscription,
             _watcher: None,
@@ -914,7 +927,9 @@ impl Workspace {
         #[cfg(feature = "collab")]
         self.collab_root_changing(&root, cx);
         self.cancel_refresh();
-        self.entries = file_tree::scan(&root, &self.collapsed);
+        self.all_entries.clear();
+        self.entries.clear();
+        self.pending_select = None;
         self.tree_target = None;
         self.tree_input = None;
         self.tree_error = None;
@@ -935,6 +950,7 @@ impl Workspace {
         for entry in &self.addon_panels {
             entry.panel.update(cx, |panel, cx| panel.set_root(Some(root.clone()), cx));
         }
+        self.main_cache.borrow_mut().clear();
         self.config = match Config::load(&root) {
             Ok(config) => config,
             Err(error) => {
@@ -946,22 +962,29 @@ impl Workspace {
             self.config.trigger = Trigger::Type;
         }
 
-        let first = ["main.tex", "main.typ", "README.md"]
-            .iter()
-            .map(|name| root.join(name))
-            .find(|path| path.is_file())
-            .or_else(|| {
-                self.entries
-                    .iter()
-                    .find(|entry| {
-                        !entry.is_dir && Language::from_path(&entry.path) != Language::Plain
-                    })
-                    .map(|entry| entry.path.clone())
-            });
+        // The tree comes from a walk in the background, so the first file is found
+        // without it: the usual names, or else any source at the top.
+        let first = ["main.tex", "main.typ", "README.md"].iter().map(|name| root.join(name)).find(|path| path.is_file()).or_else(|| {
+            let mut sources: Vec<PathBuf> = std::fs::read_dir(&root)
+                .ok()?
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.is_file() && Language::from_path(path) != Language::Plain)
+                .collect();
+            sources.sort();
+            sources.into_iter().next()
+        });
+        // The last PDF shows at once, while the build makes a new one.
+        self.last_pdf = projects::newest_pdf(&root).map(|(pdf, _)| pdf);
+        match self.last_pdf.clone() {
+            Some(pdf) => self.pdf.update(cx, |view, cx| view.load_file(pdf, cx)),
+            None => self.pdf.update(cx, |view, cx| view.clear(cx)),
+        }
         if let Some(path) = first {
             self.open_file(path, window, cx);
             self.recompile(cx);
         }
+        self.refresh_in_background(cx);
         self.forget_saved_recovery(cx);
         self.git_root_opened(cx);
         #[cfg(feature = "collab")]
@@ -1013,12 +1036,12 @@ impl Workspace {
     /// For a change from outside. A big project takes a while to walk, which must
     /// not stop typing, and changes during a walk lead to one more walk afterward.
     fn refresh_in_background(&mut self, cx: &mut Context<Self>) {
+        self.main_cache.borrow_mut().clear();
         if self.refresh_task.is_some() {
             self.refresh_again = true;
             return;
         }
         let root = self.root.clone();
-        let collapsed = self.collapsed.clone();
         let documents: Vec<_> = self
             .documents
             .iter()
@@ -1041,11 +1064,11 @@ impl Workspace {
                     }
                 }
             });
-            let entries = cx.background_spawn(async move { root.map(|root| file_tree::scan(&root, &collapsed)) }).await;
+            let entries = cx.background_spawn(async move { root.map(|root| file_tree::scan(&root)) }).await;
             this.update(cx, |this, cx| {
                 this.refresh_task = None;
                 if let Some(entries) = entries {
-                    this.entries = entries;
+                    this.set_tree(entries);
                 }
                 this.git_panel.update(cx, |panel, cx| panel.refresh(cx));
                 this.refresh_git(cx);
@@ -1065,16 +1088,43 @@ impl Workspace {
         self.refresh_again = false;
     }
 
+    /// The file that builds for `active`. Finding it reads files, so the answer
+    /// is kept until something on disk changes.
+    fn main_document(&self, active: Option<&Path>) -> Option<PathBuf> {
+        let root = self.root.as_deref()?;
+        let key = active.map(Path::to_path_buf);
+        if let Some(main) = self.main_cache.borrow().get(&key) {
+            return main.clone();
+        }
+        let main = find_main(root, &self.config, active);
+        self.main_cache.borrow_mut().insert(key, main.clone());
+        main
+    }
+
+    /// After a change of our own: the tree, the open files and git catch up on a
+    /// background thread.
     fn refresh_from_disk(&mut self, cx: &mut Context<Self>) {
-        self.cancel_refresh();
-        if let Some(root) = &self.root {
-            self.entries = file_tree::scan(root, &self.collapsed);
+        self.refresh_in_background(cx);
+    }
+
+    fn set_tree(&mut self, entries: Vec<TreeEntry>) {
+        self.all_entries = entries;
+        self.show_tree();
+        if let Some(path) = self.pending_select.take() {
+            if let Some(index) = self.entries.iter().position(|entry| entry.path == path) {
+                self.tree_cursor = index;
+                self.tree_scroll.scroll_to_item(index, ScrollStrategy::Nearest);
+            } else if !self.all_entries.iter().any(|entry| entry.path == path) {
+                // Not there yet: the walk began before the entry was made.
+                self.pending_select = Some(path);
+            }
         }
-        for document in &self.documents {
-            document.view.update(cx, |view, cx| view.reload_from_disk(cx));
-        }
-        self.git_panel.update(cx, |panel, cx| panel.refresh(cx));
-        cx.notify();
+    }
+
+    /// Rows from the last walk, after a folder opened or closed.
+    fn show_tree(&mut self) {
+        self.entries = file_tree::visible(&self.all_entries, &self.collapsed);
+        self.tree_cursor = self.tree_cursor.min(self.entries.len().saturating_sub(1));
     }
 
     fn open_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
@@ -1157,7 +1207,7 @@ impl Workspace {
             return;
         }
         let active = self.active_view().and_then(|view| view.read(cx).path.clone());
-        let main = self.root.as_deref().and_then(|root| find_main(root, &self.config, active.as_deref()));
+        let main = self.main_document(active.as_deref());
         let engine = self.engine.or_else(|| Engine::for_path(main.as_deref()?));
         let directory = main.as_deref().and_then(Path::parent).or(self.root.as_deref());
         let relative = directory.map_or_else(|| path.display().to_string(), |directory| relative_path(directory, &path));
@@ -1520,19 +1570,27 @@ impl Workspace {
         let Some(view) = self.active_view() else {
             return;
         };
-        match view.update(cx, |view, cx| view.save(cx)) {
-            Ok(saved) => {
-                if saved {
-                    self.notify_addons_saved(&view, cx);
+        let Some(save) = view.update(cx, |view, cx| view.save_in_background(cx)) else {
+            return;
+        };
+        self.save_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = save.await;
+            this.update_in(cx, |this, window, cx| {
+                this.save_task = None;
+                match result {
+                    Ok(()) => {
+                        this.notify_addons_saved(&view, cx);
+                        if this.config.trigger == Trigger::Save {
+                            this.build_when_free(cx);
+                        }
+                    }
+                    Err(error) if is_save_conflict(&error) => this.ask_about_conflict(view, false, window, cx),
+                    Err(error) => this.set_status(format!("Cannot save: {error}"), cx),
                 }
-                if saved && self.config.trigger == Trigger::Save {
-                    self.build_when_free(cx);
-                }
-            }
-            Err(error) if is_save_conflict(&error) => self.ask_about_conflict(view, false, window, cx),
-            Err(error) => self.set_status(format!("Cannot save: {error}"), cx),
-        }
-        self.forget_saved_recovery(cx);
+                this.forget_saved_recovery(cx);
+            })
+            .ok();
+        }));
     }
 
     fn set_status(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
@@ -1802,7 +1860,7 @@ impl Workspace {
         let root = self.root.clone();
         self.answer_in_background(panel, id, cx, move || {
             let root = root.ok_or("No project is open.")?;
-            let files: Vec<PathBuf> = file_tree::scan(&root, &HashSet::new())
+            let files: Vec<PathBuf> = file_tree::scan(&root)
                 .into_iter()
                 .filter(|entry| !entry.is_dir)
                 .map(|entry| entry.path)
@@ -1968,17 +2026,62 @@ impl Workspace {
         all_saved
     }
 
+    /// Saves every open document on background threads, then reports whether
+    /// all of them reached the disk.
+    fn save_all_in_background(&mut self, cx: &mut Context<Self>) -> Task<bool> {
+        let saves: Vec<_> = self
+            .documents
+            .iter()
+            .filter_map(|document| {
+                let view = document.view.clone();
+                let save = view.update(cx, |view, cx| view.save_in_background(cx))?;
+                Some((view, save))
+            })
+            .collect();
+        cx.spawn(async move |this, cx| {
+            let mut all_saved = true;
+            for (view, save) in saves {
+                let result = save.await;
+                all_saved &= result.is_ok();
+                let reported = this.update(cx, |this, cx| match result {
+                    Ok(()) => this.notify_addons_saved(&view, cx),
+                    // The other documents still get saved. This one waits for a decision.
+                    Err(error) if is_save_conflict(&error) => {
+                        let title = view.read(cx).title();
+                        this.set_status(format!("{title} changed on disk and was not saved. Save it to decide."), cx);
+                    }
+                    Err(error) => this.set_status(format!("Cannot save: {error}"), cx),
+                });
+                all_saved &= reported.is_ok();
+            }
+            this.update(cx, |this, cx| this.forget_saved_recovery(cx)).ok();
+            all_saved
+        })
+    }
+
+    /// Saves in the background and builds once the files are on disk, as the
+    /// compilers read them from there.
     fn recompile(&mut self, cx: &mut Context<Self>) {
         self.debounce_task = None;
-        let Some(root) = self.root.clone() else {
+        if self.root.is_none() {
             self.set_status("Open a folder first.", cx);
             return;
-        };
-        if !self.save_all(cx) {
-            return;
         }
+        let saved = self.save_all_in_background(cx);
+        self.save_task = Some(cx.spawn(async move |this, cx| {
+            if saved.await {
+                this.update(cx, |this, cx| this.start_build(cx)).ok();
+            }
+        }));
+    }
+
+    fn start_build(&mut self, cx: &mut Context<Self>) {
+        self.save_task = None;
+        let Some(root) = self.root.clone() else {
+            return;
+        };
         let active = self.active_view().and_then(|view| view.read(cx).path.clone());
-        let Some(main) = build::find_main(&root, &self.config, active.as_deref()) else {
+        let Some(main) = self.main_document(active.as_deref()) else {
             self.set_status("This file type cannot be compiled.", cx);
             return;
         };
@@ -2014,12 +2117,12 @@ impl Workspace {
     /// A folder of standalone notes has one PDF per file, so switching files
     /// must not leave the PDF of the previous file on screen.
     fn compile_if_document_changed(&mut self, cx: &mut Context<Self>) {
-        let (Some(root), Some(last_main)) = (&self.root, &self.last_main) else {
+        let Some(last_main) = self.last_main.clone() else {
             return;
         };
         let active = self.active_view().and_then(|view| view.read(cx).path.clone());
-        let main = build::find_main(root, &self.config, active.as_deref());
-        if main.is_some_and(|main| main != *last_main) {
+        let main = self.main_document(active.as_deref());
+        if main.is_some_and(|main| main != last_main) {
             self.recompile(cx);
         }
     }
@@ -2175,7 +2278,7 @@ impl Workspace {
                     let mut sources: Vec<(PathBuf, String)> = Vec::new();
                     let mut has_own_style_files = false;
                     let mut own_styles = Vec::new();
-                    for entry in file_tree::scan(&root, &HashSet::new()) {
+                    for entry in file_tree::scan(&root) {
                         let extension = entry.path.extension().and_then(|extension| extension.to_str());
                         has_own_style_files |= !entry.is_dir && matches!(extension, Some("sty" | "cls"));
                         if !entry.is_dir && extension == Some("sty") {
@@ -2520,7 +2623,8 @@ impl Workspace {
             for ancestor in path.ancestors().skip(1) {
                 self.collapsed.remove(ancestor);
             }
-            self.refresh_from_disk(cx);
+            self.show_tree();
+            cx.notify();
         }
         self.focus_tree(window, cx);
     }
@@ -2907,7 +3011,7 @@ impl Workspace {
             return;
         };
         let active = self.active_view().and_then(|view| view.read(cx).path.clone());
-        let Some(main) = build::find_main(&root, &self.config, active.as_deref()) else {
+        let Some(main) = self.main_document(active.as_deref()) else {
             self.set_status("This file type has no word count.", cx);
             return;
         };
@@ -3211,7 +3315,7 @@ impl Workspace {
             return;
         };
         let active = self.active_view().and_then(|view| view.read(cx).path.clone());
-        let main = build::find_main(&root, &self.config, active.as_deref()).filter(|main| export::pandoc_reader(main).is_some());
+        let main = self.main_document(active.as_deref()).filter(|main| export::pandoc_reader(main).is_some());
         let Some(main) = main else {
             self.show_notice("This file has no draft export", "Drafts need a LaTeX, Typst or Markdown file.", window, cx);
             return;
@@ -3411,11 +3515,9 @@ impl Workspace {
         for ancestor in path.ancestors() {
             self.collapsed.remove(ancestor);
         }
+        self.pending_select = Some(path.to_path_buf());
+        self.show_tree();
         self.refresh_from_disk(cx);
-        if let Some(index) = self.entries.iter().position(|entry| entry.path == path) {
-            self.tree_cursor = index;
-            self.tree_scroll.scroll_to_item(index, ScrollStrategy::Nearest);
-        }
         self.tree_target = Some(path.to_path_buf());
     }
 
@@ -3510,7 +3612,6 @@ impl Workspace {
                 }
                 this.collapsed.retain(|folder| !folder.starts_with(&path));
                 this.refresh_from_disk(cx);
-                this.tree_cursor = this.tree_cursor.min(this.entries.len().saturating_sub(1));
                 this.set_status(format!("Moved {name} to the Trash"), cx);
             })
             .ok();
@@ -3654,7 +3755,8 @@ impl Workspace {
             if !self.collapsed.remove(&entry.path) {
                 self.collapsed.insert(entry.path);
             }
-            self.refresh_from_disk(cx);
+            self.show_tree();
+            cx.notify();
         }
     }
 
@@ -3675,7 +3777,8 @@ impl Workspace {
             self.tree_cursor = index;
         }
         self.collapsed.insert(folder);
-        self.refresh_from_disk(cx);
+        self.show_tree();
+        cx.notify();
         self.tree_scroll.scroll_to_item(self.tree_cursor, ScrollStrategy::Nearest);
     }
 
@@ -3693,7 +3796,7 @@ impl Workspace {
         let bbl = (kind == PickerKind::Citations && language == Some(Language::Latex))
             .then(|| {
                 let active = self.active_view().and_then(|view| view.read(cx).path.clone());
-                find_main(&root, &self.config, active.as_deref())
+                self.main_document(active.as_deref())
             })
             .flatten()
             .and_then(|main| bib::bbl_path(&main));
@@ -3722,7 +3825,7 @@ impl Workspace {
                     if let Some(repository) = repository.filter(|_| kind == PickerKind::Branches) {
                         return (Vec::new(), picker::branch_items(repository.branches().unwrap_or_default()));
                     }
-                    let files = file_tree::scan(&scan_root, &HashSet::new())
+                    let files = file_tree::scan(&scan_root)
                         .into_iter()
                         .filter(|entry| !entry.is_dir)
                         .map(|entry| entry.path)
@@ -4217,7 +4320,7 @@ impl Workspace {
             let available = offered
                 || cx
                     .background_spawn(async move {
-                        let files: Vec<PathBuf> = file_tree::scan(&root, &HashSet::new())
+                        let files: Vec<PathBuf> = file_tree::scan(&root)
                             .into_iter()
                             .filter(|entry| !entry.is_dir && entry.path.extension().is_some_and(|extension| extension == "bib"))
                             .map(|entry| entry.path)
@@ -4244,7 +4347,7 @@ impl Workspace {
         // Typst looks next to the current file, LaTeX next to the main file.
         let main = match language {
             Language::Typst => active,
-            _ => self.root.as_deref().and_then(|root| find_main(root, &self.config, active.as_deref())),
+            _ => self.main_document(active.as_deref()),
         };
         let directory = main.as_deref().and_then(Path::parent).or(self.root.as_deref());
         let relative = directory.map_or_else(|| path.display().to_string(), |directory| relative_path(directory, path));

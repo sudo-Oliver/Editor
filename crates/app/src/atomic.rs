@@ -5,6 +5,7 @@ use std::{
     fs::{self, File},
     io::{self, Write},
     path::Path,
+    sync::{LazyLock, mpsc},
 };
 
 use tempfile::NamedTempFile;
@@ -30,6 +31,35 @@ pub fn write(path: &Path, contents: &[u8]) -> io::Result<()> {
     finish(temp, &target)
 }
 
+#[cfg_attr(not(feature = "collab"), allow(dead_code))]
+type Job = Box<dyn FnOnce() + Send>;
+
+/// Runs file work on a thread of its own, one job after the other in the order
+/// given: the window never waits for the disk, and a later write never lands
+/// before an earlier one.
+#[cfg_attr(not(feature = "collab"), allow(dead_code))]
+pub fn in_order(job: impl FnOnce() + Send + 'static) {
+    static QUEUE: LazyLock<Option<mpsc::Sender<Job>>> = LazyLock::new(|| {
+        let (sender, jobs) = mpsc::channel::<Job>();
+        let started = std::thread::Builder::new().name("file writes".into()).spawn(move || {
+            for job in jobs {
+                job();
+            }
+        });
+        started.ok().map(|_| sender)
+    });
+    let job: Job = Box::new(job);
+    match QUEUE.as_ref() {
+        Some(sender) => {
+            if let Err(mpsc::SendError(job)) = sender.send(job) {
+                job();
+            }
+        }
+        // Without a thread, the work still gets done.
+        None => job(),
+    }
+}
+
 /// Puts a finished temp file in place, in one step. Temp files are private, so
 /// the result takes the rights of the file it replaces or normal ones.
 pub fn finish(temp: NamedTempFile, target: &Path) -> io::Result<()> {
@@ -53,6 +83,20 @@ pub fn finish(temp: NamedTempFile, target: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn work_in_order_lands_in_order() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("a.txt");
+        for number in 0..50 {
+            let path = path.clone();
+            in_order(move || write(&path, number.to_string().as_bytes()).unwrap());
+        }
+        let (done, finished) = mpsc::channel();
+        in_order(move || done.send(()).unwrap());
+        finished.recv().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "49");
+    }
 
     fn names(folder: &Path) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(folder).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).collect();

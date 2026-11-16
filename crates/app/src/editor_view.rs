@@ -3,7 +3,7 @@ use std::{
     io,
     ops::Range,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, PoisonError},
     time::{Duration, Instant},
 };
 
@@ -177,8 +177,11 @@ impl Rows {
 pub struct EditorView {
     pub state: EditorState,
     pub path: Option<PathBuf>,
-    /// The file as this document last read or wrote it.
-    disk_hash: u64,
+    /// The file as this document last read or wrote it, shared with the threads
+    /// that save it.
+    disk: Arc<Mutex<Disk>>,
+    /// Counts saves, so that a slow older save never lands over a newer one.
+    saves: u64,
     focus_handle: FocusHandle,
     scroll_y: Pixels,
     rows: Rows,
@@ -238,6 +241,30 @@ pub fn is_save_conflict(error: &io::Error) -> bool {
     error.get_ref().is_some_and(|inner| inner.is::<SaveConflict>())
 }
 
+/// What a document knows of its file.
+struct Disk {
+    hash: u64,
+    /// The last save that reached the disk.
+    written: u64,
+}
+
+/// Writes save number `save` unless a later one got to the disk first, and
+/// refuses when another program changed the file since.
+fn write_save(path: &Path, text: &str, disk: &Mutex<Disk>, save: u64) -> io::Result<()> {
+    let mut disk = disk.lock().unwrap_or_else(PoisonError::into_inner);
+    if disk.written > save {
+        return Ok(());
+    }
+    // A file that went away or cannot be read has nothing to protect here.
+    if std::fs::read(path).is_ok_and(|current| is_conflict(&current, disk.hash, text.as_bytes())) {
+        return Err(io::Error::other(SaveConflict));
+    }
+    crate::atomic::write(path, text.as_bytes())?;
+    disk.hash = content_hash(text.as_bytes());
+    disk.written = save;
+    Ok(())
+}
+
 fn content_hash(bytes: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
     hasher.write(bytes);
@@ -256,7 +283,8 @@ impl EditorView {
         let mut view = Self {
             state: EditorState::new(text, language),
             path,
-            disk_hash: content_hash(text.as_bytes()),
+            disk: Arc::new(Mutex::new(Disk { hash: content_hash(text.as_bytes()), written: 0 })),
+            saves: 0,
             focus_handle: cx.focus_handle(),
             scroll_y: px(0.),
             rows: Rows::default(),
@@ -396,11 +424,44 @@ impl EditorView {
         }
         let text = self.state.buffer().to_string();
         // A file that went away or cannot be read has nothing to protect here.
-        if std::fs::read(path).is_ok_and(|disk| is_conflict(&disk, self.disk_hash, text.as_bytes())) {
+        if std::fs::read(path).is_ok_and(|disk| is_conflict(&disk, self.disk_hash(), text.as_bytes())) {
             return Err(io::Error::other(SaveConflict));
         }
         self.write_text(&text, cx)?;
         Ok(true)
+    }
+
+    /// Saves like `save`, with the conflict check, the write and the flush to disk
+    /// on a background thread, so that typing never waits for the disk. None when
+    /// there is nothing to save. The text stays editable meanwhile; what was
+    /// typed after the start of the save stays unsaved.
+    pub fn save_in_background(&mut self, cx: &mut Context<Self>) -> Option<Task<io::Result<()>>> {
+        let path = self.path.clone()?;
+        if !self.state.is_dirty() {
+            return None;
+        }
+        self.saves += 1;
+        let (save, revision, disk) = (self.saves, self.state.revision(), self.disk.clone());
+        // A rope clone shares its chunks, so this costs nothing on the main thread.
+        let rope = self.state.buffer().rope().clone();
+        let write = cx.background_spawn(async move { write_save(&path, &rope.to_string(), &disk, save) });
+        Some(cx.spawn(async move |this, cx| {
+            write.await?;
+            this.update(cx, |this, cx| {
+                this.state.mark_saved_at(revision);
+                cx.notify();
+            })
+            .ok();
+            Ok(())
+        }))
+    }
+
+    fn disk_hash(&self) -> u64 {
+        self.disk.lock().unwrap_or_else(PoisonError::into_inner).hash
+    }
+
+    fn set_disk_hash(&self, text: &str) {
+        self.disk.lock().unwrap_or_else(PoisonError::into_inner).hash = content_hash(text.as_bytes());
     }
 
     /// Replaces the file even though it changed on disk.
@@ -413,8 +474,12 @@ impl EditorView {
         let Some(path) = &self.path else {
             return Ok(());
         };
+        self.saves += 1;
+        let mut disk = self.disk.lock().unwrap_or_else(PoisonError::into_inner);
         crate::atomic::write(path, text.as_bytes())?;
-        self.disk_hash = content_hash(text.as_bytes());
+        disk.hash = content_hash(text.as_bytes());
+        disk.written = self.saves;
+        drop(disk);
         self.state.mark_saved();
         cx.notify();
         Ok(())
@@ -431,7 +496,7 @@ impl EditorView {
             return Ok(());
         };
         let text = std::fs::read_to_string(path)?;
-        self.disk_hash = content_hash(text.as_bytes());
+        self.set_disk_hash(&text);
         self.may_conflict = text.contains(CONFLICT_START);
         self.state.reload(&text);
         self.schedule_parse(cx);
@@ -459,7 +524,7 @@ impl EditorView {
         if self.state.is_dirty() || self.state.version() != version {
             return;
         }
-        self.disk_hash = content_hash(text.as_bytes());
+        self.set_disk_hash(text);
         if *self.state.buffer().rope() != text {
             // A merge writes its conflicts to disk.
             self.may_conflict = text.contains(CONFLICT_START);
@@ -2011,6 +2076,31 @@ impl EditorView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_slow_older_save_never_lands_over_a_newer_one() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("a.tex");
+        std::fs::write(&path, "old").unwrap();
+        let disk = Mutex::new(Disk { hash: content_hash(b"old"), written: 0 });
+        write_save(&path, "first", &disk, 1).unwrap();
+        // The next save follows the first without a conflict of its own making.
+        write_save(&path, "third", &disk, 3).unwrap();
+        write_save(&path, "second", &disk, 2).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "third");
+    }
+
+    #[test]
+    fn a_change_by_another_program_stops_the_save() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("a.tex");
+        std::fs::write(&path, "old").unwrap();
+        let disk = Mutex::new(Disk { hash: content_hash(b"old"), written: 0 });
+        std::fs::write(&path, "theirs").unwrap();
+        let error = write_save(&path, "mine", &disk, 1).unwrap_err();
+        assert!(is_save_conflict(&error));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "theirs");
+    }
 
     #[test]
     fn rows_stay_right_with_changes_applied_piece_by_piece() {

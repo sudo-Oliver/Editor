@@ -17,9 +17,8 @@ pub struct TreeEntry {
     pub is_dir: bool,
 }
 
-/// Lists the project, honoring `.gitignore`. Directories come before files, and
-/// children of collapsed directories are left out.
-pub fn scan(root: &Path, collapsed: &HashSet<PathBuf>) -> Vec<TreeEntry> {
+/// Lists the whole project, honoring `.gitignore`. Directories come before files.
+pub fn scan(root: &Path) -> Vec<TreeEntry> {
     let mut directories: Vec<TreeEntry> = Vec::new();
     let walker = WalkBuilder::new(root)
         .hidden(false)
@@ -45,14 +44,18 @@ pub fn scan(root: &Path, collapsed: &HashSet<PathBuf>) -> Vec<TreeEntry> {
     }
     directories.sort_by_cached_key(|entry| tree_key(entry, root));
     directories
-        .into_iter()
-        .filter(|entry| {
-            !entry
-                .path
-                .ancestors()
-                .skip(1)
-                .any(|ancestor| collapsed.contains(ancestor))
-        })
+}
+
+/// The rows the tree shows: everything but what is inside a collapsed folder.
+/// Opening and closing folders only filters, without reading the disk.
+pub fn visible(entries: &[TreeEntry], collapsed: &HashSet<PathBuf>) -> Vec<TreeEntry> {
+    if collapsed.is_empty() {
+        return entries.to_vec();
+    }
+    entries
+        .iter()
+        .filter(|entry| !entry.path.ancestors().skip(1).any(|ancestor| collapsed.contains(ancestor)))
+        .cloned()
         .collect()
 }
 
@@ -319,7 +322,7 @@ mod tests {
         std::fs::write(root.join(".build/c.log"), "").unwrap();
 
         let names = |collapsed: &HashSet<PathBuf>| -> Vec<String> {
-            scan(&root, collapsed).into_iter().map(|entry| entry.name).collect()
+            visible(&scan(&root), collapsed).into_iter().map(|entry| entry.name).collect()
         };
         assert_eq!(names(&HashSet::new()), vec!["sub", "b.tex", "a.tex"]);
         assert_eq!(names(&HashSet::from([root.join("sub")])), vec!["sub", "a.tex"]);

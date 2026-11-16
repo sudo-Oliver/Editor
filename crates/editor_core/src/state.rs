@@ -252,6 +252,16 @@ impl EditorState {
         self.saved_revision = self.revision;
     }
 
+    /// The text as of now, for marking it saved once a slower write finished.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Marks the text of `revision` as the one on disk, also when edits followed it.
+    pub fn mark_saved_at(&mut self, revision: u64) {
+        self.saved_revision = revision;
+    }
+
     pub fn marks(&self) -> &[Mark] {
         &self.marks
     }

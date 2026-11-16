@@ -563,6 +563,19 @@ pub struct ParseResult {
 }
 
 impl Syntax {
+    /// Builds the grammars' queries on a thread of their own, so that the first
+    /// file of a language opens without waiting for them.
+    pub fn warm_up() {
+        std::thread::Builder::new()
+            .name("syntax warm-up".into())
+            .spawn(|| {
+                for language in [Language::Latex, Language::Typst, Language::Markdown] {
+                    LanguageConfig::get(language);
+                }
+            })
+            .ok();
+    }
+
     pub fn new(language: Language) -> Self {
         Self {
             config: LanguageConfig::get(language),

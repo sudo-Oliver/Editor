@@ -203,16 +203,18 @@ impl PdfView {
                     }
                 }));
             }
-            Err(error) => {
-                eprintln!("PDFium did not load: {error}");
-                view.error = Some(if cfg!(debug_assertions) {
-                    format!("{error} Run scripts/fetch-pdfium.sh.")
-                } else {
-                    "The PDF viewer is missing from this copy of the app. Install Editor again from the download page.".to_string()
-                });
-            }
+            Err(error) => view.set_unavailable(&error),
         }
         view
+    }
+
+    fn set_unavailable(&mut self, error: &str) {
+        eprintln!("PDFium did not load: {error}");
+        self.error = Some(if cfg!(debug_assertions) {
+            format!("{error} Run scripts/fetch-pdfium.sh.")
+        } else {
+            "The PDF viewer is missing from this copy of the app. Install Editor again from the download page.".to_string()
+        });
     }
 
     /// Loads a new PDF. The old pages stay visible until it is ready.
@@ -421,6 +423,10 @@ impl PdfView {
                 }
             }
             PdfEvent::Outline { .. } => {}
+            PdfEvent::Unavailable { message } => {
+                self.set_unavailable(&message);
+                cx.notify();
+            }
             PdfEvent::Failed { generation, message } => {
                 if generation == self.generation {
                     cx.emit(PdfViewEvent::Failed(message));

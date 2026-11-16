@@ -53,6 +53,12 @@ pub(super) struct CollabUi {
     /// Whether a new session shows up for others on the local network.
     visible_on_lan: bool,
     lan: Option<(LanBrowser, Task<()>)>,
+    /// The search starting, which binds network sockets off the main thread.
+    lan_starting: Option<Task<()>>,
+    /// The search could not start; it waits for the dialog to open again.
+    lan_failed: bool,
+    /// A session being started, until the project is read and the network bound.
+    starting: Option<Task<()>>,
     lan_sessions: Vec<LanSession>,
     error: Option<SharedString>,
 }
@@ -123,6 +129,9 @@ impl CollabUi {
             comment: None,
             visible_on_lan: true,
             lan: None,
+            lan_starting: None,
+            lan_failed: false,
+            starting: None,
             lan_sessions: Vec::new(),
             error: None,
         }
@@ -341,7 +350,7 @@ impl Workspace {
     }
 
     pub(super) fn host_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy_with_others(cx) {
+        if self.busy_with_others(cx) || self.collab.starting.is_some() {
             return;
         }
         let Some(root) = self.root.clone() else {
@@ -350,10 +359,38 @@ impl Workspace {
         };
         self.remember_name(window, cx);
         let identity = self.identity(cx);
-        let (project, shared, skipped) = collect_project(&root, &self.open_texts(cx));
+        let open = self.open_texts(cx);
         let lan_name = self.collab.visible_on_lan.then(|| format!("{} ({})", project_name(&root), identity.name));
         let (wake, poll) = self.session_waker(window, cx);
-        match Session::host(identity, &project.encode_state(), lan_name, wake) {
+        self.set_status("Starting the session…", cx);
+        // Reading the project and binding the network take a while.
+        self.collab.starting = Some(cx.spawn(async move |this, cx| {
+            let started = cx
+                .background_spawn({
+                    let root = root.clone();
+                    async move {
+                        let (project, shared, skipped) = collect_project(&root, &open);
+                        let session = Session::host(identity, &project.encode_state(), lan_name, wake);
+                        (project, shared, skipped, session)
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.collab.starting = None;
+                this.hosted(root, started, poll, cx);
+            })
+            .ok();
+        }));
+    }
+
+    fn hosted(
+        &mut self,
+        root: PathBuf,
+        (project, shared, skipped, session): (Project, HashSet<String>, Vec<String>, Result<Session, String>),
+        poll: Task<()>,
+        cx: &mut Context<Self>,
+    ) {
+        match session {
             Ok(session) => {
                 let mut state = CollabState::new(project, Some(session), root, Role::Editor, true);
                 state.shared = shared;
@@ -483,6 +520,10 @@ impl Workspace {
                 "The review is put aside. It comes back when the project opens."
             }
         };
+        // Leaving waits a moment for the goodbye to go out, which the window must not.
+        if let Some(session) = state.session.take() {
+            cx.background_spawn(async move { drop(session) }).detach();
+        }
         drop(state);
         self.collab.comment = None;
         for document in &self.documents {
@@ -790,12 +831,16 @@ impl Workspace {
             view.update(cx, |view, cx| view.apply_remote(changes, cx));
             return;
         }
-        let mut text = std::fs::read_to_string(&target).unwrap_or_default();
-        replay(&mut text, changes);
-        target.parent().map(std::fs::create_dir_all);
-        if let Err(error) = crate::atomic::write(&target, text.as_bytes()) {
-            self.status = Some(format!("Cannot write {path}: {error}").into());
-        }
+        // In order on the file thread, as each change builds on the one before.
+        let (changes, path) = (changes.to_vec(), path.to_string());
+        crate::atomic::in_order(move || {
+            let mut text = std::fs::read_to_string(&target).unwrap_or_default();
+            replay(&mut text, &changes);
+            target.parent().map(std::fs::create_dir_all);
+            if let Err(error) = crate::atomic::write(&target, text.as_bytes()) {
+                eprintln!("Cannot write {path}: {error}");
+            }
+        });
     }
 
     /// Shows the others' cursors, comments and suggestions in every document.
@@ -1246,37 +1291,48 @@ impl Workspace {
 
     /// Looks for sessions on the local network while the join dialog shows,
     /// and only then.
-    pub(super) fn collab_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn collab_frame(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let browsing = self.dialog == Some(Dialog::JoinSession) && !self.collab.active();
-        if browsing == self.collab.lan.is_some() {
+        let started = self.collab.lan.is_some() || self.collab.lan_starting.is_some() || self.collab.lan_failed;
+        if browsing == started {
             return;
         }
         if !browsing {
             self.collab.lan = None;
+            self.collab.lan_starting = None;
+            self.collab.lan_failed = false;
             self.collab.lan_sessions.clear();
             return;
         }
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<()>();
-        let Ok(browser) = LanBrowser::start(move || {
-            sender.send(()).ok();
-        }) else {
-            return;
-        };
-        let task = cx.spawn_in(window, async move |this, cx| {
-            while receiver.recv().await.is_some() {
-                while receiver.try_recv().is_ok() {}
-                let updated = this.update(cx, |this, cx| {
-                    if let Some((browser, _)) = &this.collab.lan {
-                        this.collab.lan_sessions = browser.sessions();
-                        cx.notify();
+        self.collab.lan_starting = Some(cx.spawn(async move |this, cx| {
+            let browser = cx.background_spawn(async move { LanBrowser::start(move || {
+                    sender.send(()).ok();
+                }) }).await;
+            this.update(cx, |this, cx| {
+                this.collab.lan_starting = None;
+                let Ok(browser) = browser else {
+                    this.collab.lan_failed = true;
+                    return;
+                };
+                let task = cx.spawn(async move |this, cx| {
+                    while receiver.recv().await.is_some() {
+                        while receiver.try_recv().is_ok() {}
+                        let updated = this.update(cx, |this, cx| {
+                            if let Some((browser, _)) = &this.collab.lan {
+                                this.collab.lan_sessions = browser.sessions();
+                                cx.notify();
+                            }
+                        });
+                        if updated.is_err() {
+                            return;
+                        }
                     }
                 });
-                if updated.is_err() {
-                    return;
-                }
-            }
-        });
-        self.collab.lan = Some((browser, task));
+                this.collab.lan = Some((browser, task));
+            })
+            .ok();
+        }));
     }
 
     pub(super) fn add_collab_entries(&self, menu: Menu, entries: &mut Vec<MenuEntry>) {
@@ -1847,9 +1903,12 @@ fn save_review(state: &mut CollabState) {
         return;
     };
     let folder = state.root.join(REVIEW_FOLDER);
-    std::fs::create_dir_all(&folder).ok();
-    crate::atomic::write(&folder.join(REVIEW_STATE), &state.project.encode_state()).ok();
-    crate::atomic::write(&folder.join(REVIEW_META), &serde_json::to_vec(meta).unwrap()).ok();
+    let (encoded, meta) = (state.project.encode_state(), serde_json::to_vec(meta).unwrap());
+    crate::atomic::in_order(move || {
+        std::fs::create_dir_all(&folder).ok();
+        crate::atomic::write(&folder.join(REVIEW_STATE), &encoded).ok();
+        crate::atomic::write(&folder.join(REVIEW_META), &meta).ok();
+    });
 }
 
 /// The comments and suggestions with where they are now.

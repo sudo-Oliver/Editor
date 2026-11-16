@@ -13,7 +13,7 @@ use std::{
     os::unix::process::CommandExt,
     process::{Command, Stdio},
     sync::{
-        Arc, Mutex,
+        Arc, LazyLock, Mutex, PoisonError,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
@@ -182,8 +182,23 @@ fn found_program(program: &str, tools: Option<&Path>) -> Found {
     }
 }
 
+/// What `look_for` found, as pages that list the tools draw on every frame and
+/// looking means many file checks, sometimes starting a program.
+static FOUND: LazyLock<Mutex<HashMap<Tool, Found>>> = LazyLock::new(Mutex::default);
+
 /// For LaTeX, an installed TeX distribution counts, since the build prefers it.
 pub fn find(tool: Tool) -> Found {
+    let mut found = FOUND.lock().unwrap_or_else(PoisonError::into_inner);
+    found.entry(tool).or_insert_with(|| look_for(tool)).clone()
+}
+
+/// Looks again next time, after an install, a removal or when the tools are shown
+/// anew, since the user may have installed something meanwhile.
+pub fn forget_found() {
+    FOUND.lock().unwrap_or_else(PoisonError::into_inner).clear();
+}
+
+fn look_for(tool: Tool) -> Found {
     let tools = tools_directory();
     if tool == Tool::Tectonic {
         for program in ["latexmk", "pdflatex"] {
@@ -448,6 +463,7 @@ impl Toolchain {
             };
             this.update(cx, |this, cx| {
                 this.jobs.remove(&tool);
+                forget_found();
                 match result {
                     Ok(_) => cx.emit(ToolchainEvent::Installed(tool)),
                     Err(error) if error == "Stopped." => {}
@@ -475,6 +491,7 @@ impl Toolchain {
                 self.errors.insert(tool, error);
             }
         }
+        forget_found();
         cx.notify();
     }
 }

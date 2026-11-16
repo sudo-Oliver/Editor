@@ -50,6 +50,7 @@ fn main() {
     // Old macOS versions add a process serial number when Finder starts the app.
     let root = std::env::args_os().skip(1).find(|argument| !argument.to_string_lossy().starts_with("-psn_")).map(PathBuf::from);
     toolchain::register_installed();
+    editor_core::Syntax::warm_up();
 
     // Files and folders from Finder, the Dock and the `editor` command arrive
     // here, at the start as well as while the app runs.

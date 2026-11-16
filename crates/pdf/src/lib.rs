@@ -37,6 +37,8 @@ pub enum PdfEvent {
     PageContent { generation: u64, page: usize, content: PageContent },
     Outline { generation: u64, entries: Vec<OutlineEntry> },
     Failed { generation: u64, message: String },
+    /// PDFium did not load, so no document will open.
+    Unavailable { message: String },
 }
 
 /// A bookmark of the PDF, such as a chapter.
@@ -136,28 +138,44 @@ impl Drop for PdfWorker {
     }
 }
 
+/// Starts the PDFium thread without waiting for the library to load, which
+/// would hold up the first frame of the window. A library that does not load
+/// turns every document into a `PdfEvent::Failed`.
 fn start(library: &Path) -> Result<mpsc::Sender<Message>, String> {
     let library = library.to_path_buf();
     let (messages, receiver) = mpsc::channel();
-    let (ready, ready_receiver) = mpsc::channel();
     std::thread::Builder::new()
         .name("pdfium".into())
         .spawn(move || {
             let path = Pdfium::pdfium_platform_library_name_at_path(&library);
             match Pdfium::bind_to_library(path) {
-                Ok(bindings) => {
-                    ready.send(Ok(())).ok();
-                    run(Pdfium::new(bindings), receiver);
-                }
-                Err(error) => {
-                    let message = format!("Cannot load PDFium from {}: {error}", library.display());
-                    ready.send(Err(message)).ok();
-                }
+                Ok(bindings) => run(Pdfium::new(bindings), receiver),
+                Err(error) => refuse(&format!("Cannot load PDFium from {}: {error}", library.display()), receiver),
             }
         })
         .map_err(|error| format!("Cannot start the PDF thread: {error}"))?;
-    ready_receiver.recv().map_err(|_| "The PDF thread stopped.".to_string())??;
     Ok(messages)
+}
+
+fn refuse(message: &str, messages: mpsc::Receiver<Message>) {
+    let mut clients: HashMap<u64, UnboundedSender<PdfEvent>> = HashMap::new();
+    for message_in in messages {
+        match message_in {
+            Message::Attach { client, events } => {
+                events.send(PdfEvent::Unavailable { message: message.to_string() }).ok();
+                clients.insert(client, events);
+            }
+            Message::Detach { client } => {
+                clients.remove(&client);
+            }
+            Message::Command { client, command: Command::Load { generation, .. } | Command::Open { generation, .. } } => {
+                if let Some(events) = clients.get(&client) {
+                    events.send(PdfEvent::Failed { generation, message: message.to_string() }).ok();
+                }
+            }
+            Message::Command { .. } => {}
+        }
+    }
 }
 
 /// A worker's document and the pages it still wants.
