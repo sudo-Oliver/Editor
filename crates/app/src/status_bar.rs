@@ -2,7 +2,7 @@
 //! because the app must not depend on a Nerd Font.
 
 use editor_core::vim::Mode;
-use gpui::{Bounds, FontWeight, Path as GpuiPath, Pixels, canvas, div, point, prelude::*, px, svg};
+use gpui::{Bounds, FontWeight, Pixels, canvas, div, point, prelude::*, px, svg};
 
 use crate::theme;
 
@@ -38,10 +38,10 @@ fn slant(color: u32, background: u32) -> impl IntoElement {
     canvas(
         |_, _, _| {},
         move |bounds: Bounds<Pixels>, _, window, _| {
-            let mut path = GpuiPath::new(bounds.origin);
-            path.line_to(point(bounds.right(), bounds.top()));
-            path.line_to(point(bounds.left(), bounds.bottom()));
-            window.paint_path(path, theme::color(color));
+            let corners = [bounds.origin, point(bounds.right(), bounds.top()), point(bounds.left(), bounds.bottom())];
+            if let Some(path) = theme::polygon(corners) {
+                window.paint_path(path, theme::color(color));
+            }
         },
     )
     .flex_none()
@@ -57,12 +57,13 @@ fn round(color: u32, background: u32) -> impl IntoElement {
         move |bounds: Bounds<Pixels>, _, window, _| {
             let radius = bounds.size.height / 2.;
             let center = point(bounds.right(), bounds.top() + radius);
-            let mut path = GpuiPath::new(point(bounds.right(), bounds.top()));
-            for step in 1..=ROUND_STEPS {
+            let arc = (1..=ROUND_STEPS).map(|step| {
                 let angle = std::f32::consts::PI * step as f32 / ROUND_STEPS as f32;
-                path.line_to(point(center.x - radius * angle.sin(), center.y - radius * angle.cos()));
+                point(center.x - radius * angle.sin(), center.y - radius * angle.cos())
+            });
+            if let Some(path) = theme::polygon(std::iter::once(point(bounds.right(), bounds.top())).chain(arc)) {
+                window.paint_path(path, theme::color(color));
             }
-            window.paint_path(path, theme::color(color));
         },
     )
     .flex_none()
