@@ -100,6 +100,30 @@ fn display_name(path: &Path) -> String {
     path.file_name().map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned())
 }
 
+/// Gives a file or folder a new name in its folder. A change of case alone is
+/// fine, but no other entry gets replaced.
+pub fn rename_entry(from: &Path, name: &str) -> Result<PathBuf, String> {
+    let parent = from.parent().ok_or_else(|| "This cannot be renamed.".to_string())?;
+    let target = new_entry_path(parent, name)?;
+    if target == from {
+        return Ok(target);
+    }
+    let same = from.file_name().zip(target.file_name()).is_some_and(|(from, to)| from.eq_ignore_ascii_case(to));
+    if target.exists() && !same {
+        return Err(format!("{} already exists.", display_name(&target)));
+    }
+    if let Some(folder) = target.parent() {
+        fs::create_dir_all(folder).map_err(|error| error.to_string())?;
+    }
+    fs::rename(from, &target).map_err(|error| error.to_string())?;
+    Ok(target)
+}
+
+/// Where `path` ends up when `from` moves to `to`, for paths inside `from` too.
+pub fn moved_path(path: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
+    path.strip_prefix(from).ok().map(|rest| if rest.as_os_str().is_empty() { to.to_path_buf() } else { to.join(rest) })
+}
+
 /// Never replaces anything that is already there.
 pub fn create_file(path: &Path) -> Result<(), String> {
     if let Some(parent) = path.parent() {
@@ -188,6 +212,28 @@ pub fn make_copy(source: &Path, text: Option<&str>) -> io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renaming_never_replaces_another_entry() {
+        let folder = tempfile::tempdir().unwrap();
+        let source = folder.path().join("a.tex");
+        fs::write(&source, "a").unwrap();
+        fs::write(folder.path().join("b.tex"), "b").unwrap();
+        assert_eq!(rename_entry(&source, "b.tex"), Err("b.tex already exists.".to_string()));
+        assert!(rename_entry(&source, "../out.tex").is_err());
+        let renamed = rename_entry(&source, "intro.tex").unwrap();
+        assert_eq!(fs::read_to_string(&renamed).unwrap(), "a");
+        assert!(!source.exists());
+        assert_eq!(fs::read_to_string(rename_entry(&renamed, "Intro.tex").unwrap()).unwrap(), "a");
+    }
+
+    #[test]
+    fn paths_inside_a_moved_folder_follow_it() {
+        let (from, to) = (Path::new("/p/old"), Path::new("/p/new"));
+        assert_eq!(moved_path(Path::new("/p/old/a.tex"), from, to), Some(PathBuf::from("/p/new/a.tex")));
+        assert_eq!(moved_path(from, from, to), Some(to.to_path_buf()));
+        assert_eq!(moved_path(Path::new("/p/older.tex"), from, to), None);
+    }
 
     #[test]
     fn copies_count_up_and_keep_the_original() {

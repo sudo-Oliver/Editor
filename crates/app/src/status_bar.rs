@@ -94,8 +94,8 @@ pub fn render(info: StatusInfo) -> impl IntoElement {
         .flex()
         .flex_col()
         .flex_none()
-        .font_family(theme::CODE_FONT)
-        .text_size(px(theme::CODE_FONT_SIZE))
+        .font_family(theme::code_font())
+        .text_size(px(theme::code_font_size()))
         .child(
             div()
                 .flex()

@@ -90,6 +90,8 @@ pub struct Heading {
     pub level: usize,
     pub title: String,
     pub line: usize,
+    /// False for `\section*` and its kin, which LaTeX leaves without a number.
+    pub numbered: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -267,6 +269,7 @@ fn collect_outline(config: &LanguageConfig, tree: &Tree, rope: &Rope) -> (Vec<He
                 level,
                 title: rope.byte_slice(title).to_string(),
                 line: rope.byte_to_line(node.start_byte()),
+                numbered: !node.child_by_field_name("command").is_some_and(|command| command.kind().ends_with('*')),
             });
         }
         if let Some(rules) = config.symbols
@@ -792,6 +795,16 @@ mod tests {
         assert_eq!(titles.first(), Some(&"{A}"));
         assert!(!titles.contains(&"{no}"), "{titles:?}");
         assert!(syntax.symbols().iter().any(|symbol| symbol.name == "a"));
+    }
+
+    #[test]
+    fn starred_sections_have_no_number() {
+        let rope = Rope::from_str("\\section*{A}\n\\section{B}\n\\subsection*{C}\n");
+        let mut syntax = Syntax::new(Language::Latex);
+        let result = syntax.parse_job(&rope, 1).unwrap().run();
+        assert!(syntax.apply(result, &[]));
+        let numbered: Vec<_> = syntax.headings().iter().map(|heading| heading.numbered).collect();
+        assert_eq!(numbered, [false, true, false]);
     }
 
     #[test]

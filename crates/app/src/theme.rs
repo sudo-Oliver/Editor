@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::RwLock};
 
-use gpui::{Hsla, Rgba, rgb};
+use gpui::{FontWeight, Hsla, Rgba, SharedString, rgb};
 use serde::{Deserialize, Serialize};
 
 use editor_core::HighlightKind;
@@ -175,6 +175,155 @@ impl Palette {
         st_visual: 0x0a7571,
     };
 
+    /// Ink on warm paper, in the spirit of an e-ink screen: low glare, muted
+    /// inks for the syntax and a deep ink for whatever is chosen.
+    pub const PAPER: Self = Self {
+        bg: 0xf4f3f0,
+        panel: 0xeae8e2,
+        divider: 0xc9c5bc,
+        tab_active: 0xf4f3f0,
+        tab_inactive: 0xd8d4cb,
+        ui_text: 0x2c2b2a,
+        ui_muted: 0x6f6a61,
+        folder: 0x2c2b2a,
+        accent: 0x1a1918,
+        on_accent: 0xf4f3f0,
+        accent_soft: 0xcfcabf,
+        focus: 0x3a4a6b,
+        error: 0x9e3426,
+        on_error: 0xffffff,
+        error_panel: 0xf3e3de,
+        warning: 0x7a5512,
+        on_warning: 0xffffff,
+        code_text: 0x2c2b2a,
+        caret: 0x1a1918,
+        line_number: 0x8a857b,
+        line_number_active: 0x2c2b2a,
+        active_line: 0xedebe6,
+        selection: 0xdcd7cb,
+        search_match: 0xebddb0,
+        comment: 0x857f74,
+        keyword: 0x8b2e3c,
+        function: 0x2e4057,
+        string: 0x56662b,
+        number: 0x8a5a2b,
+        kind: 0x2e4057,
+        math: 0x8b2e3c,
+        heading: 0x1a1918,
+        st_bg: 0xe6e3dc,
+        st_light: 0xdad6cd,
+        st_grey: 0xc9c4ba,
+        st_muted: 0x6a645a,
+        st_text: 0x2c2b2a,
+        st_black: 0xf4f3f0,
+        st_one_bg: 0xf4f3f0,
+        st_red: 0x9e3426,
+        st_yellow: 0x7a5512,
+        st_green: 0x4f6b2e,
+        st_normal: 0x2c2b2a,
+        st_insert: 0x6b3a5a,
+        st_visual: 0x2e5566,
+    };
+
+    /// Paper mode in daylight: warm parchment, graphite ink and a blue-black
+    /// fountain-pen ink for commands.
+    pub const PAPER_INK: Self = Self {
+        bg: 0xe6e1d7,
+        panel: 0xf6f4ee,
+        divider: 0xbeb8ad,
+        tab_active: 0xe6e1d7,
+        tab_inactive: 0xccc5b8,
+        ui_text: 0x333333,
+        ui_muted: 0x6e6e6e,
+        folder: 0x333333,
+        accent: 0x111111,
+        on_accent: 0xf6f4ee,
+        accent_soft: 0xc9c2b4,
+        focus: 0x2b4570,
+        error: 0x9e3426,
+        on_error: 0xffffff,
+        error_panel: 0xf1dfd8,
+        warning: 0x7a5512,
+        on_warning: 0xffffff,
+        code_text: 0x111111,
+        caret: 0x111111,
+        line_number: 0x6e6e6e,
+        line_number_active: 0x333333,
+        active_line: 0xdfd9cd,
+        selection: 0xcfc8ba,
+        search_match: 0xe3cf98,
+        comment: 0x666666,
+        keyword: 0x2b4570,
+        function: 0x2b4570,
+        string: 0x5e5444,
+        number: 0x7a5426,
+        kind: 0x333333,
+        math: 0x8a2f35,
+        heading: 0x111111,
+        st_bg: 0xebe7df,
+        st_light: 0xdcd6ca,
+        st_grey: 0xbeb8ad,
+        st_muted: 0x666666,
+        st_text: 0x333333,
+        st_black: 0xf6f4ee,
+        st_one_bg: 0xf6f4ee,
+        st_red: 0x9e3426,
+        st_yellow: 0x7a5512,
+        st_green: 0x4f6b2e,
+        st_normal: 0x333333,
+        st_insert: 0x2b4570,
+        st_visual: 0x6b3a5a,
+    };
+
+    /// Paper mode at night: dark paper and pale ink, the same roles inverted.
+    pub const PAPER_INK_DARK: Self = Self {
+        bg: 0x1c1b19,
+        panel: 0x141312,
+        divider: 0x3d3a35,
+        tab_active: 0x1c1b19,
+        tab_inactive: 0x3a3732,
+        ui_text: 0xd6d1c6,
+        ui_muted: 0x8e8980,
+        folder: 0xd6d1c6,
+        accent: 0xece8df,
+        on_accent: 0x141312,
+        accent_soft: 0x34312c,
+        focus: 0x9db4d6,
+        error: 0xe0806e,
+        on_error: 0x141312,
+        error_panel: 0x33201c,
+        warning: 0xd6ac62,
+        on_warning: 0x141312,
+        code_text: 0xece8df,
+        caret: 0xece8df,
+        line_number: 0x807b72,
+        line_number_active: 0xd6d1c6,
+        active_line: 0x24231f,
+        selection: 0x3a3732,
+        search_match: 0x4a3f22,
+        comment: 0x8e8980,
+        keyword: 0x9fb7da,
+        function: 0x9fb7da,
+        string: 0xc2b59c,
+        number: 0xd9b27c,
+        kind: 0xd6d1c6,
+        math: 0xe0a092,
+        heading: 0xf7f4ec,
+        st_bg: 0x24231f,
+        st_light: 0x2c2a26,
+        st_grey: 0x3d3a35,
+        st_muted: 0x8e8980,
+        st_text: 0xd6d1c6,
+        st_black: 0x141312,
+        st_one_bg: 0x141312,
+        st_red: 0xe0806e,
+        st_yellow: 0xd6ac62,
+        st_green: 0xa3b87a,
+        st_normal: 0xd6d1c6,
+        st_insert: 0x9fb7da,
+        st_visual: 0xc79bbd,
+    };
+
     /// Maps Neovim highlight groups to the roles. A group the scheme leaves out
     /// falls back to a related one, and in the end to a mix of `Normal`.
     pub fn from_groups(groups: &HashMap<String, Highlight>) -> Self {
@@ -334,6 +483,11 @@ fn luminance(color: u32) -> f32 {
     0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0)
 }
 
+/// A tone above the panel for the chosen row, like a sheet lifted off the desk.
+pub fn raised(palette: &Palette) -> u32 {
+    if is_light(palette.panel) { mix(palette.panel, 0xffffff, 0.7) } else { mix(palette.panel, palette.ui_text, 0.12) }
+}
+
 pub fn is_light(color: u32) -> bool {
     luminance(color) > 0.4
 }
@@ -389,7 +543,8 @@ fn text_on(fill: u32, candidates: [u32; 2]) -> u32 {
 pub const DEFAULT_THEME: &str = "overleaf-dark";
 
 /// The themes that ship with the app, by the name the picker shows.
-pub const BUILT_IN: [(&str, Palette); 2] = [("overleaf-dark", Palette::OVERLEAF_DARK), ("overleaf-light", Palette::OVERLEAF_LIGHT)];
+pub const BUILT_IN: [(&str, Palette); 3] =
+    [("overleaf-dark", Palette::OVERLEAF_DARK), ("overleaf-light", Palette::OVERLEAF_LIGHT), ("paper", Palette::PAPER)];
 
 pub fn built_in(name: &str) -> Option<Palette> {
     BUILT_IN.iter().find(|(built_in, _)| *built_in == name).map(|(_, palette)| *palette)
@@ -408,6 +563,64 @@ pub fn set_palette(palette: Palette) {
 pub const CODE_FONT_SIZE: f32 = 12.0;
 pub const CODE_LINE_HEIGHT: f32 = 19.2;
 pub const UI_FONT_SIZE: f32 = 13.0;
+/// Ships with the app for paper mode, under the SIL Open Font License.
+pub const PAPER_FONT: &str = "iA Writer Quattro S";
+/// A book's rhythm: lines further apart than in a code editor.
+const PAPER_LINE_SPACING: f32 = 1.7;
+
+/// How text looks and whether the editor is in paper mode. The settings set it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Look {
+    pub code_font: SharedString,
+    /// None keeps the system font of the interface.
+    pub ui_font: Option<SharedString>,
+    pub code_size: f32,
+    pub line_height: f32,
+    pub paper: bool,
+    pub ruled_lines: bool,
+}
+
+impl Look {
+    pub fn new(paper: bool, ruled_lines: bool, code_font: Option<&str>, ui_font: Option<&str>, code_size: Option<f32>) -> Self {
+        let code_size = code_size.unwrap_or(if paper { 14. } else { CODE_FONT_SIZE });
+        let spacing = if paper { PAPER_LINE_SPACING } else { CODE_LINE_HEIGHT / CODE_FONT_SIZE };
+        Self {
+            code_font: code_font.unwrap_or(if paper { PAPER_FONT } else { CODE_FONT }).to_string().into(),
+            ui_font: ui_font.or(paper.then_some(PAPER_FONT)).map(|font| font.to_string().into()),
+            code_size,
+            line_height: (code_size * spacing).round(),
+            paper,
+            ruled_lines: paper && ruled_lines,
+        }
+    }
+}
+
+static LOOK: RwLock<Option<Look>> = RwLock::new(None);
+
+pub fn look() -> Look {
+    LOOK.read().unwrap_or_else(|error| error.into_inner()).clone().unwrap_or_else(|| Look::new(false, false, None, None, None))
+}
+
+pub fn set_look(look: Look) {
+    *LOOK.write().unwrap_or_else(|error| error.into_inner()) = Some(look);
+}
+
+pub fn code_font() -> SharedString {
+    look().code_font
+}
+
+pub fn code_font_size() -> f32 {
+    look().code_size
+}
+
+pub fn code_line_height() -> f32 {
+    look().line_height
+}
+/// The title of a page in the hub or the setup.
+pub const TITLE_FONT_SIZE: f32 = 22.0;
+pub const RADIUS_SM: f32 = 4.0;
+pub const RADIUS_MD: f32 = 6.0;
+pub const RADIUS_LG: f32 = 10.0;
 
 #[cfg(target_os = "macos")]
 pub const CODE_FONT: &str = "Menlo";
@@ -419,11 +632,28 @@ pub fn color(value: u32) -> Hsla {
     color.into()
 }
 
-/// Returns the color and the italic flag of a syntax kind.
-pub fn highlight_style(kind: Option<HighlightKind>) -> (u32, bool) {
+/// Returns the color, the italic flag and the weight of a syntax kind. Paper
+/// mode carries structure by weight, as ink on a page has one color.
+pub fn highlight_style(kind: Option<HighlightKind>) -> (u32, bool, FontWeight) {
     use HighlightKind::*;
     let palette = palette();
-    match kind {
+    if look().paper {
+        // Ink tells commands from text, slant tells arguments from commands,
+        // and weight is kept for what the document itself makes bold.
+        let (color, italic) = match kind {
+            None | Some(Punctuation | Variable | Strong | Emphasis) => (palette.code_text, kind == Some(Emphasis)),
+            Some(Heading) => (palette.heading, false),
+            Some(Comment) => (palette.comment, true),
+            Some(Keyword | Operator | Function | Tag) => (palette.keyword, false),
+            Some(Type) => (palette.kind, true),
+            Some(String | Link | Raw) => (palette.string, true),
+            Some(Number | Constant) => (palette.number, false),
+            Some(Math) => (palette.math, false),
+        };
+        let weight = if matches!(kind, Some(Heading | Strong)) { FontWeight::BOLD } else { FontWeight::NORMAL };
+        return (color, italic, weight);
+    }
+    let (color, italic) = match kind {
         None | Some(Punctuation | Variable | Strong) => (palette.code_text, false),
         Some(Heading) => (palette.heading, false),
         Some(Comment) => (palette.comment, false),
@@ -435,7 +665,9 @@ pub fn highlight_style(kind: Option<HighlightKind>) -> (u32, bool) {
         Some(Emphasis) => (palette.code_text, true),
         Some(Raw) => (palette.string, false),
         Some(Math) => (palette.math, false),
-    }
+    };
+    let weight = if kind == Some(Strong) { FontWeight::BOLD } else { FontWeight::NORMAL };
+    (color, italic, weight)
 }
 
 #[cfg(test)]
@@ -504,10 +736,28 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn text_reads_on_the_raised_row() {
+        for (name, palette) in BUILT_IN {
+            assert!(contrast(palette.ui_text, raised(&palette)) >= TEXT_CONTRAST, "{name}");
+        }
+    }
+
+    #[test]
     fn built_in_themes_are_readable() {
         for (name, palette) in BUILT_IN {
             assert_theme(&palette, name);
         }
+        assert_theme(&Palette::PAPER_INK, "paper-ink");
+        assert_theme(&Palette::PAPER_INK_DARK, "paper-ink-dark");
+    }
+
+    #[test]
+    fn paper_mode_spaces_lines_like_a_book() {
+        let look = Look::new(true, true, None, None, None);
+        assert_eq!(look.code_font.as_ref(), PAPER_FONT);
+        assert!(look.line_height >= look.code_size * 1.6);
+        assert!(!Look::new(false, true, None, None, None).ruled_lines);
+        assert_eq!(Look::new(false, false, Some("Fira Code"), None, Some(13.)).code_font.as_ref(), "Fira Code");
     }
 
     #[test]

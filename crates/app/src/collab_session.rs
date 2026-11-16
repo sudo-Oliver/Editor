@@ -1564,7 +1564,7 @@ impl Workspace {
                         .p(px(6.))
                         .rounded(px(4.))
                         .bg(theme::color(theme::palette().bg))
-                        .font_family(theme::CODE_FONT)
+                        .font_family(theme::code_font())
                         .text_size(px(11.))
                         .child(code.clone()),
                 )

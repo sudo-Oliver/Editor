@@ -1,5 +1,5 @@
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     ops::Range,
     path::{Path, PathBuf},
@@ -15,7 +15,7 @@ use std::{
 use build::{BuildEvent, BuildManager, BuildOutcome, BuildRequest, Config, Diagnostic, Engine, Fix, Loaded, Severity, Trigger, find_main};
 use addon_api::{ActiveFile, DiagnosticInfo, Reply, Request, SearchHit};
 use editor_core::{
-    Symbol, SymbolKind,
+    Selection, Symbol, SymbolKind,
     Language, Mark, MarkSeverity,
     snippet::Snippet,
     vim::{self, Effect, Key, Leader, Mode},
@@ -23,7 +23,7 @@ use editor_core::{
 };
 use gpui::{
     AnyElement, Anchor, App, AsyncWindowContext, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Entity, FocusHandle, Focusable, FontWeight, Keystroke,
-    KeystrokeEvent, MouseButton, MouseMoveEvent, PathPromptOptions, Pixels, Point, Render, ScrollHandle, ScrollStrategy, SharedString, UniformListScrollHandle,
+    KeystrokeEvent, MouseButton, MouseDownEvent, MouseMoveEvent, PathPromptOptions, Pixels, Point, Render, ScrollHandle, ScrollStrategy, SharedString, UniformListScrollHandle,
     EntityId, PromptLevel, Subscription, Task, WeakEntity, Window, anchored, black, canvas, deferred, div, fill, point, prelude::*, px, size, uniform_list, svg,
 };
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -45,15 +45,19 @@ use crate::{
     image_view::{ImageView, ImageViewEvent, include_snippet, is_image, relative_path},
     pdf_view::{PdfView, PdfViewEvent, ZOOM_STEP},
     nvim_themes, package_commands,
-    picker::{self, Picker, PickerKind},
+    picker::{self, FontSlot, Picker, PickerKind},
     package_check::{self, PackageHint},
     problems::{self, Problem},
     recovery,
     settings::{self, Settings},
+    setup::{SetupEvent, SetupView},
+    projects::{self, TemplateLanguage},
+    tour::{self, Tour, TourAnchor},
     shortcuts,
     snippets,
     status_bar::{self, StatusInfo},
     theme,
+    toolchain::{self, Tool, Toolchain, ToolchainEvent},
 };
 
 #[cfg(feature = "collab")]
@@ -71,6 +75,11 @@ const TAB_SLANT: f32 = 12.0;
 const TAB_GAP: f32 = 1.5;
 const TAB_HEIGHT: f32 = 32.0;
 const TOOLBAR_HEIGHT: f32 = 32.0;
+/// The toolbar floats in this much of the editor's paper above the text.
+const TOOLBAR_ROW_HEIGHT: f32 = TOOLBAR_HEIGHT + 14.0;
+/// Corners of the floating toolbar and of the spots inside it.
+const TOOLBAR_RADIUS: f32 = 12.0;
+const TOOL_RADIUS: f32 = 8.0;
 const BREADCRUMB_HEIGHT: f32 = 24.0;
 /// The editor in focus mode stays this wide, for lines that read well.
 const FOCUS_WIDTH: f32 = 860.0;
@@ -80,9 +89,16 @@ const SYMBOL_COLUMNS: f32 = 11.0;
 const TABLE_GRID: usize = 8;
 const PREVIEW_TOOLBAR_HEIGHT: f32 = 32.0;
 const MIN_PANE_WIDTH: f32 = 160.0;
-const OUTLINE_INSET: f32 = 8.0;
-const OUTLINE_INDENT: f32 = 16.0;
-const OUTLINE_CHEVRON: f32 = 16.0;
+/// The outline reads like a contents page: one line down the left, chapters
+/// as numbered pills on it, sections as dots.
+const OUTLINE_SPINE: f32 = 22.0;
+const OUTLINE_PILL: f32 = 30.0;
+const OUTLINE_LINE: f32 = 18.0;
+/// The rows of the file tree: room to breathe, and one step of indent per level.
+const TREE_ROW: f32 = 34.0;
+const TREE_INSET: f32 = 12.0;
+const TREE_INDENT: f32 = 20.0;
+const TREE_ICON: f32 = 16.0;
 const FOLLOW_DEBOUNCE: Duration = Duration::from_millis(150);
 /// Oldest output is dropped beyond this size.
 const MAX_LOG_BYTES: usize = 2 << 20;
@@ -137,6 +153,8 @@ enum Menu {
     Compile,
     Symbols,
     Table,
+    /// The right-click menu of a row in the file tree.
+    Tree,
 }
 
 /// How the editor and the PDF share the window.
@@ -164,6 +182,7 @@ const PRESENT_CONTROLS_TIME: Duration = Duration::from_secs(2);
 enum SettingsPage {
     Editor,
     Compiler,
+    Tools,
 }
 
 /// The name field for a new file or folder at the top of the file tree.
@@ -173,6 +192,8 @@ struct TreeInput {
     view: Entity<EditorView>,
     /// Vim keeps working in the tree when the field closes.
     back_to_tree: bool,
+    /// The entry whose name the field edits, in its own row, instead of a new one.
+    renaming: Option<PathBuf>,
     _observer: Subscription,
 }
 
@@ -213,6 +234,8 @@ struct MenuEntry {
     label: String,
     shortcut: &'static str,
     handler: MenuHandler,
+    /// Shown in the error color, for actions that remove something.
+    danger: bool,
 }
 
 fn entry(
@@ -225,6 +248,7 @@ fn entry(
         label: label.into(),
         shortcut,
         handler: Rc::new(handler),
+        danger: false,
     }
 }
 
@@ -266,6 +290,22 @@ async fn ask(
 ) -> Option<usize> {
     let answer = this.update_in(cx, |_, window, cx| window.prompt(level, message, Some(detail), answers, cx)).ok()?;
     answer.await.ok()
+}
+
+/// The palette of the chosen theme, from the cache only, so that it never waits for Neovim.
+fn theme_palette(name: Option<&str>) -> Option<theme::Palette> {
+    let name = name.unwrap_or(theme::DEFAULT_THEME);
+    theme::built_in(name).or_else(|| nvim_themes::cache_path().and_then(|path| nvim_themes::load_cache(&path).remove(name)))
+}
+
+/// Paper mode lays its own ink over the theme; without it the theme comes back.
+fn apply_look(settings: &Settings) {
+    if settings.paper_mode {
+        theme::set_palette(if settings.paper_dark { theme::Palette::PAPER_INK_DARK } else { theme::Palette::PAPER_INK });
+    } else if let Some(palette) = theme_palette(settings.theme.as_deref()) {
+        theme::set_palette(palette);
+    }
+    theme::set_look(settings.look());
 }
 
 fn show_status(this: &WeakEntity<Workspace>, cx: &mut AsyncWindowContext, message: &str) {
@@ -412,6 +452,15 @@ pub struct Workspace {
     pdf_tab_shown: bool,
     focus_mode: bool,
     home: Entity<HomeView>,
+    /// The setup of the first start, shown in place of everything else.
+    setup: Option<(Entity<SetupView>, Subscription)>,
+    tour: Option<Tour>,
+    /// A file or folder from Finder or the terminal that arrived during the setup.
+    pending_open: Option<PathBuf>,
+    /// Where the parts that the tour points at were drawn last.
+    tour_anchors: Rc<RefCell<HashMap<TourAnchor, Bounds<Pixels>>>>,
+    toolchain: Entity<Toolchain>,
+    _toolchain_subscriptions: [Subscription; 2],
     /// The hub also shows by itself while no project is open.
     show_hub: bool,
     /// The logo turns into a house under the mouse, as it leads to the hub.
@@ -488,6 +537,8 @@ pub struct Workspace {
     /// The row last clicked, which decides where a new entry goes.
     tree_target: Option<PathBuf>,
     tree_input: Option<TreeInput>,
+    /// The row the tree's menu belongs to.
+    tree_menu_path: Option<PathBuf>,
     tree_error: Option<SharedString>,
     tree_g_pending: bool,
     tree_leader: Option<String>,
@@ -534,7 +585,18 @@ impl Workspace {
         let key_subscription = cx.intercept_keystrokes(move |event, window, cx| {
             key_handle.update(cx, |this, cx| this.intercept_key(event, window, cx)).ok();
         });
-        let home = cx.new(HomeView::new);
+        let toolchain = cx.new(|_| Toolchain::default());
+        let toolchain_subscriptions = [
+            cx.observe(&toolchain, |_, _, cx| cx.notify()),
+            cx.subscribe(&toolchain, |this, _, event, cx| match event {
+                ToolchainEvent::Installed(tool) => this.tool_installed(*tool, cx),
+                ToolchainEvent::InstallerChosen(use_homebrew) => {
+                    this.settings.use_homebrew = *use_homebrew;
+                    this.save_settings(cx);
+                }
+            }),
+        ];
+        let home = cx.new(|cx| HomeView::new(toolchain.clone(), cx));
         let home_subscription = cx.subscribe_in(&home, window, |this, _, event, window, cx| match event {
             HomeEvent::Open(path) => {
                 let path = path.clone();
@@ -549,6 +611,14 @@ impl Workspace {
             HomeEvent::Trashed(path) => this.forget_trashed_root(path, cx),
             #[cfg(feature = "collab")]
             HomeEvent::JoinSession => this.open_join_dialog(window, cx),
+            HomeEvent::CardsChanged(cards) => {
+                this.settings.hub_cards = *cards;
+                this.save_settings(cx);
+            }
+            HomeEvent::StartTour => this.start_tour(window, cx),
+            HomeEvent::InstallCommand => this.install_shell_command(cx),
+            HomeEvent::RunSetup => this.run_setup(window, cx),
+            HomeEvent::ShowShortcuts => this.open_dialog(Dialog::Shortcuts, window, cx),
         });
         let workspace_handle = cx.entity().downgrade();
         let git_panel = cx.new(|cx| GitPanel::new(workspace_handle, cx));
@@ -565,14 +635,19 @@ impl Workspace {
             GitPanelEvent::ShowCommit { title, patch } => this.show_commit(title, patch, window, cx),
         });
         let settings_path = settings::default_path();
-        let settings = settings_path.as_deref().map(Settings::load).unwrap_or_default();
-        // Only the cache, so that starting never waits for Neovim.
-        if let Some(name) = &settings.theme
-            && let Some(palette) = theme::built_in(name)
-                .or_else(|| nvim_themes::cache_path().and_then(|path| nvim_themes::load_cache(&path).remove(name)))
-        {
-            theme::set_palette(palette);
+        let mut settings = settings_path.as_deref().map(Settings::load).unwrap_or_default();
+        let use_homebrew = settings.use_homebrew;
+        toolchain.update(cx, |toolchain, _| toolchain.use_homebrew = use_homebrew);
+        // Nothing of the editor on disk means that it was just installed.
+        let first_start = settings_path.as_deref().is_some_and(|path| !path.exists())
+            && projects::registry_path().is_none_or(|path| !path.exists());
+        let settings_migrated = !first_start && !settings.first_run_done;
+        if settings_migrated {
+            // People who used the editor before the setup existed skip it and the tour.
+            settings.first_run_done = true;
+            settings.tour_done = true;
         }
+        apply_look(&settings);
         #[cfg(feature = "collab")]
         let collab = {
             let name = if settings.collab_name.is_empty() { collab_session::default_name() } else { settings.collab_name.clone() };
@@ -612,6 +687,12 @@ impl Workspace {
             pdf_tab_shown: false,
             focus_mode: false,
             home,
+            setup: None,
+            tour: None,
+            pending_open: None,
+            tour_anchors: Rc::default(),
+            toolchain,
+            _toolchain_subscriptions: toolchain_subscriptions,
             show_hub: false,
             logo_hovered: false,
             _home_subscription: home_subscription,
@@ -672,6 +753,7 @@ impl Workspace {
             show_tree: true,
             tree_target: None,
             tree_input: None,
+            tree_menu_path: None,
             tree_error: None,
             tree_g_pending: false,
             tree_leader: None,
@@ -692,14 +774,74 @@ impl Workspace {
             git: git_sync::GitUi::default(),
         };
         workspace.reload_addons(cx);
+        if settings_migrated {
+            workspace.save_settings(cx);
+        }
+        if first_start {
+            workspace.run_setup(window, cx);
+        }
         match root {
-            Some(root) => workspace.open_root(root, window, cx),
+            Some(path) => workspace.open_path(path, window, cx),
             None => {
                 let home = workspace.home.clone();
-                cx.defer_in(window, move |_, window, cx| home.update(cx, |home, cx| home.focus(window, cx)));
+                let (vim_mode, cards) = (workspace.settings.vim_mode, workspace.settings.hub_cards);
+                cx.defer_in(window, move |_, window, cx| {
+                    home.update(cx, |home, cx| {
+                        home.set_context(false, vim_mode, cards);
+                        home.show(window, cx);
+                    })
+                });
             }
         }
         workspace
+    }
+
+    /// Adds the `editor` command for the terminal. The password prompt of
+    /// macOS can take a while, so this runs off the main thread.
+    fn install_shell_command(&mut self, cx: &mut Context<Self>) {
+        let install = cx.background_spawn(async { crate::shell_command::install() });
+        cx.spawn(async move |this, cx| {
+            let message = match install.await {
+                Ok(crate::shell_command::Outcome::Installed(_)) => "Added. In a new Terminal window, editor . opens the folder you are in.".to_string(),
+                Ok(crate::shell_command::Outcome::AlreadyThere(link)) => format!("The editor command is already there, at {}.", link.display()),
+                Ok(crate::shell_command::Outcome::NeedsAdmin) => "The editor command was not added.".to_string(),
+                Err(error) => error,
+            };
+            this.update(cx, |this, cx| this.set_status(message, cx)).ok();
+        })
+        .detach();
+    }
+
+    /// Opens a folder as the project, or a file in its project. Finder, the
+    /// `editor` command and the command line all come here.
+    pub fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let path = match path.canonicalize() {
+            Ok(path) => path,
+            Err(_) => return self.set_status(format!("Cannot find {}.", path.display()), cx),
+        };
+        if self.setup.is_some() {
+            self.pending_open = Some(path);
+            return;
+        }
+        let (root, file) = if path.is_dir() {
+            (path, None)
+        } else {
+            let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from);
+            (projects::project_root_for(&path, self.root.as_deref(), &home), Some(path))
+        };
+        if self.root.as_deref() != Some(root.as_path()) {
+            self.open_root(root.clone(), window, cx);
+            // Unsaved text that could not be saved keeps the old project open.
+            if self.root.as_deref() != Some(root.as_path()) {
+                return;
+            }
+        }
+        self.show_hub = false;
+        match file {
+            Some(file) => self.open_file(file, window, cx),
+            None => self.focus_main(window, cx),
+        }
+        cx.notify();
     }
 
     fn hub_shown(&self) -> bool {
@@ -711,9 +853,9 @@ impl Workspace {
             self.close_menu(window, cx);
         }
         self.show_hub = true;
-        let (has_project, vim_mode) = (self.root.is_some(), self.settings.vim_mode);
+        let (has_project, vim_mode, cards) = (self.root.is_some(), self.settings.vim_mode, self.settings.hub_cards);
         self.home.update(cx, |home, cx| {
-            home.set_context(has_project, vim_mode);
+            home.set_context(has_project, vim_mode, cards);
             home.show(window, cx);
         });
         cx.notify();
@@ -764,8 +906,8 @@ impl Workspace {
         for entry in &self.addon_panels {
             entry.panel.update(cx, |panel, cx| panel.set_root(None, cx));
         }
-        let vim_mode = self.settings.vim_mode;
-        self.home.update(cx, |home, _| home.set_context(false, vim_mode));
+        let (vim_mode, cards) = (self.settings.vim_mode, self.settings.hub_cards);
+        self.home.update(cx, |home, _| home.set_context(false, vim_mode, cards));
         cx.notify();
     }
 
@@ -788,10 +930,10 @@ impl Workspace {
         self.start_watching(&root, cx);
         self.git_branch = git_branch(&root);
         self.root = Some(root.clone());
-        let vim_mode = self.settings.vim_mode;
+        let (vim_mode, cards) = (self.settings.vim_mode, self.settings.hub_cards);
         self.home.update(cx, |home, cx| {
             home.touch(&root, cx);
-            home.set_context(true, vim_mode);
+            home.set_context(true, vim_mode, cards);
         });
         self.git_panel.update(cx, |panel, cx| panel.set_root(Some(root.clone()), cx));
         self.tracked_edits.clear();
@@ -805,6 +947,9 @@ impl Workspace {
                 Config::default()
             }
         };
+        if !self.config.trigger_set && self.settings.compile_while_typing {
+            self.config.trigger = Trigger::Type;
+        }
 
         let first = ["main.tex", "main.typ", "README.md"]
             .iter()
@@ -2096,6 +2241,13 @@ impl Workspace {
     /// Makes the edit of `fix`, with undo. A new package goes to the main file, and
     /// a removal to the file that loads the package.
     fn apply_fix(&mut self, fix: &Fix, path: Option<&Path>, cx: &mut Context<Self>) {
+        if let Fix::InstallTool(language) = fix {
+            if let Some(tool) = Tool::for_language(language) {
+                self.toolchain.update(cx, |toolchain, cx| toolchain.start(tool, cx));
+            }
+            self.dialog = Some(Dialog::Settings(SettingsPage::Tools));
+            return cx.notify();
+        }
         let Some(path) = path.map(Path::to_path_buf).or_else(|| self.last_main.clone()) else {
             return;
         };
@@ -2121,6 +2273,7 @@ impl Workspace {
         let done = match fix {
             Fix::AddPackage(package) => format!("Added {package}"),
             Fix::RemovePackage(package) => format!("Removed {package}"),
+            Fix::InstallTool(_) => return,
         };
         self.set_status(done, cx);
     }
@@ -2328,7 +2481,14 @@ impl Workspace {
     // Settings and dialogs
 
     fn update_settings(&mut self, update: impl FnOnce(&mut Settings), window: &mut Window, cx: &mut Context<Self>) {
+        let look = (self.settings.look(), self.settings.paper_dark);
         update(&mut self.settings);
+        if (self.settings.look(), self.settings.paper_dark) != look {
+            apply_look(&self.settings);
+            for document in &self.documents {
+                document.view.update(cx, |view, cx| view.forget_layout(cx));
+            }
+        }
         if let Some(path) = &self.settings_path
             && let Err(error) = self.settings.save(path)
         {
@@ -2492,6 +2652,22 @@ impl Workspace {
     /// Runs before the key bindings. An open picker takes its keys in any mode. Apart
     /// from that, nothing changes with vim mode off.
     fn intercept_key(&mut self, event: &KeystrokeEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.setup.is_some() {
+            return;
+        }
+        if self.tour.is_some() {
+            let modifiers = event.keystroke.modifiers;
+            if !(modifiers.platform || modifiers.control || modifiers.alt) {
+                match event.keystroke.key.as_str() {
+                    "right" | "enter" => self.tour_step(true, window, cx),
+                    "left" => self.tour_step(false, window, cx),
+                    "escape" => self.end_tour(window, cx),
+                    _ => return,
+                }
+                cx.stop_propagation();
+            }
+            return;
+        }
         if self.hub_shown() && self.dialog.is_none() && self.open_menu.is_none() {
             if self.home.update(cx, |home, cx| home.handle_key(&event.keystroke, window, cx)) {
                 cx.stop_propagation();
@@ -3130,6 +3306,16 @@ impl Workspace {
             Key::Char('a') => self.open_tree_input(false, window, cx),
             Key::Char('A') => self.open_tree_input(true, window, cx),
             Key::Char('u') => self.prompt_add_files(window, cx),
+            Key::Char('r') => {
+                if let Some(entry) = self.entries.get(self.tree_cursor) {
+                    self.open_rename(entry.path.clone(), window, cx);
+                }
+            }
+            Key::Char('D') => {
+                if let Some(entry) = self.entries.get(self.tree_cursor) {
+                    self.trash_tree_entry(entry.path.clone(), window, cx);
+                }
+            }
             Key::Char(' ') => self.tree_leader = Some(String::new()),
             Key::Tab => self.focus_active(window, cx),
             // `q` does nothing in the nvim-tree config either.
@@ -3162,7 +3348,7 @@ impl Workspace {
         });
         let _observer = cx.observe(&view, |_, _, cx| cx.notify());
         window.focus(&view.read(cx).focus_handle(cx), cx);
-        self.tree_input = Some(TreeInput { folder, parent, view, back_to_tree, _observer });
+        self.tree_input = Some(TreeInput { folder, parent, view, back_to_tree, renaming: None, _observer });
         self.tree_error = None;
         cx.notify();
     }
@@ -3194,6 +3380,19 @@ impl Workspace {
         };
         let folder = input.folder;
         let name = input.view.read(cx).state.buffer().to_string();
+        if let Some(from) = input.renaming.clone() {
+            match file_tree::rename_entry(&from, &name) {
+                Ok(to) => {
+                    self.close_tree_input(window, cx);
+                    self.follow_rename(&from, &to, cx);
+                }
+                Err(error) => {
+                    self.tree_error = Some(error.into());
+                    cx.notify();
+                }
+            }
+            return;
+        }
         let created = file_tree::new_entry_path(&input.parent, &name).and_then(|path| {
             if folder { file_tree::create_folder(&path) } else { file_tree::create_file(&path) }.map(|()| path)
         });
@@ -3223,6 +3422,187 @@ impl Workspace {
             self.tree_scroll.scroll_to_item(index, ScrollStrategy::Nearest);
         }
         self.tree_target = Some(path.to_path_buf());
+    }
+
+    /// Edits the name of an entry in its own row, with the cursor before the extension.
+    fn open_rename(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.root.as_deref() == Some(path.as_path()) {
+            return;
+        }
+        let Some(name) = path.file_name().map(|name| name.to_string_lossy().into_owned()) else {
+            return;
+        };
+        let back_to_tree = self.tree_focus.is_focused(window);
+        self.show_files();
+        let stem = if path.is_dir() { name.len() } else { name.rfind('.').filter(|dot| *dot > 0).unwrap_or(name.len()) };
+        let view = cx.new(|cx| {
+            let mut view = EditorView::new(&name, None, cx);
+            view.set_plain();
+            view.state.set_selections(vec![Selection::cursor(stem)]);
+            view
+        });
+        let _observer = cx.observe(&view, |_, _, cx| cx.notify());
+        window.focus(&view.read(cx).focus_handle(cx), cx);
+        let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        self.tree_target = Some(path.clone());
+        self.tree_input = Some(TreeInput { folder: path.is_dir(), parent, view, back_to_tree, renaming: Some(path), _observer });
+        self.tree_error = None;
+        cx.notify();
+    }
+
+    /// Open tabs, folded folders and the main document move along with a rename.
+    fn follow_rename(&mut self, from: &Path, to: &Path, cx: &mut Context<Self>) {
+        for document in &self.documents {
+            document.view.update(cx, |view, _| {
+                if let Some(path) = view.path.as_deref().and_then(|path| file_tree::moved_path(path, from, to)) {
+                    view.path = Some(path);
+                }
+            });
+        }
+        for image in &self.images {
+            image.view.update(cx, |view, _| {
+                if let Some(path) = file_tree::moved_path(view.path(), from, to) {
+                    view.set_path(path);
+                }
+            });
+        }
+        self.collapsed = self.collapsed.iter().map(|path| file_tree::moved_path(path, from, to).unwrap_or_else(|| path.clone())).collect();
+        if let Some(root) = self.root.clone()
+            && let Some(main) = self.config.main.as_deref().and_then(|main| file_tree::moved_path(&root.join(main), from, to))
+            && let Ok(relative) = main.strip_prefix(&root)
+        {
+            self.set_main_document(relative.to_path_buf(), cx);
+        }
+        self.reveal_new_entry(to, cx);
+        let name = to.file_name().map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+        self.set_status(format!("Renamed to {name}"), cx);
+    }
+
+    /// Asks first, then moves the entry to the Trash, from where Finder can put it back.
+    fn trash_tree_entry(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.root.as_deref() == Some(path.as_path()) {
+            return;
+        }
+        let name = path.file_name().map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+        let unsaved = self.documents.iter().any(|document| {
+            let view = document.view.read(cx);
+            view.state.is_dirty() && view.path.as_deref().is_some_and(|open| open.starts_with(&path))
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let message = format!("Move “{name}” to the Trash?");
+            let detail = if unsaved {
+                "Unsaved changes in its open files are lost. Finder can put it back from the Trash."
+            } else {
+                "Finder can put it back from the Trash."
+            };
+            if ask(&this, cx, PromptLevel::Warning, &message, detail, &["Move to Trash", "Cancel"]).await != Some(0) {
+                return;
+            }
+            let target = path.clone();
+            let trashed = cx.background_spawn(async move { trash::delete(&target) }).await;
+            this.update_in(cx, |this, window, cx| {
+                if let Err(error) = trashed {
+                    this.set_status(format!("Cannot move {name} to the Trash: {error}"), cx);
+                    return;
+                }
+                while let Some(index) =
+                    this.documents.iter().rposition(|document| document.view.read(cx).path.as_deref().is_some_and(|open| open.starts_with(&path)))
+                {
+                    this.remove_document(index, window, cx);
+                }
+                while let Some(index) = this.images.iter().rposition(|image| image.view.read(cx).path().starts_with(&path)) {
+                    this.close_image(index, window, cx);
+                }
+                this.collapsed.retain(|folder| !folder.starts_with(&path));
+                this.refresh_from_disk(cx);
+                this.tree_cursor = this.tree_cursor.min(this.entries.len().saturating_sub(1));
+                this.set_status(format!("Moved {name} to the Trash"), cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn duplicate_tree_entry(&mut self, path: &Path, cx: &mut Context<Self>) {
+        match file_tree::make_copy(path, None) {
+            Ok(copy) => self.reveal_new_entry(&copy, cx),
+            Err(error) => self.set_status(format!("Cannot duplicate: {error}"), cx),
+        }
+    }
+
+    /// Writes the choice to `.editor.toml`, where every build finds it.
+    fn set_main_document(&mut self, relative: PathBuf, cx: &mut Context<Self>) {
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        match build::write_main(&root, &relative) {
+            Ok(()) => {
+                self.set_status(format!("{} is the main document", relative.display()), cx);
+                self.config.main = Some(relative);
+                self.recompile(cx);
+            }
+            Err(error) => self.set_status(format!("Cannot set the main document: {error}"), cx),
+        }
+    }
+
+    fn open_tree_menu(&mut self, path: PathBuf, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        self.tree_target = Some(path.clone());
+        if let Some(index) = self.entries.iter().position(|entry| entry.path == path) {
+            self.tree_cursor = index;
+        }
+        self.tree_menu_path = Some(path);
+        self.open_menu = Some(Menu::Tree);
+        self.menu_origin = position;
+        window.focus(&self.menu_focus, cx);
+        cx.notify();
+    }
+
+    fn tree_menu_entries(&self) -> Vec<MenuEntry> {
+        let (Some(path), Some(root)) = (self.tree_menu_path.clone(), self.root.clone()) else {
+            return Vec::new();
+        };
+        let is_root = path == root;
+        let is_dir = is_root || path.is_dir();
+        let vim = self.settings.vim_mode;
+        let here = |label: &str, folder: bool, key: &'static str| {
+            let target = path.clone();
+            entry(label, key, move |this, window, cx| {
+                this.tree_target = Some(target.clone());
+                this.open_tree_input(folder, window, cx);
+            })
+        };
+        let mut entries = vec![here("New file", false, if vim { "a" } else { "" }), here("New folder", true, if vim { "A" } else { "" })];
+        if !is_root {
+            entries.push(menu_separator());
+            let target = path.clone();
+            entries.push(entry("Rename", if vim { "r" } else { "" }, move |this, window, cx| this.open_rename(target.clone(), window, cx)));
+            if !is_dir {
+                let target = path.clone();
+                entries.push(entry("Duplicate", "", move |this, _, cx| this.duplicate_tree_entry(&target, cx)));
+            }
+            let target = path.clone();
+            entries.push(MenuEntry {
+                danger: true,
+                ..entry("Move to Trash", if vim { "D" } else { "" }, move |this, window, cx| this.trash_tree_entry(target.clone(), window, cx))
+            });
+        }
+        entries.push(menu_separator());
+        let target = path.clone();
+        entries.push(entry("Reveal in Finder", "", move |_, _, cx| cx.reveal_path(&target)));
+        let target = path.clone();
+        entries.push(entry("Copy path", "", move |this, _, cx| {
+            let relative = this.relative_to_project(&target);
+            cx.write_to_clipboard(ClipboardItem::new_string(relative.clone()));
+            this.set_status(format!("Copied {relative}"), cx);
+        }));
+        let document = path.extension().is_some_and(|extension| extension == "tex" || extension == "typ");
+        if document && let Ok(relative) = path.strip_prefix(&root).map(Path::to_path_buf) {
+            let current = self.config.main.as_deref() == Some(relative.as_path());
+            let label = if current { "✓ Main document" } else { "Set as main document" };
+            entries.push(menu_separator());
+            entries.push(entry(label, "", move |this, _, cx| this.set_main_document(relative.clone(), cx)));
+        }
+        entries
     }
 
     /// Copies files from elsewhere into the project. Files with a name that the
@@ -3352,7 +3732,7 @@ impl Workspace {
                         .filter(|entry| !entry.is_dir)
                         .map(|entry| entry.path)
                         .filter(|path| match kind {
-                            PickerKind::Files | PickerKind::Text | PickerKind::Branches | PickerKind::Themes => true,
+                            PickerKind::Files | PickerKind::Text | PickerKind::Branches | PickerKind::Themes | PickerKind::Fonts(_) => true,
                             PickerKind::Figures => language.is_some_and(|language| snippets::is_figure_file(language, path)),
                             PickerKind::Citations => path.extension().is_some_and(|extension| extension == "bib"),
                         })
@@ -3424,6 +3804,59 @@ impl Workspace {
         cx.notify();
     }
 
+    fn open_font_picker(&mut self, slot: FontSlot, window: &mut Window, cx: &mut Context<Self>) {
+        let names = cx.text_system().all_font_names();
+        self.picker = Some(Picker {
+            kind: PickerKind::Fonts(slot),
+            query: String::new(),
+            items: Vec::new(),
+            selected: 0,
+            root: PathBuf::new(),
+            files: Arc::new(Vec::new()),
+            entries: Arc::new(picker::font_items(names)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            task: None,
+            themes: Arc::new(nvim_themes::Themes::new()),
+            original: None,
+        });
+        window.focus(&self.picker_focus, cx);
+        self.refresh_picker(cx);
+        cx.notify();
+    }
+
+    /// The settings with the font in the slot set, None for the default of the mode.
+    fn with_font(&self, slot: FontSlot, label: &str) -> Settings {
+        let font = (label != picker::DEFAULT_FONT).then(|| label.to_string());
+        let mut settings = self.settings.clone();
+        match slot {
+            FontSlot::Editor => settings.editor_font = font,
+            FontSlot::Interface => settings.ui_font = font,
+        }
+        settings
+    }
+
+    /// Lays out the documents again in the type that is set now.
+    fn relayout(&self, cx: &mut Context<Self>) {
+        for document in &self.documents {
+            document.view.update(cx, |view, cx| view.forget_layout(cx));
+        }
+        cx.refresh_windows();
+    }
+
+    /// Shows the selected font, so that moving through the list previews it.
+    fn preview_font(&mut self, cx: &mut Context<Self>) {
+        let Some((PickerKind::Fonts(slot), Some(item))) =
+            self.picker.as_ref().map(|picker| (picker.kind, picker.items.get(picker.selected).cloned()))
+        else {
+            return;
+        };
+        let look = self.with_font(slot, &item.label).look();
+        if look != theme::look() {
+            theme::set_look(look);
+            self.relayout(cx);
+        }
+    }
+
     /// Shows the selected theme, so that moving through the list previews it.
     fn preview_theme(&mut self, cx: &mut Context<Self>) {
         let Some(picker) = self.picker.as_ref().filter(|picker| picker.kind == PickerKind::Themes) else {
@@ -3448,6 +3881,10 @@ impl Workspace {
             if let Some(original) = picker.original {
                 theme::set_palette(original);
                 cx.refresh_windows();
+            }
+            if matches!(picker.kind, PickerKind::Fonts(_)) && theme::look() != self.settings.look() {
+                theme::set_look(self.settings.look());
+                self.relayout(cx);
             }
         }
         self.picker_files_task = None;
@@ -3483,6 +3920,22 @@ impl Workspace {
                 };
                 self.picker_scroll.scroll_to_item(picker.selected);
                 self.preview_theme(cx);
+            }
+            PickerKind::Fonts(slot) => {
+                picker.items = picker::match_in_order(&picker.entries, &picker.query);
+                // Without a query the list starts at the font in use.
+                let current = match slot {
+                    FontSlot::Editor => self.settings.editor_font.as_deref(),
+                    FontSlot::Interface => self.settings.ui_font.as_deref(),
+                }
+                .unwrap_or(picker::DEFAULT_FONT);
+                picker.selected = if picker.query.trim().is_empty() {
+                    picker.items.iter().position(|item| item.label == current).unwrap_or(0)
+                } else {
+                    0
+                };
+                self.picker_scroll.scroll_to_item(picker.selected);
+                self.preview_font(cx);
             }
             PickerKind::Text => {
                 picker.cancel.store(true, Ordering::Relaxed);
@@ -3522,6 +3975,7 @@ impl Workspace {
             self.picker_scroll.scroll_to_item(picker.selected);
         }
         self.preview_theme(cx);
+        self.preview_font(cx);
         cx.notify();
     }
 
@@ -3538,7 +3992,19 @@ impl Workspace {
             PickerKind::Files | PickerKind::Text => {}
             PickerKind::Themes => {
                 let name = (item.label != theme::DEFAULT_THEME).then_some(item.label);
-                return self.update_settings(|settings| settings.theme = name, window, cx);
+                // A theme is a choice against paper, which would cover it.
+                return self.update_settings(
+                    |settings| {
+                        settings.theme = name;
+                        settings.paper_mode = false;
+                    },
+                    window,
+                    cx,
+                );
+            }
+            PickerKind::Fonts(slot) => {
+                let chosen = self.with_font(slot, &item.label);
+                return self.update_settings(|settings| *settings = chosen, window, cx);
             }
             PickerKind::Figures => return self.insert_figure(&item.path, cx),
             PickerKind::Branches => {
@@ -4039,10 +4505,16 @@ impl Workspace {
                     this.with_active(cx, |view, cx| view.format(FormatKind::Italic, cx))
                 }),
             ],
+            Menu::Tree => self.tree_menu_entries(),
             Menu::Symbols | Menu::Table => Vec::new(),
-            Menu::Help => vec![entry("Keyboard shortcuts", "", |this, window, cx| {
-                this.open_dialog(Dialog::Shortcuts, window, cx);
-            })],
+            Menu::Help => vec![
+                entry("Editor tour", "", |this, window, cx| this.start_tour(window, cx)),
+                entry("Keyboard shortcuts", "", |this, window, cx| {
+                    this.open_dialog(Dialog::Shortcuts, window, cx);
+                }),
+                entry("Writing tools…", "", |this, window, cx| this.open_dialog(Dialog::Settings(SettingsPage::Tools), window, cx)),
+                entry("Add editor command for Terminal…", "", |this, _, cx| this.install_shell_command(cx)),
+            ],
             Menu::Compile => {
                 let trigger = self.config.trigger;
                 let engine = self.config.engine;
@@ -4051,17 +4523,11 @@ impl Workspace {
                     entry("Recompile", "⌘↩", |this, _, cx| this.recompile_by_hand(cx)),
                     entry("Recompile from scratch", "", |this, _, cx| this.recompile_from_scratch(cx)),
                     entry("Stop build", "", |this, _, _| this.build.cancel()),
-                    entry(check(trigger == Trigger::Save, "Compile on save"), "", |this, _, cx| {
-                        this.config.trigger = Trigger::Save;
-                        cx.notify();
-                    }),
+                    entry(check(trigger == Trigger::Save, "Compile on save"), "", |this, _, cx| this.set_trigger(Trigger::Save, cx)),
                     entry(
                         check(trigger == Trigger::Type, &format!("Compile on type, autosaves after {debounce} ms")),
                         "",
-                        |this, _, cx| {
-                            this.config.trigger = Trigger::Type;
-                            cx.notify();
-                        },
+                        |this, _, cx| this.set_trigger(Trigger::Type, cx),
                     ),
                     entry(check(self.sync_on_click, "Sync PDF on click"), "", |this, _, cx| {
                         this.sync_on_click = !this.sync_on_click;
@@ -4115,6 +4581,27 @@ impl Workspace {
             .child(Self::icon(name, 16., theme::palette().ui_text))
     }
 
+    /// A button inside the floating toolbar, with a spot as round as the toolbar.
+    fn tool_button(
+        &self,
+        id: &'static str,
+        name: &'static str,
+        cx: &mut Context<Self>,
+        handler: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(26.))
+            .rounded(px(TOOL_RADIUS))
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::color(theme::palette().divider).opacity(0.55)))
+            .on_click(cx.listener(move |this, _, window, cx| handler(this, window, cx)))
+            .child(Self::icon(name, 16., theme::palette().ui_text))
+    }
+
     fn menu_button(&self, menu: Menu, label: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
         let open = self.open_menu == Some(menu);
         div()
@@ -4134,8 +4621,12 @@ impl Workspace {
             .when(open, |element| element.child(self.render_menu(menu, cx)))
     }
 
+    /// The tree's menu is a sheet of the side panel: a raised tone without a
+    /// frame, and a pill under the row in reach.
     fn render_menu(&self, menu: Menu, cx: &mut Context<Self>) -> impl IntoElement {
         let items = self.menu_entries(menu);
+        let palette = theme::palette();
+        let paper = menu == Menu::Tree;
         deferred(
             anchored()
                 .anchor(Anchor::TopLeft)
@@ -4145,19 +4636,28 @@ impl Workspace {
                         .id("menu")
                         .occlude()
                         .min_w(px(220.))
-                        .py(px(4.))
-                        .rounded(px(4.))
-                        .bg(theme::color(theme::palette().panel))
                         // A menu can open inside an accent button, whose text would carry over.
-                        .text_color(theme::color(theme::palette().ui_text))
+                        .text_color(theme::color(palette.ui_text))
                         .font_weight(FontWeight::NORMAL)
-                        .border_1()
-                        .border_color(theme::color(theme::palette().divider))
-                        .shadow_lg()
+                        .when(paper, |style| style.p(px(6.)).bg(theme::color(theme::raised(&palette))).shadow_md())
+                        .when(!paper, |style| {
+                            style
+                                .py(px(4.))
+                                .rounded(px(4.))
+                                .bg(theme::color(palette.panel))
+                                .border_1()
+                                .border_color(theme::color(palette.divider))
+                                .shadow_lg()
+                        })
                         .children(items.into_iter().enumerate().map(|(index, item)| {
                             match item.kind {
                                 MenuEntryKind::Separator => {
-                                    return div().my(px(4.)).h(px(1.)).bg(theme::color(theme::palette().divider)).into_any_element();
+                                    return div()
+                                        .my(px(4.))
+                                        .when(paper, |line| line.mx(px(12.)))
+                                        .h(px(1.))
+                                        .bg(theme::color(palette.divider))
+                                        .into_any_element();
                                 }
                                 MenuEntryKind::Heading => {
                                     return div()
@@ -4178,7 +4678,9 @@ impl Workspace {
                                 .px(px(12.))
                                 .py(px(5.))
                                 .cursor_pointer()
-                                .hover(|style| style.bg(theme::color(theme::palette().accent_soft)))
+                                .when(item.danger, |style| style.text_color(theme::color(palette.error)))
+                                .when(paper, |style| style.h(px(32.)).items_center().py_0().rounded_full().hover(|style| style.bg(theme::color(palette.panel))))
+                                .when(!paper, |style| style.hover(|style| style.bg(theme::color(palette.accent_soft))))
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.close_menu(window, cx);
                                     handler(this, window, cx);
@@ -4222,6 +4724,8 @@ impl Workspace {
                     .child(
                         div()
                             .id("hub-logo")
+                            .relative()
+                            .children(self.tour_anchor(TourAnchor::Home))
                             .flex()
                             .flex_none()
                             .items_center()
@@ -4245,12 +4749,12 @@ impl Workspace {
                                 Self::icon("notepad", 18., theme::palette().accent)
                             }),
                     )
-                    .child(self.menu_button(Menu::File, "File", cx))
+                    .child(div().relative().child(self.menu_button(Menu::File, "File", cx)).children(self.tour_anchor(TourAnchor::FileMenu)))
                     .child(self.menu_button(Menu::Edit, "Edit", cx))
                     .child(self.menu_button(Menu::Insert, "Insert", cx))
                     .child(self.menu_button(Menu::View, "View", cx))
                     .child(self.menu_button(Menu::Format, "Format", cx))
-                    .child(self.menu_button(Menu::Help, "Help", cx)),
+                    .child(div().relative().child(self.menu_button(Menu::Help, "Help", cx)).children(self.tour_anchor(TourAnchor::HelpMenu))),
             )
             .child(
                 div()
@@ -4280,25 +4784,33 @@ impl Workspace {
             )
     }
 
+    /// A round place on the rail. The open panel sits on a raised disc, the rest
+    /// only shade on hover.
+    fn rail_spot(id: impl Into<gpui::ElementId>, on: bool) -> gpui::Stateful<gpui::Div> {
+        let palette = theme::palette();
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(32.))
+            .rounded_full()
+            .cursor_pointer()
+            .when(on, |style| style.bg(theme::color(theme::raised(&palette))))
+            .when(!on, |style| style.hover(|style| style.bg(theme::color(palette.divider).opacity(0.35))))
+    }
+
     fn render_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = theme::palette();
         let rail_button = |id: &'static str, icon: &'static str, panel: LeftPanel, cx: &mut Context<Self>| -> gpui::Stateful<gpui::Div> {
             let on = self.show_file_panel && self.left_panel == panel;
-            div()
-                .id(id)
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(px(32.))
-                .rounded(px(4.))
-                .cursor_pointer()
-                .when(on, |style| style.bg(theme::color(theme::palette().accent_soft)))
-                .hover(|style| style.bg(theme::color(theme::palette().divider)))
+            Self::rail_spot(id, on)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.show_file_panel = !(this.show_file_panel && this.left_panel == panel);
                     this.left_panel = panel;
                     cx.notify();
                 }))
-                .child(Self::icon(icon, 18., theme::palette().ui_text))
+                .child(Self::icon(icon, 18., palette.ui_text))
         };
         #[cfg(feature = "collab")]
         let collab_rail = Some(rail_button("rail-collab", "people", LeftPanel::Collab, cx));
@@ -4312,15 +4824,16 @@ impl Workspace {
             .items_center()
             .w(px(RAIL_WIDTH))
             .h_full()
-            .py(px(4.))
+            .py(px(10.))
+            .bg(theme::color(palette.panel))
             .border_r_1()
-            .border_color(theme::color(theme::palette().panel))
+            .border_color(theme::color(palette.divider))
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .items_center()
-                    .gap(px(6.))
+                    .gap(px(8.))
                     .child(rail_button("rail-files", "file", LeftPanel::Files, cx))
                     .child(rail_button("rail-git", "git-branch", LeftPanel::Git, cx))
                     .child(rail_button("rail-addons", "addon", LeftPanel::Addons, cx))
@@ -4330,22 +4843,13 @@ impl Workspace {
                         let on = self.show_file_panel && self.left_panel == panel;
                         let icon = entry.panel.read(cx).add_on.icon();
                         let path: SharedString = icon.map_or_else(|| "icons/puzzle.svg".to_string(), |icon| icon.display().to_string()).into();
-                        div()
-                            .id(("rail-addon", index))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .size(px(32.))
-                            .rounded(px(4.))
-                            .cursor_pointer()
-                            .when(on, |style| style.bg(theme::color(theme::palette().accent_soft)))
-                            .hover(|style| style.bg(theme::color(theme::palette().divider)))
+                        Self::rail_spot(("rail-addon", index), on)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.show_file_panel = !(this.show_file_panel && this.left_panel == panel);
                                 this.left_panel = panel;
                                 cx.notify();
                             }))
-                            .child(svg().path(path).size(px(18.)).flex_none().text_color(theme::color(theme::palette().ui_text)))
+                            .child(svg().path(path).size(px(18.)).flex_none().text_color(theme::color(palette.ui_text)))
                     })),
             )
             .child(
@@ -4353,17 +4857,33 @@ impl Workspace {
                     .flex()
                     .flex_col()
                     .items_center()
-                    .gap(px(6.))
-                    .child(self.icon_button("rail-logs", "log", cx, |this, _, cx| {
-                        this.toggle_logs();
-                        cx.notify();
-                    }))
-                    .child(self.icon_button("rail-help", "help", cx, |this, window, cx| {
-                        this.open_dialog(Dialog::Shortcuts, window, cx);
-                    }))
-                    .child(self.icon_button("rail-settings", "settings", cx, |this, window, cx| {
-                        this.open_dialog(Dialog::Settings(SettingsPage::Editor), window, cx);
-                    })),
+                    .gap(px(8.))
+                    .child(div().w(px(16.)).h(px(1.)).mb(px(4.)).bg(theme::color(palette.divider)))
+                    .child(
+                        div()
+                            .relative()
+                            .child(
+                                Self::rail_spot("rail-logs", false)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toggle_logs();
+                                        cx.notify();
+                                    }))
+                                    .child(Self::icon("log", 18., palette.ui_text)),
+                            )
+                            .children(self.tour_anchor(TourAnchor::Logs)),
+                    )
+                    .child(
+                        Self::rail_spot("rail-help", false)
+                            .on_click(cx.listener(|this, _, window, cx| this.open_dialog(Dialog::Shortcuts, window, cx)))
+                            .child(Self::icon("help", 18., palette.ui_text)),
+                    )
+                    .child(
+                        Self::rail_spot("rail-settings", false)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_dialog(Dialog::Settings(SettingsPage::Editor), window, cx);
+                            }))
+                            .child(Self::icon("settings", 18., palette.ui_text)),
+                    ),
             )
     }
 
@@ -4385,7 +4905,15 @@ impl Workspace {
             .flex_1()
             .min_h_0()
             .track_focus(&self.tree_focus)
-            .px(px(4.))
+            .px(px(8.))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    if let Some(root) = this.root.clone() {
+                        this.open_tree_menu(root, event.position, window, cx);
+                    }
+                }),
+            )
             .child(
                 uniform_list(
                     "file-tree-rows",
@@ -4397,40 +4925,59 @@ impl Workspace {
             )
     }
 
+    /// The open file sits on a raised pill and its folder on a pill of ink, so the
+    /// eye finds both at once. Children hang on a fine line from their folder.
     fn render_tree_rows(&self, range: Range<usize>, window: &Window, cx: &mut Context<Self>) -> Vec<impl IntoElement + use<>> {
+        let palette = theme::palette();
         let tree_cursor = self.tree_focus.is_focused(window).then_some(self.tree_cursor);
         let active_path = self
             .active_view()
             .and_then(|view| view.read(cx).path.clone());
+        let active_folder = active_path.as_deref().and_then(Path::parent).map(Path::to_path_buf);
+        let shade = theme::color(palette.divider).opacity(0.35);
+        let renaming = self.tree_input.as_ref().and_then(|input| input.renaming.clone().map(|path| (path, input.view.clone())));
         range
             .map(|index| {
                 let entry = &self.entries[index];
-                let selected = active_path.as_deref() == Some(entry.path.as_path());
                 let path = entry.path.clone();
                 let is_dir = entry.is_dir;
                 let collapsed = self.collapsed.contains(&entry.path);
+                let selected = active_path.as_deref() == Some(entry.path.as_path());
+                let inked = is_dir && !collapsed && active_folder.as_deref() == Some(entry.path.as_path());
                 let git_mark = self.tree_git_mark(&entry.path, is_dir);
+                let indent = TREE_INSET + entry.depth as f32 * TREE_INDENT;
+                let field = renaming.as_ref().filter(|(path, _)| *path == entry.path).map(|(_, view)| view.clone());
+                let menu_path = entry.path.clone();
+                let (text, icon_color) = if inked {
+                    (palette.on_accent, palette.on_accent)
+                } else {
+                    (palette.ui_text, if is_dir { palette.folder } else { palette.ui_text })
+                };
                 div()
                     .id(index)
+                    .relative()
                     .flex()
                     .items_center()
-                    .gap(px(6.))
-                    .h(px(32.))
-                    .pl(px(8. + entry.depth as f32 * 14.))
-                    .rounded(px(4.))
+                    .gap(px(12.))
+                    .w_full()
+                    .h(px(TREE_ROW))
+                    .pl(px(indent))
+                    .pr(px(12.))
                     .cursor_pointer()
-                    .when(selected, |style| {
-                        style
-                            .bg(theme::color(theme::palette().accent_soft))
-                            .font_weight(FontWeight::SEMIBOLD)
+                    .when(!selected && !inked, |style| {
+                        style.when(tree_cursor == Some(index), |style| style.bg(shade)).hover(|style| style.bg(shade))
                     })
-                    .when(!selected, |style| {
-                        style.hover(|style| style.bg(theme::color(theme::palette().panel)))
-                    })
-                    .when(tree_cursor == Some(index), |style| {
-                        style.border_1().border_color(theme::color(theme::palette().focus))
-                    })
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.open_tree_menu(menu_path.clone(), event.position, window, cx);
+                        }),
+                    )
                     .on_click(cx.listener(move |this, _, window, cx| {
+                        if this.tree_input.as_ref().is_some_and(|input| input.renaming.as_deref() == Some(path.as_path())) {
+                            return;
+                        }
                         this.tree_target = Some(path.clone());
                         if is_dir {
                             if !this.collapsed.remove(&path) {
@@ -4441,118 +4988,248 @@ impl Workspace {
                             this.open_file(path.clone(), window, cx);
                         }
                     }))
-                    .when(is_dir, |element| {
-                        element.child(Self::icon(
-                            if collapsed { "chevron-right" } else { "chevron-down" },
-                            12.,
-                            theme::palette().ui_text,
-                        ))
+                    // Rows touch, so the lines of neighbours join, and each runs below
+                    // the middle of its folder's icon.
+                    .children((0..entry.depth).map(|depth| {
+                        div()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .left(px(TREE_INSET + depth as f32 * TREE_INDENT + TREE_ICON / 2.))
+                            .w(px(1.))
+                            .bg(theme::color(palette.divider))
+                    }))
+                    .when(selected || inked, |element| {
+                        element.child(
+                            div()
+                                .absolute()
+                                .top(px(2.))
+                                .bottom(px(2.))
+                                .left(px(indent - 10.))
+                                .right_0()
+                                .rounded_full()
+                                .bg(theme::color(if inked { palette.accent } else { theme::raised(&palette) })),
+                        )
                     })
-                    .child(Self::icon(Self::file_icon(entry), 16., if is_dir { theme::palette().folder } else { theme::palette().ui_text }))
                     .child(
                         div()
+                            .relative()
+                            .flex_none()
+                            .child(Self::icon(Self::file_icon(entry), TREE_ICON, icon_color))
+                            .children(git_mark.map(|(_, color)| {
+                                div().absolute().top(px(-1.)).right(px(-2.)).size(px(6.)).rounded_full().bg(theme::color(color))
+                            })),
+                    )
+                    .child(match field {
+                        // The name turns into the field, so the row keeps its place.
+                        Some(view) => div()
+                            .relative()
                             .flex_1()
                             .min_w_0()
-                            .truncate()
-                            .when(is_dir, |name| name.text_color(theme::color(theme::palette().folder)))
-                            .when_some(git_mark.filter(|_| !is_dir), |name, (_, color)| name.text_color(theme::color(color)))
-                            .child(entry.name.clone()),
-                    )
-                    .children(git_mark.map(|(letter, color)| {
-                        div().flex_none().pr(px(8.)).font_family(theme::CODE_FONT).text_size(px(11.)).text_color(theme::color(color)).child(letter.to_string())
+                            .h(px(26.))
+                            .px(px(8.))
+                            .ml(px(-8.))
+                            .rounded_full()
+                            .overflow_hidden()
+                            .bg(theme::color(palette.bg))
+                            .child(view)
+                            .into_any_element(),
+                        None => div().relative().flex_1().min_w_0().truncate().text_color(theme::color(text)).child(entry.name.clone()).into_any_element(),
+                    })
+                    .children(git_mark.map(|(letter, _)| {
+                        div()
+                            .relative()
+                            .flex_none()
+                            .font_family(theme::code_font())
+                            .text_size(px(11.))
+                            .text_color(theme::color(if inked { palette.on_accent } else { palette.ui_muted }))
+                            .child(letter.to_string())
                     }))
+                    .when(is_dir, |element| {
+                        element.child(
+                            div()
+                                .relative()
+                                .flex_none()
+                                .child(Self::icon(if collapsed { "plus" } else { "minus" }, 12., if inked { palette.on_accent } else { palette.ui_muted })),
+                        )
+                    })
             })
             .collect()
     }
 
     fn render_outline(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .id("outline")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .children(outline::visible(&self.outline).map(|(index, item)| {
-                let line = item.line;
-                div()
-                    .id(index)
-                    .relative()
+        let palette = theme::palette();
+        let cursor_line = match self.active_tab() {
+            Some(Tab::Document(index)) => Some(self.documents[index].view.read(cx).cursor_position().0 - 1),
+            _ => None,
+        };
+        let trail = cursor_line.map_or_else(Vec::new, |line| heading_trail(&self.outline, line));
+        let here = trail.last().copied();
+        let rows = outline::visible(&self.outline).map(|(index, item)| {
+            let line = item.line;
+            let label = item.number.as_deref().map_or_else(|| "—".to_string(), outline::label);
+            let row = div()
+                .id(index)
+                .relative()
+                .w_full()
+                .flex()
+                .cursor_pointer()
+                .hover(|style| style.bg(theme::color(palette.divider).opacity(0.35)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if let Some(view) = this.active_view() {
+                        view.update(cx, |view, cx| view.go_to_line(line, 0, window, cx));
+                    }
+                }));
+            if item.depth == 0 {
+                // The pill sits on a line across the panel and folds the chapter.
+                let in_trail = trail.first() == Some(&index);
+                let pill = div()
+                    .id(("outline-toggle", index))
                     .flex()
+                    .flex_none()
                     .items_center()
-                    .gap(px(4.))
-                    .h(px(32.))
-                    .pl(px(OUTLINE_INSET + item.depth as f32 * OUTLINE_INDENT))
-                    .pr(px(8.))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(theme::color(theme::palette().panel)))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        if let Some(view) = this.active_view() {
-                            view.update(cx, |view, cx| view.go_to_line(line, 0, window, cx));
+                    .justify_center()
+                    .w(px(OUTLINE_PILL))
+                    .h(px(20.))
+                    .rounded_full()
+                    .bg(theme::color(palette.panel))
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .map(|pill| {
+                        if item.collapsed {
+                            pill.border_1().border_color(theme::color(palette.accent)).text_color(theme::color(palette.ui_text))
+                        } else {
+                            let ink = theme::color(palette.accent).opacity(if in_trail { 1. } else { 0.6 });
+                            pill.bg(ink).text_color(theme::color(palette.on_accent))
                         }
-                    }))
-                    // Rows touch, so the guides of neighbours join into one line.
-                    .children((0..item.depth).map(|depth| {
-                        div()
-                            .absolute()
-                            .top_0()
-                            .bottom_0()
-                            .left(px(OUTLINE_INSET + OUTLINE_CHEVRON / 2. + depth as f32 * OUTLINE_INDENT))
-                            .w(px(1.))
-                            .bg(theme::color(theme::palette().divider))
-                    }))
+                    })
+                    .when(item.has_children, |pill| {
+                        pill.on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.outline[index].collapsed ^= true;
+                            cx.notify();
+                        }))
+                    })
+                    .child(label);
+                return row
+                    .h(px(44.))
+                    .items_center()
+                    .pl(px(OUTLINE_SPINE - OUTLINE_PILL / 2.))
+                    .pr(px(12.))
+                    .child(div().absolute().left_0().right_0().top(px(22.)).h(px(1.)).bg(theme::color(palette.divider)))
+                    .child(pill)
                     .child(
                         div()
-                            .id(("outline-toggle", index))
-                            .flex()
-                            .flex_none()
-                            .items_center()
-                            .justify_center()
-                            .size(px(OUTLINE_CHEVRON))
-                            .when(item.has_children, |toggle| {
-                                toggle
-                                    .child(Self::icon(
-                                        if item.collapsed { "chevron-right" } else { "chevron-down" },
-                                        12.,
-                                        theme::palette().ui_text,
-                                    ))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.outline[index].collapsed ^= true;
-                                        cx.notify();
-                                    }))
-                            }),
+                            .relative()
+                            .min_w_0()
+                            .ml(px(6.))
+                            .px(px(6.))
+                            .bg(theme::color(palette.panel))
+                            .font_weight(FontWeight::MEDIUM)
+                            .truncate()
+                            .child(item.title.clone()),
                     )
-                    .child(div().truncate().child(item.title.clone()))
-            }))
+                    .into_any_element();
+            }
+            // Sections hang on the line as dots, without indent: the number
+            // and the dot tell the depth, and the title keeps the width.
+            let dot_top = 6. + OUTLINE_LINE / 2.;
+            let dot = if here == Some(index) {
+                div()
+                    .absolute()
+                    .left(px(OUTLINE_SPINE - 4.5))
+                    .top(px(dot_top - 4.5))
+                    .size(px(9.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .border_1()
+                    .border_color(theme::color(palette.ui_text))
+                    .bg(theme::color(palette.panel))
+                    .child(div().size(px(3.)).rounded_full().bg(theme::color(palette.ui_text)))
+            } else {
+                div()
+                    .absolute()
+                    .left(px(OUTLINE_SPINE - 2.5))
+                    .top(px(dot_top - 2.5))
+                    .size(px(5.))
+                    .rounded_full()
+                    .map(|dot| {
+                        if item.depth == 1 {
+                            dot.bg(theme::color(palette.ui_text))
+                        } else {
+                            dot.border_1().border_color(theme::color(palette.ui_text)).bg(theme::color(palette.panel))
+                        }
+                    })
+            };
+            row.items_start()
+                .py(px(6.))
+                .pl(px(OUTLINE_SPINE + 12.))
+                .pr(px(12.))
+                .line_height(px(OUTLINE_LINE))
+                .child(dot)
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(34.))
+                        .font_family(theme::code_font())
+                        .text_size(px(11.))
+                        .text_color(theme::color(palette.ui_muted))
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .line_clamp(2)
+                        .text_ellipsis()
+                        .when(here == Some(index), |title| title.font_weight(FontWeight::MEDIUM))
+                        .child(item.title.clone()),
+                )
+                .into_any_element()
+        });
+        div().id("outline").flex_1().min_h_0().overflow_y_scroll().child(
+            div()
+                .relative()
+                .w_full()
+                .pb(px(12.))
+                .child(div().absolute().top_0().bottom_0().left(px(OUTLINE_SPINE - 0.5)).w(px(1.)).bg(theme::color(palette.divider)))
+                .children(rows),
+        )
     }
 
+    /// A quiet title in sentence case with its count, as on a page of notes. A
+    /// click folds the section.
     fn panel_header(
         &self,
         id: &'static str,
         title: &'static str,
+        count: Option<usize>,
         open: bool,
         cx: &mut Context<Self>,
         toggle: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> gpui::Stateful<gpui::Div> {
+        let palette = theme::palette();
         div()
             .id(id)
             .flex()
             .flex_none()
             .items_center()
             .gap(px(6.))
-            .h(px(32.))
-            .px(px(10.))
-            .font_weight(FontWeight::SEMIBOLD)
+            .h(px(44.))
+            .pl(px(20.))
+            .pr(px(12.))
+            .font_weight(FontWeight::MEDIUM)
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, window, cx| {
                 toggle(this, window, cx);
                 cx.notify();
             }))
-            .child(Self::icon(
-                if open { "chevron-down" } else { "chevron-right" },
-                12.,
-                theme::palette().ui_text,
-            ))
-            .child(div().flex_1().min_w_0().truncate().child(title))
+            .child(div().flex_none().child(title))
+            .children(count.map(|count| div().flex_none().font_weight(FontWeight::NORMAL).text_color(theme::color(palette.ui_muted)).child(format!("({count})"))))
+            .child(Self::icon(if open { "chevron-down" } else { "chevron-right" }, 10., palette.ui_muted))
+            .child(div().flex_1())
     }
 
     /// A button in a panel header, where a click must not also fold the panel.
@@ -4569,15 +5246,15 @@ impl Workspace {
             .flex_none()
             .items_center()
             .justify_center()
-            .size(px(22.))
-            .rounded(px(4.))
+            .size(px(24.))
             .cursor_pointer()
-            .hover(|style| style.bg(theme::color(theme::palette().divider)))
+            .opacity(0.6)
+            .hover(|style| style.opacity(1.))
             .on_click(cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
                 handler(this, window, cx);
             }))
-            .child(Self::icon(name, 14., theme::palette().ui_text))
+            .child(Self::icon(name, 15., theme::palette().ui_text))
     }
 
     fn render_tree_input(&self, input: &TreeInput, cx: &mut Context<Self>) -> impl IntoElement {
@@ -4591,13 +5268,14 @@ impl Workspace {
             .flex_none()
             .flex_col()
             .gap(px(4.))
-            .px(px(10.))
-            .pb(px(6.))
+            .px(px(12.))
+            .pb(px(8.))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .justify_between()
+                    .pl(px(8.))
                     .text_color(theme::color(theme::palette().ui_muted))
                     .child(div().flex_1().min_w_0().truncate().child(label))
                     .child(self.header_button("tree-input-cancel", "close", cx, |this, window, cx| {
@@ -4606,13 +5284,11 @@ impl Workspace {
             )
             .child(
                 div()
-                    .h(px(26.))
-                    .px(px(6.))
-                    .rounded(px(4.))
+                    .h(px(28.))
+                    .px(px(10.))
+                    .rounded_full()
                     .overflow_hidden()
-                    .bg(theme::color(theme::palette().bg))
-                    .border_1()
-                    .border_color(theme::color(theme::palette().divider))
+                    .bg(theme::color(theme::raised(&theme::palette())))
                     .child(input.view.clone()),
             )
     }
@@ -4622,20 +5298,24 @@ impl Workspace {
         let show_tree = self.show_tree;
         let has_project = self.root.is_some();
         div()
+            .relative()
+            .children(self.tour_anchor(TourAnchor::FileTree))
             .flex()
             .flex_none()
             .flex_col()
             .w(self.file_panel_width)
             .h_full()
+            .pb(px(8.))
+            .bg(theme::color(theme::palette().panel))
+            .when(self.open_menu == Some(Menu::Tree), |panel| panel.child(self.render_menu(Menu::Tree, cx)))
             .child(
-                self.panel_header("tree-header", "File tree", show_tree, cx, |this, window, cx| {
+                self.panel_header("tree-header", "Files", None, show_tree, cx, |this, window, cx| {
                     this.show_tree = !this.show_tree;
                     if !this.show_tree && this.tree_focus.is_focused(window) {
                         this.focus_active(window, cx);
                     }
                 })
                 .overflow_hidden()
-                .pr(px(4.))
                 .when(has_project, |header| {
                     header
                         .child(self.header_button("tree-new-file", "file-plus", cx, |this, window, cx| {
@@ -4654,14 +5334,16 @@ impl Workspace {
             )
             .when(show_tree, |panel| {
                 panel
-                    .when_some(self.tree_input.as_ref(), |panel, input| panel.child(self.render_tree_input(input, cx)))
+                    .when_some(self.tree_input.as_ref().filter(|input| input.renaming.is_none()), |panel, input| {
+                        panel.child(self.render_tree_input(input, cx))
+                    })
                     .when_some(self.tree_error.clone(), |panel, error| {
                         panel.child(
                             div()
                                 .id("tree-error")
                                 .flex_none()
-                                .px(px(10.))
-                                .pb(px(6.))
+                                .px(px(20.))
+                                .pb(px(8.))
                                 .cursor_pointer()
                                 .text_color(theme::color(theme::palette().error))
                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -4683,7 +5365,8 @@ impl Workspace {
                     .when(show_outline && !show_tree, |style| style.flex_1().min_h_0())
                     .child(self.panel_header(
                         "outline-header",
-                        "File outline",
+                        "Outline",
+                        Some(self.outline.len()).filter(|count| *count > 0),
                         show_outline,
                         cx,
                         |this, _, _| this.show_outline = !this.show_outline,
@@ -4692,12 +5375,15 @@ impl Workspace {
             )
     }
 
+    /// A hairline between the sections, with room around it to grab.
     fn divider_horizontal(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("outline-divider")
+            .flex()
             .flex_none()
-            .h(px(6.))
-            .bg(theme::color(theme::palette().divider))
+            .items_center()
+            .h(px(13.))
+            .px(px(20.))
             .cursor(CursorStyle::ResizeUpDown)
             .on_mouse_down(
                 MouseButton::Left,
@@ -4706,6 +5392,7 @@ impl Workspace {
                     cx.notify();
                 }),
             )
+            .child(div().w_full().h(px(1.)).bg(theme::color(theme::palette().divider)))
     }
 
     fn divider_vertical(&self, id: &'static str, divider: Divider, cx: &mut Context<Self>) -> impl IntoElement {
@@ -4714,7 +5401,14 @@ impl Workspace {
             .flex_none()
             .w(px(DIVIDER_WIDTH))
             .h_full()
-            .bg(theme::color(theme::palette().divider))
+            // The side panel ends in a hairline; the grip stays as wide.
+            .map(|style| {
+                if divider == Divider::FilePanel {
+                    style.child(div().w(px(1.)).h_full().bg(theme::color(theme::palette().divider)))
+                } else {
+                    style.bg(theme::color(theme::palette().divider))
+                }
+            })
             .cursor(CursorStyle::ResizeLeftRight)
             .on_mouse_down(
                 MouseButton::Left,
@@ -4839,9 +5533,9 @@ impl Workspace {
             .items_center()
             .justify_center()
             .size(px(26.))
-            .rounded(px(4.))
+            .rounded(px(TOOL_RADIUS))
             .cursor_pointer()
-            .hover(|style| style.bg(theme::color(theme::palette().divider)))
+            .hover(|style| style.bg(theme::color(theme::palette().divider).opacity(0.55)))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.with_active(cx, |view, cx| view.format(kind, cx));
             }))
@@ -4865,12 +5559,12 @@ impl Workspace {
             .items_center()
             .justify_center()
             .size(px(26.))
-            .rounded(px(4.))
+            .rounded(px(TOOL_RADIUS))
             .cursor_pointer()
-            .when(open, |style| style.bg(theme::color(theme::palette().divider)))
-            .hover(|style| style.bg(theme::color(theme::palette().divider)))
+            .when(open, |style| style.bg(theme::color(theme::palette().divider).opacity(0.55)))
+            .hover(|style| style.bg(theme::color(theme::palette().divider).opacity(0.55)))
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                let bottom = this.editor_toolbar_bottom(TOOLBAR_HEIGHT);
+                let bottom = this.editor_toolbar_bottom(TOOLBAR_ROW_HEIGHT);
                 this.toggle_menu(menu, event.position(), bottom, window, cx);
             }))
             .child(Self::icon(icon, 16., theme::palette().ui_text))
@@ -4923,7 +5617,7 @@ impl Workspace {
                 .size(px(SYMBOL_CELL))
                 .rounded(px(4.))
                 .cursor_pointer()
-                .font_family(theme::CODE_FONT)
+                .font_family(theme::code_font())
                 .hover(|style| style.bg(theme::color(theme::palette().divider)))
                 .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                     if *hovered {
@@ -4951,8 +5645,8 @@ impl Workspace {
                     div()
                         .h(px(18.))
                         .truncate()
-                        .font_family(theme::CODE_FONT)
-                        .text_size(px(theme::CODE_FONT_SIZE))
+                        .font_family(theme::code_font())
+                        .text_size(px(theme::code_font_size()))
                         .text_color(theme::color(theme::palette().ui_muted))
                         .child(preview),
                 ),
@@ -4996,21 +5690,30 @@ impl Workspace {
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let separator = || div().w(px(1.)).h(px(18.)).mx(px(4.)).bg(theme::color(theme::palette().divider));
+        let separator = || div().w(px(1.)).h(px(14.)).mx(px(6.)).bg(theme::color(theme::palette().divider));
+        let palette = theme::palette();
         let language = self.active_language(cx);
         let markup = matches!(language, Some(Language::Latex | Language::Typst));
         let formats = matches!(language, Some(Language::Latex | Language::Typst | Language::Markdown));
-        div()
+        // A capsule floating on the editor's paper rather than a bar across it;
+        // it is a little see-through, so the grain of paper mode shows.
+        let capsule = div()
+            .relative()
+            .children(self.tour_anchor(TourAnchor::Toolbar))
             .flex()
             .flex_none()
             .items_center()
             .h(px(TOOLBAR_HEIGHT))
             .px(px(6.))
-            .bg(theme::color(theme::palette().panel))
-            .child(self.icon_button("undo", "undo", cx, |this, _, cx| {
+            .rounded(px(TOOLBAR_RADIUS))
+            .bg(theme::color(theme::raised(&palette)).opacity(0.72))
+            .border_1()
+            .border_color(theme::color(palette.divider).opacity(0.7))
+            .shadow_sm()
+            .child(self.tool_button("undo", "undo", cx, |this, _, cx| {
                 this.with_active(cx, |view, cx| view.undo_edit(cx));
             }))
-            .child(self.icon_button("redo", "redo", cx, |this, _, cx| {
+            .child(self.tool_button("redo", "redo", cx, |this, _, cx| {
                 this.with_active(cx, |view, cx| view.redo_edit(cx));
             }))
             .when(formats, |element| {
@@ -5020,7 +5723,8 @@ impl Workspace {
                         "bold",
                         FormatKind::Bold,
                         cx,
-                        div().font_weight(FontWeight::BOLD).child("B"),
+                        // Its own font: the bold of iA Writer Quattro claims a regular weight.
+                        div().font_family(theme::CODE_FONT).font_weight(FontWeight::BOLD).child("B"),
                     ))
                     .child(self.format_button(
                         "italic",
@@ -5055,13 +5759,22 @@ impl Workspace {
                     .child(self.popup_button("table", "table", Menu::Table, cx, move |this, cx| {
                         this.render_table_grid(language, cx)
                     }))
-                    .child(self.icon_button("figure", "image", cx, |this, window, cx| {
+                    .child(self.tool_button("figure", "image", cx, |this, window, cx| {
                         this.open_picker(PickerKind::Figures, window, cx);
                     }))
-                    .child(self.icon_button("citation", "quote", cx, |this, window, cx| {
+                    .child(self.tool_button("citation", "quote", cx, |this, window, cx| {
                         this.open_picker(PickerKind::Citations, window, cx);
                     }))
-            })
+            });
+        div()
+            .flex()
+            .flex_none()
+            .justify_center()
+            .items_center()
+            .h(px(TOOLBAR_ROW_HEIGHT))
+            .px(px(12.))
+            .bg(theme::color(palette.bg))
+            .child(capsule)
     }
 
     /// The path of the shown tab and, in a document, the headings around the cursor.
@@ -5185,7 +5898,7 @@ impl Workspace {
             .when(self.show_tab_bar(), |element| element.child(self.render_tabs(cx)))
             .when(self.show_breadcrumbs(), |element| element.child(self.render_breadcrumbs(cx)))
             .children(toolbar)
-            .child(div().flex_1().min_h_0().child(body))
+            .child(div().relative().flex_1().min_h_0().child(body).children(self.tour_anchor(TourAnchor::Editor)))
             .children(self.render_conflict_strip(cx))
             .when_some(self.cursor_hint(cx).cloned(), |element, hint| element.child(self.render_hint_strip(&hint, cx)))
             .when(self.error_count() > 0, |element| element.child(self.render_error_strip(cx)))
@@ -5265,6 +5978,8 @@ impl Workspace {
                             .flex()
                             .items_center()
                             .h(px(24.))
+                            .relative()
+                            .children(self.tour_anchor(TourAnchor::Recompile))
                             .rounded(px(12.))
                             .bg(theme::color(theme::palette().accent))
                             .text_color(theme::color(theme::palette().on_accent))
@@ -5432,8 +6147,8 @@ impl Workspace {
                         .p(px(8.))
                         .rounded(px(4.))
                         .bg(theme::color(theme::palette().bg))
-                        .font_family(theme::CODE_FONT)
-                        .text_size(px(theme::CODE_FONT_SIZE))
+                        .font_family(theme::code_font())
+                        .text_size(px(theme::code_font_size()))
                         .overflow_hidden()
                         .whitespace_nowrap()
                         .children(problem.excerpt.iter().flat_map(|line| {
@@ -5662,7 +6377,7 @@ impl Workspace {
                 element.child(
                     div()
                         .mt(px(8.))
-                        .font_family(theme::CODE_FONT)
+                        .font_family(theme::code_font())
                         .text_size(px(11.))
                         .text_color(theme::color(theme::palette().ui_muted))
                         .children(shown.iter().map(|line| div().child(line.to_string()))),
@@ -5760,6 +6475,29 @@ impl Workspace {
             }))
     }
 
+    /// Names the font in use for a slot and opens the font picker.
+    fn font_button(&self, id: &'static str, slot: FontSlot, cx: &mut Context<Self>) -> impl IntoElement {
+        let look = theme::look();
+        let name: SharedString = match slot {
+            FontSlot::Editor => look.code_font,
+            FontSlot::Interface => look.ui_font.unwrap_or_else(|| "System".into()),
+        };
+        div()
+            .id(id)
+            .flex_none()
+            .px(px(8.))
+            .py(px(3.))
+            .rounded(px(4.))
+            .cursor_pointer()
+            .bg(theme::color(theme::palette().divider))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.close_dialog(window, cx);
+                this.open_font_picker(slot, window, cx);
+            }))
+            .font_family(name.clone())
+            .child(name)
+    }
+
     fn setting_row(title: &'static str, description: impl Into<SharedString>, control: impl IntoElement) -> impl IntoElement {
         div()
             .flex()
@@ -5783,6 +6521,19 @@ impl Workspace {
 
     fn render_editor_settings(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let vim_on = self.settings.vim_mode;
+        let paper_on = self.settings.paper_mode;
+        let paper_tone = |dark: bool| -> MenuHandler {
+            Rc::new(move |this, window, cx| {
+                this.update_settings(
+                    |settings| {
+                        settings.paper_dark = dark;
+                        settings.paper_mode = true;
+                    },
+                    window,
+                    cx,
+                )
+            })
+        };
         let handler = |vim_mode: bool| -> MenuHandler {
             Rc::new(move |this, window, cx| this.update_settings(|settings| settings.vim_mode = vim_mode, window, cx))
         };
@@ -5809,6 +6560,70 @@ impl Workspace {
                         this.open_theme_picker(window, cx);
                     }))
                     .child(self.settings.theme.clone().unwrap_or_else(|| theme::DEFAULT_THEME.to_string())),
+            )
+            .into_any_element(),
+            Self::setting_row(
+                "Paper mode",
+                "Paper texture, ink-like text and a calm, monochrome editor. Covers the theme while on.",
+                self.toggle_switch("paper-mode-setting", self.settings.paper_mode, true, cx, |this, window, cx| {
+                    this.update_settings(|settings| settings.paper_mode = !settings.paper_mode, window, cx);
+                }),
+            )
+            .into_any_element(),
+            Self::setting_row(
+                "Paper",
+                if paper_on { "Parchment with graphite ink, or dark paper with pale ink." } else { "Needs paper mode." },
+                self.segmented(
+                    "paper-tone-setting",
+                    vec![
+                        ("Light", !self.settings.paper_dark, paper_tone(false)),
+                        ("Dark", self.settings.paper_dark, paper_tone(true)),
+                    ],
+                    cx,
+                ),
+            )
+            .into_any_element(),
+            Self::setting_row(
+                "Ruled lines",
+                if paper_on { "Draws a line under every row, like ruled paper." } else { "Needs paper mode." },
+                self.toggle_switch("ruled-lines-setting", paper_on && self.settings.ruled_lines, paper_on, cx, |this, window, cx| {
+                    this.update_settings(|settings| settings.ruled_lines = !settings.ruled_lines, window, cx);
+                }),
+            )
+            .into_any_element(),
+            Self::setting_row(
+                "Editor font",
+                "Any installed font. Moving through the list previews it.",
+                self.font_button("editor-font-setting", FontSlot::Editor, cx),
+            )
+            .into_any_element(),
+            Self::setting_row(
+                "Interface font",
+                "The font of menus, panels and dialogs.",
+                self.font_button("ui-font-setting", FontSlot::Interface, cx),
+            )
+            .into_any_element(),
+            Self::setting_row(
+                "Font size",
+                "The size of the text in the editor.",
+                self.segmented(
+                    "font-size-setting",
+                    [12u32, 13, 14, 16]
+                        .into_iter()
+                        .map(|size| {
+                            let label: &'static str = match size {
+                                12 => "12",
+                                13 => "13",
+                                14 => "14",
+                                _ => "16",
+                            };
+                            let handler: MenuHandler =
+                                Rc::new(move |this, window, cx| this.update_settings(|settings| settings.editor_font_size = Some(size), window, cx));
+                            (label, theme::look().code_size.round() as u32 == size, handler)
+                        })
+                        .collect(),
+                    cx,
+                ),
             )
             .into_any_element(),
             Self::setting_row(
@@ -6029,7 +6844,7 @@ impl Workspace {
         let trigger = self.config.trigger;
         let engine = self.config.engine;
         let set_trigger = |trigger: Trigger| -> MenuHandler {
-            Rc::new(move |this, _, _| this.config.trigger = trigger)
+            Rc::new(move |this, _, cx| this.set_trigger(trigger, cx))
         };
         let set_engine = |engine: Option<Engine>| -> MenuHandler {
             Rc::new(move |this, _, cx| {
@@ -6040,7 +6855,11 @@ impl Workspace {
         vec![
             Self::setting_row(
                 "Compile",
-                "Applies until the app closes. Set trigger in .editor.toml to keep it.",
+                if self.config.trigger_set {
+                    "This project's .editor.toml chooses, so a change here lasts until the app closes."
+                } else {
+                    "While typing saves your files by itself. Applies to all projects."
+                },
                 self.segmented(
                     "compile-trigger",
                     vec![
@@ -6078,6 +6897,296 @@ impl Workspace {
         ]
     }
 
+    fn render_tool_settings(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut elements = vec![
+            div()
+                .flex_none()
+                .pb(px(4.))
+                .text_color(theme::color(theme::palette().ui_muted))
+                .child("A compiler turns what you write into a PDF. Install the ones for the languages you use.")
+                .into_any_element(),
+        ];
+        elements.extend(toolchain::installer_choice(&self.toolchain, cx));
+        elements.extend(toolchain::tool_rows(&self.toolchain, &Tool::ALL, cx));
+        elements.push(div().flex_none().pt(px(4.)).text_size(px(11.)).text_color(theme::color(theme::palette().ui_muted)).child(toolchain::promise(&self.toolchain, cx)).into_any_element());
+        elements
+    }
+
+    fn run_setup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let setup = cx.new(|cx| SetupView::new(self.toolchain.clone(), cx));
+        let subscription = cx.subscribe_in(&setup, window, |this, _, event, window, cx| match event {
+            SetupEvent::Finished { example, guided } => this.finish_setup(*example, *guided, window, cx),
+            SetupEvent::InstallCommand => this.install_shell_command(cx),
+        });
+        let focus = setup.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
+        self.setup = Some((setup, subscription));
+        cx.notify();
+    }
+
+    fn finish_setup(&mut self, example: Option<TemplateLanguage>, guided: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.setup = None;
+        self.settings.first_run_done = true;
+        if guided {
+            // Nobody new has to know that saving makes the PDF.
+            self.settings.compile_while_typing = true;
+            if self.root.is_some() && !self.config.trigger_set {
+                self.config.trigger = Trigger::Type;
+            }
+        } else {
+            self.settings.tour_done = true;
+        }
+        self.save_settings(cx);
+        if let Some(path) = self.pending_open.take() {
+            self.open_path(path, window, cx);
+            if example.is_some() && !self.settings.tour_done && self.root.is_some() {
+                self.start_tour(window, cx);
+            }
+            return cx.notify();
+        }
+        match example {
+            Some(language) => match self.home.update(cx, |home, cx| home.create_welcome(language, cx)) {
+                Ok(dir) => {
+                    self.show_hub = false;
+                    self.open_root(dir, window, cx);
+                    if !self.settings.tour_done {
+                        self.start_tour(window, cx);
+                    }
+                }
+                Err(error) => {
+                    self.open_hub(window, cx);
+                    self.set_status(error, cx);
+                }
+            },
+            None => self.open_hub(window, cx),
+        }
+        cx.notify();
+    }
+
+    /// Without a project, the tour opens the welcome example to have something to show.
+    fn start_tour(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.root.is_none() {
+            let language = if toolchain::find(Tool::Tectonic) == toolchain::Found::Missing && toolchain::find(Tool::Typst) != toolchain::Found::Missing {
+                TemplateLanguage::Typst
+            } else {
+                TemplateLanguage::Latex
+            };
+            match self.home.update(cx, |home, cx| home.create_welcome(language, cx)) {
+                Ok(dir) => self.open_root(dir, window, cx),
+                Err(error) => return self.set_status(error, cx),
+            }
+        }
+        if self.open_menu.is_some() {
+            self.close_menu(window, cx);
+        }
+        self.dialog = None;
+        self.picker = None;
+        self.show_hub = false;
+        self.tour = Some(Tour::default());
+        self.prepare_tour_step(window, cx);
+    }
+
+    fn end_tour(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.tour = None;
+        self.tour_anchors.borrow_mut().clear();
+        if !self.settings.tour_done {
+            self.settings.tour_done = true;
+            self.save_settings(cx);
+        }
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    fn tour_step(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tour) = &mut self.tour else {
+            return;
+        };
+        if forward {
+            if !tour.next() {
+                return self.end_tour(window, cx);
+            }
+        } else {
+            tour.back();
+        }
+        self.prepare_tour_step(window, cx);
+    }
+
+    /// Shows the part that the step points at, in case the user hid it.
+    fn prepare_tour_step(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tour) = &self.tour else {
+            return;
+        };
+        match tour.current().anchor {
+            TourAnchor::FileTree => {
+                self.show_file_panel = true;
+                self.left_panel = LeftPanel::Files;
+                self.show_tree = true;
+            }
+            TourAnchor::Editor | TourAnchor::Toolbar | TourAnchor::Recompile | TourAnchor::Pdf => {
+                self.focus_mode = false;
+                self.pdf_tab_shown = false;
+                self.layout = PaneLayout::Split;
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    /// An invisible layer that notes where its parent was drawn, for the tour.
+    fn tour_anchor(&self, anchor: TourAnchor) -> Option<impl IntoElement> {
+        self.tour.as_ref()?;
+        let anchors = self.tour_anchors.clone();
+        Some(
+            canvas(
+                move |bounds, window, _| {
+                    let previous = anchors.borrow_mut().insert(anchor, bounds);
+                    if previous != Some(bounds) {
+                        window.refresh();
+                    }
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full(),
+        )
+    }
+
+    fn render_tour(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        const BUBBLE: (f32, f32) = (330., 180.);
+        const PADDING: f32 = 6.;
+        let viewport = window.viewport_size();
+        let (width, height) = (viewport.width.to_f64() as f32, viewport.height.to_f64() as f32);
+        let anchor = self.tour.as_ref()?.current().anchor;
+        let found = self.tour_anchors.borrow().get(&anchor).copied();
+        let target = match found {
+            Some(bounds) => tour::Rect {
+                x: bounds.origin.x.to_f64() as f32,
+                y: bounds.origin.y.to_f64() as f32,
+                width: bounds.size.width.to_f64() as f32,
+                height: bounds.size.height.to_f64() as f32,
+            }
+            .grow(PADDING)
+            .clamp(width, height),
+            // The part is not on screen, so the explanation stands alone in the middle.
+            None => tour::Rect { x: width / 2., y: height / 2., width: 0., height: 0. },
+        };
+        let tour = self.tour.as_mut()?;
+        let (light, moving) = tour.light(target);
+        if moving {
+            window.request_animation_frame();
+        }
+        let step = tour.current();
+        let (number, last) = (tour.step + 1, tour.is_last());
+        let (bubble_x, bubble_y) = tour::place_bubble(light, BUBBLE, (width, height), 14.);
+        let palette = theme::palette();
+        let shade = |x: f32, y: f32, w: f32, h: f32| div().absolute().left(px(x)).top(px(y)).w(px(w.max(0.))).h(px(h.max(0.))).bg(black().opacity(0.55));
+        let button = |id: &'static str, label: &'static str, primary: bool, cx: &mut Context<Self>, forward: Option<bool>| {
+            div()
+                .id(id)
+                .px(px(12.))
+                .py(px(6.))
+                .rounded(px(theme::RADIUS_MD))
+                .cursor_pointer()
+                .font_weight(FontWeight::SEMIBOLD)
+                .when(primary, |style| style.bg(theme::color(palette.accent)).text_color(theme::color(palette.on_accent)))
+                .when(!primary, |style| style.text_color(theme::color(palette.ui_muted)).hover(|style| style.bg(theme::color(palette.divider))))
+                .on_click(cx.listener(move |this, _, window, cx| match forward {
+                    Some(forward) => this.tour_step(forward, window, cx),
+                    None => this.end_tour(window, cx),
+                }))
+                .child(label)
+        };
+        Some(
+            div()
+                .id("tour")
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .occlude()
+                .child(shade(0., 0., width, light.y))
+                .child(shade(0., light.bottom(), width, height - light.bottom()))
+                .child(shade(0., light.y, light.x, light.height))
+                .child(shade(light.right(), light.y, width - light.right(), light.height))
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(light.x))
+                        .top(px(light.y))
+                        .w(px(light.width))
+                        .h(px(light.height))
+                        .rounded(px(theme::RADIUS_MD))
+                        .border_2()
+                        .border_color(theme::color(palette.accent)),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(bubble_x))
+                        .top(px(bubble_y))
+                        .w(px(BUBBLE.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.))
+                        .p(px(16.))
+                        .rounded(px(theme::RADIUS_LG))
+                        .bg(theme::color(palette.panel))
+                        .border_1()
+                        .border_color(theme::color(palette.divider))
+                        .shadow_lg()
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme::color(palette.accent))
+                                .child(format!("STEP {number} OF {}", tour::STEPS.len())),
+                        )
+                        .child(div().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(step.title))
+                        .child(div().line_height(px(19.)).text_color(theme::color(palette.ui_muted)).child(step.body))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(4.))
+                                .pt(px(4.))
+                                .child(button("tour-skip", "Skip tour", false, cx, None))
+                                .child(div().flex_1())
+                                .when(number > 1, |element| element.child(button("tour-back", "Back", false, cx, Some(false))))
+                                .child(button("tour-next", if last { "Done" } else { "Next" }, true, cx, Some(true))),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Keeps the choice for all projects, unless this one's `.editor.toml` makes it.
+    fn set_trigger(&mut self, trigger: Trigger, cx: &mut Context<Self>) {
+        self.config.trigger = trigger;
+        if !self.config.trigger_set {
+            self.settings.compile_while_typing = trigger == Trigger::Type;
+            self.save_settings(cx);
+        }
+        cx.notify();
+    }
+
+    fn save_settings(&mut self, cx: &mut Context<Self>) {
+        if let Some(path) = &self.settings_path
+            && let Err(error) = self.settings.save(path)
+        {
+            self.set_status(format!("Cannot save settings: {error}"), cx);
+        }
+    }
+
+    /// A build that failed for want of this tool runs again.
+    fn tool_installed(&mut self, tool: Tool, cx: &mut Context<Self>) {
+        self.set_status(format!("{} is ready.", tool.language()), cx);
+        if self.root.is_some() && !self.last_build_succeeded {
+            self.recompile(cx);
+        }
+    }
+
     fn render_shortcuts(&self) -> Vec<AnyElement> {
         let mut elements: Vec<AnyElement> = shortcuts::sections(self.settings.vim_mode)
             .into_iter()
@@ -6098,8 +7207,8 @@ impl Workspace {
                                 div()
                                     .w(px(170.))
                                     .flex_none()
-                                    .font_family(theme::CODE_FONT)
-                                    .text_size(px(theme::CODE_FONT_SIZE))
+                                    .font_family(theme::code_font())
+                                    .text_size(px(theme::code_font_size()))
                                     .text_color(theme::color(theme::palette().function))
                                     .child(keys),
                             )
@@ -6152,6 +7261,7 @@ impl Workspace {
         let content = match dialog {
             Dialog::Settings(SettingsPage::Editor) => self.render_editor_settings(cx),
             Dialog::Settings(SettingsPage::Compiler) => self.render_compiler_settings(cx),
+            Dialog::Settings(SettingsPage::Tools) => self.render_tool_settings(cx),
             Dialog::Shortcuts => self.render_shortcuts(),
             Dialog::WordCount => self.render_word_count(),
             #[cfg(feature = "collab")]
@@ -6223,7 +7333,8 @@ impl Workspace {
                                             .border_r_1()
                                             .border_color(theme::color(theme::palette().divider))
                                             .child(self.settings_tab(SettingsPage::Editor, page, "Editor", cx))
-                                            .child(self.settings_tab(SettingsPage::Compiler, page, "Compiler", cx)),
+                                            .child(self.settings_tab(SettingsPage::Compiler, page, "Compiler", cx))
+                                            .child(self.settings_tab(SettingsPage::Tools, page, "Writing tools", cx)),
                                     )
                                 },
                             )
@@ -6251,6 +7362,8 @@ impl Workspace {
             PickerKind::Citations => "Insert citation",
             PickerKind::Branches => "Switch branch",
             PickerKind::Themes => "Select theme",
+            PickerKind::Fonts(FontSlot::Editor) => "Editor font",
+            PickerKind::Fonts(FontSlot::Interface) => "Interface font",
         };
         let empty = match (picker.kind, picker.query.is_empty()) {
             (PickerKind::Text, true) => "Type to search the project.",
@@ -6301,7 +7414,7 @@ impl Workspace {
                                 div()
                                     .flex()
                                     .items_center()
-                                    .font_family(theme::CODE_FONT)
+                                    .font_family(theme::code_font())
                                     .child(picker.query.clone())
                                     .child(div().w(px(1.5)).h(px(15.)).bg(theme::color(theme::palette().focus))),
                             ),
@@ -6347,8 +7460,8 @@ impl Workspace {
                                                         .flex_none()
                                                         .max_w(px(220.))
                                                         .truncate()
-                                                        .font_family(theme::CODE_FONT)
-                                                        .text_size(px(theme::CODE_FONT_SIZE))
+                                                        .font_family(theme::code_font())
+                                                        .text_size(px(theme::code_font_size()))
                                                         .text_color(muted)
                                                         .child(location),
                                                 ),
@@ -6369,8 +7482,8 @@ impl Workspace {
                                                 .flex_1()
                                                 .min_w_0()
                                                 .truncate()
-                                                .font_family(theme::CODE_FONT)
-                                                .text_size(px(theme::CODE_FONT_SIZE))
+                                                .font_family(theme::code_font())
+                                                .text_size(px(theme::code_font_size()))
                                                 .text_color(muted)
                                                 .child(detail),
                                         )
@@ -6403,6 +7516,8 @@ impl Workspace {
         let body = self.render_preview_body(cx);
         let alone = self.layout == PaneLayout::PdfOnly;
         div()
+            .relative()
+            .children(self.tour_anchor(TourAnchor::Pdf))
             .flex()
             .flex_col()
             .when(alone, |element| element.flex_1().min_w_0())
@@ -6488,8 +7603,10 @@ impl Render for Workspace {
         self.tree_cursor = self.tree_cursor.min(self.entries.len().saturating_sub(1));
         let dragging = self.dragging;
         let presenting = self.presenting.is_some();
-        let hub = self.hub_shown();
+        let setup = self.setup.as_ref().map(|(setup, _)| setup.clone());
+        let hub = self.hub_shown() || setup.is_some();
         let focus = self.focus_mode && !presenting && !hub;
+        let tour = if hub || presenting { None } else { self.render_tour(window, cx) };
         let show_preview = !focus && matches!(self.layout, PaneLayout::Split | PaneLayout::PdfOnly);
         let show_editor = focus || self.layout != PaneLayout::PdfOnly;
         let show_file_panel = self.show_file_panel;
@@ -6518,6 +7635,7 @@ impl Render for Workspace {
             .bg(theme::color(theme::palette().bg))
             .text_color(theme::color(theme::palette().ui_text))
             .text_size(px(theme::UI_FONT_SIZE))
+            .when_some(theme::look().ui_font, |root, font| root.font_family(font))
             .when(dragging.is_some(), |style| {
                 style.cursor(match dragging {
                     Some(Divider::Outline) => CursorStyle::ResizeUpDown,
@@ -6594,7 +7712,14 @@ impl Render for Workspace {
                 this.open_dialog(Dialog::Settings(SettingsPage::Editor), window, cx);
             }))
             .on_action(|_: &Quit, _, cx: &mut App| cx.quit())
-            .when(hub, |element| element.child(div().flex().flex_1().min_h_0().child(self.home.clone())))
+            .when(hub, |element| {
+                let page = match setup {
+                    Some(setup) => setup.into_any_element(),
+                    None => self.home.clone().into_any_element(),
+                };
+                element.child(div().flex().flex_1().min_h_0().child(page))
+            })
+            .on_action(cx.listener(|this, _: &StartTour, window, cx| this.start_tour(window, cx)))
             .when(!presenting && !focus && !hub, |element| element.child(self.render_top_bar(cx)))
             .when(presenting, |element| {
                 let controls = self.presenting.as_ref().is_some_and(|state| state.controls_shown);
@@ -6685,6 +7810,7 @@ impl Render for Workspace {
             .when_some(self.dialog, |element, dialog| element.child(self.render_dialog(dialog, cx)))
             .when_some(self.picker.as_ref(), |element, picker| element.child(self.render_picker(picker, cx)))
             .when_some(addon_dialog, |element, dialog| element.child(dialog))
+            .children(tour)
             // Below the menus, which are deferred, and above everything else.
             .when(self.open_menu.is_some(), |element| {
                 element.child(
@@ -6698,6 +7824,17 @@ impl Render for Workspace {
                         .track_focus(&self.menu_focus)
                         .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.close_menu(window, cx)))
                         .on_mouse_down(MouseButton::Right, cx.listener(|this, _, window, cx| this.close_menu(window, cx))),
+                )
+            })
+            // Last, over the text too, so that type looks printed into the page.
+            // A canvas takes no clicks.
+            .when(theme::look().paper && self.presenting.is_none(), |element| {
+                element.child(
+                    canvas(|_, _, _| {}, |bounds, _, window, _| crate::paper::paint(bounds, window))
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
                 )
             })
     }
@@ -6727,6 +7864,7 @@ mod tests {
             depth,
             has_children: false,
             collapsed: false,
+            number: None,
         };
         let items = [item(0, 0, "Intro"), item(1, 5, "Motivation"), item(0, 10, "Method"), item(1, 12, "Data"), item(2, 14, "Sources")];
         assert_eq!(heading_trail(&items, 3), [0]);

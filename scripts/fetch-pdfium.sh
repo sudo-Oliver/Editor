@@ -1,25 +1,40 @@
 #!/bin/sh
-# Downloads the pinned PDFium build into vendor/pdfium and verifies its checksum.
+# Downloads the pinned PDFium build and verifies its checksum.
+#
+#   scripts/fetch-pdfium.sh            the build for this machine, into vendor/pdfium
+#   scripts/fetch-pdfium.sh x86_64     a macOS build for that architecture, into
+#                                      vendor/pdfium-x86_64 (used by bundle-macos.sh)
 set -eu
 
 release="chromium/8125"
-case "$(uname -s)-$(uname -m)" in
+root="$(cd "$(dirname "$0")/.." && pwd)"
+if [ $# -gt 0 ]; then
+  platform="Darwin-$1"
+  target="$root/vendor/pdfium-$1"
+else
+  platform="$(uname -s)-$(uname -m)"
+  target="$root/vendor/pdfium"
+fi
+
+case "$platform" in
   Darwin-arm64)
     asset="pdfium-mac-arm64.tgz"
     checksum="4939bd935ac83ddc09a3a4f038bc43a19cea1660316a3667f26cb07a070e139d"
+    ;;
+  Darwin-x86_64)
+    asset="pdfium-mac-x64.tgz"
+    checksum="8a5193535b80c7215d8932f6647ae5097465b6dba2811602c21e120c2af112b0"
     ;;
   Linux-x86_64)
     asset="pdfium-linux-x64.tgz"
     checksum="e1c3ce6e270cb5e0c20816b379ad9f2c1309972697c505f508de92bf5e7d6659"
     ;;
   *)
-    echo "Unsupported platform: $(uname -s)-$(uname -m)" >&2
+    echo "Unsupported platform: $platform" >&2
     exit 1
     ;;
 esac
 
-root="$(cd "$(dirname "$0")/.." && pwd)"
-target="$root/vendor/pdfium"
 archive="$(mktemp)"
 trap 'rm -f "$archive"' EXIT
 

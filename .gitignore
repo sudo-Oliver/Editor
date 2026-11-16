@@ -1,4 +1,5 @@
 /target
 .build/
 /vendor/pdfium/
+/vendor/pdfium-*/
 .DS_Store
