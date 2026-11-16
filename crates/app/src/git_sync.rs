@@ -195,6 +195,13 @@ impl Workspace {
         }));
     }
 
+    /// The status the git panel read, for the tree, so that git runs once.
+    pub(super) fn take_panel_status(&mut self, repository: &Repository, status: &Status, cx: &mut Context<Self>) {
+        if self.git.repository.as_ref().is_some_and(|own| own.root() == repository.root()) {
+            self.apply_git_status(repository, status, cx);
+        }
+    }
+
     fn apply_git_status(&mut self, repository: &Repository, status: &Status, cx: &mut Context<Self>) {
         let mut files = HashMap::new();
         let mut folders = HashSet::new();

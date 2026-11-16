@@ -2,10 +2,12 @@
 //! leaves the old file whole and never a cut-off one.
 
 use std::{
+    collections::HashMap,
     fs::{self, File},
     io::{self, Write},
-    path::Path,
-    sync::{LazyLock, mpsc},
+    path::{Path, PathBuf},
+    sync::{LazyLock, Mutex, PoisonError, mpsc},
+    time::{Duration, Instant},
 };
 
 use tempfile::NamedTempFile;
@@ -13,9 +15,24 @@ use tempfile::NamedTempFile;
 /// Hidden from the file tree and from exports, also if a crash leaves one behind.
 pub const TEMP_PREFIX: &str = ".export-";
 
+/// How long a write of ours still explains a change the file watcher reports.
+const OWN_WRITE_WINDOW: Duration = Duration::from_secs(2);
+
+/// Files this process wrote lately, so that the watcher can tell our saves from
+/// changes by other programs.
+static RECENT: LazyLock<Mutex<HashMap<PathBuf, Instant>>> = LazyLock::new(Mutex::default);
+
+/// Whether `path` is a file this process wrote a moment ago.
+pub fn written_by_us(path: &Path) -> bool {
+    let mut recent = RECENT.lock().unwrap_or_else(PoisonError::into_inner);
+    recent.retain(|_, written| written.elapsed() < OWN_WRITE_WINDOW);
+    recent.contains_key(path)
+}
+
 pub fn write(path: &Path, contents: &[u8]) -> io::Result<()> {
     // A link stays a link, and the file behind it changes.
     let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    RECENT.lock().unwrap_or_else(PoisonError::into_inner).insert(target.clone(), Instant::now());
     // Renaming would replace a read-only file without asking.
     if fs::metadata(&target).is_ok_and(|metadata| metadata.permissions().readonly()) {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "the file is read-only"));

@@ -7,7 +7,6 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc,
     },
     time::Duration,
 };
@@ -89,6 +88,8 @@ const SYMBOL_COLUMNS: f32 = 11.0;
 const TABLE_GRID: usize = 8;
 const PREVIEW_TOOLBAR_HEIGHT: f32 = 32.0;
 const MIN_PANE_WIDTH: f32 = 160.0;
+/// Changes on disk come in bursts, such as a checkout; one refresh takes them all.
+const WATCH_SETTLE: Duration = Duration::from_millis(150);
 /// The rows of the file tree: room to breathe, and one step of indent per level.
 const TREE_ROW: f32 = 34.0;
 const TREE_INSET: f32 = 12.0;
@@ -634,6 +635,7 @@ impl Workspace {
                 this.refresh_in_background(cx);
                 this.refresh_diff_bases(cx);
             }
+            GitPanelEvent::Status(repository, status) => this.take_panel_status(repository, status, cx),
             GitPanelEvent::SignIn { host } => this.open_sign_in(host.clone(), window, cx),
             GitPanelEvent::Conflicts(files) => this.show_conflicts(files, window, cx),
             GitPanelEvent::ShowCommit { title, patch } => this.show_commit(title, patch, window, cx),
@@ -994,12 +996,16 @@ impl Workspace {
     }
 
     fn start_watching(&mut self, root: &Path, cx: &mut Context<Self>) {
-        let (sender, receiver) = mpsc::channel::<()>();
+        // True for a change by another program, false for a save of ours.
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<bool>();
         let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+            let Ok(event) = event else {
+                return;
+            };
             // Build output would otherwise wake the tree on every compile.
-            let relevant = event.is_ok_and(|event| event.paths.iter().any(|path| git_panel::is_watched_path(path)));
-            if relevant {
-                sender.send(()).ok();
+            let mut paths = event.paths.iter().filter(|path| git_panel::is_watched_path(path)).peekable();
+            if paths.peek().is_some() {
+                sender.send(!paths.all(|path| crate::atomic::written_by_us(path))).ok();
             }
         });
         let Ok(mut watcher) = watcher else {
@@ -1012,25 +1018,36 @@ impl Workspace {
         }
         self._watcher = Some(watcher);
         self._watch_task = Some(cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(Duration::from_millis(250)).await;
-                let mut changed = false;
-                loop {
-                    match receiver.try_recv() {
-                        Ok(()) => changed = true,
-                        Err(mpsc::TryRecvError::Empty) => break,
-                        Err(mpsc::TryRecvError::Disconnected) => return,
-                    }
+            // Sleeps until something happens, then takes what follows in a burst.
+            while let Some(first) = receiver.recv().await {
+                cx.background_executor().timer(WATCH_SETTLE).await;
+                let mut external = first;
+                while let Ok(more) = receiver.try_recv() {
+                    external |= more;
                 }
-                if changed
-                    && this
-                        .update(cx, |this, cx| this.refresh_in_background(cx))
-                        .is_err()
-                {
+                // A save of ours changes only what git says about the file.
+                let refreshed = this.update(cx, |this, cx| {
+                    if external {
+                        this.refresh_in_background(cx);
+                    } else {
+                        this.refresh_git_status(cx);
+                    }
+                });
+                if refreshed.is_err() {
                     return;
                 }
             }
         }));
+    }
+
+    /// Reads the status once: through the git panel while it shows, which hands
+    /// it on to the tree, or else for the tree alone.
+    fn refresh_git_status(&mut self, cx: &mut Context<Self>) {
+        if self.git_panel.read(cx).is_visible() {
+            self.git_panel.update(cx, |panel, cx| panel.refresh(cx));
+        } else {
+            self.refresh_git(cx);
+        }
     }
 
     /// For a change from outside. A big project takes a while to walk, which must
@@ -1070,8 +1087,7 @@ impl Workspace {
                 if let Some(entries) = entries {
                     this.set_tree(entries);
                 }
-                this.git_panel.update(cx, |panel, cx| panel.refresh(cx));
-                this.refresh_git(cx);
+                this.refresh_git_status(cx);
                 cx.notify();
                 if std::mem::take(&mut this.refresh_again) {
                     this.refresh_in_background(cx);

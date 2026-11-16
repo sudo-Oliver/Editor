@@ -39,6 +39,8 @@ pub enum GitPanelEvent {
     PickBranch,
     /// Git changed files or the branch.
     Changed(Option<String>),
+    /// The panel read the status, which the tree shows as well.
+    Status(Repository, Status),
     /// A remote at this host wants a login. The action runs again after it.
     SignIn { host: String },
     /// A merge stopped at conflicts in these files, by absolute path.
@@ -186,6 +188,10 @@ impl GitPanel {
         self.refresh(cx);
     }
 
+    pub fn is_visible(&self) -> bool {
+        self.visible
+    }
+
     pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
         if self.visible != visible {
             self.visible = visible;
@@ -265,6 +271,7 @@ impl GitPanel {
                 self.reset_history();
             }
             Ok(Some(read)) => {
+                cx.emit(GitPanelEvent::Status(read.repository.clone(), read.status.clone()));
                 let branch_changed = self.status.branch != read.status.branch;
                 self.merging = read.merging;
                 self.state = RepoState::Ready(read.repository);
@@ -978,6 +985,10 @@ pub fn program() -> Option<Program> {
 /// internals of `.git`, only what git status and history depend on counts,
 /// which leaves out lock files and objects.
 pub fn is_watched_path(path: &Path) -> bool {
+    // The temp files of a save of ours come and go within it.
+    if path.file_name().is_some_and(|name| name.to_string_lossy().starts_with(crate::atomic::TEMP_PREFIX)) {
+        return false;
+    }
     let mut parts = path.components().map(|part| part.as_os_str());
     while let Some(part) = parts.next() {
         if part == ".build" {
