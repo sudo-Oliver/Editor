@@ -1030,7 +1030,7 @@ impl EditorView {
     fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.focus_handle.focus(window, cx);
         let offset = self.position_to_offset(event.position, window);
-        if event.modifiers.secondary() {
+        if event.modifiers.secondary(cx) {
             self.state.toggle_cursor(offset);
         } else if event.modifiers.shift {
             let anchor = self.state.selections().primary().anchor;
@@ -1463,14 +1463,6 @@ struct EditorPrepaint {
     labels: Vec<(Point<Pixels>, ShapedLine, u32)>,
 }
 
-impl IntoElement for EditorElement {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 impl Element for EditorElement {
     type RequestLayoutState = ();
     type PrepaintState = EditorPrepaint;
@@ -1581,11 +1573,9 @@ impl Element for EditorElement {
             // Below the text, so that the character under the cursor stays readable.
             if focus_handle.is_focused(window) {
                 if let Some(points) = prepaint.trail.take() {
-                    let mut path = gpui::Path::new(points[0]);
-                    for point in &points[1..] {
-                        path.line_to(*point);
+                    if let Some(path) = theme::polygon(points) {
+                        window.paint_path(path, theme::color(theme::palette().caret).opacity(0.45));
                     }
-                    window.paint_path(path, theme::color(theme::palette().caret).opacity(0.45));
                     // Frames are only requested while a trail is on screen.
                     window.request_animation_frame();
                 }
