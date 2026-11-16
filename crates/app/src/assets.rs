@@ -16,7 +16,16 @@ icons!(
     "file-markdown", "file-md", "file-plus", "file-tex", "file-toml", "file-txt", "file-typ", "folder",
     "folder-plus", "git-branch", "help", "home", "image", "layout", "link", "log", "logo", "math", "minus",
     "notepad", "outline", "people", "plus", "position", "puzzle", "quote", "redo", "refresh", "settings", "sigma", "table", "undo", "upload", "vim",
+    "check-circle", "clipboard", "grid", "list", "play", "wrench",
 );
+
+/// iA Writer Quattro for paper mode, under the SIL Open Font License, see `assets/fonts/LICENSE.md`.
+pub const FONTS: &[&[u8]] = &[
+    include_bytes!("../assets/fonts/iAWriterQuattroS-Regular.ttf"),
+    include_bytes!("../assets/fonts/iAWriterQuattroS-Italic.ttf"),
+    include_bytes!("../assets/fonts/iAWriterQuattroS-Bold.ttf"),
+    include_bytes!("../assets/fonts/iAWriterQuattroS-BoldItalic.ttf"),
+];
 
 pub struct Assets;
 

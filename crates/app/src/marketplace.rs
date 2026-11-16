@@ -84,7 +84,7 @@ pub fn parse_catalog(text: &str) -> Result<Vec<CatalogEntry>, String> {
     Ok(entries)
 }
 
-fn curl(seconds: &str) -> Command {
+pub(crate) fn curl(seconds: &str) -> Command {
     let protocols = if cfg!(test) || std::env::var_os(CATALOG_OVERRIDE).is_some() { "=https,file" } else { "=https" };
     let mut command = Command::new("curl");
     command.args(["--fail", "--silent", "--show-error", "--location", "--max-time", seconds]);
@@ -92,7 +92,7 @@ fn curl(seconds: &str) -> Command {
     command
 }
 
-fn failure(output: &std::process::Output) -> String {
+pub(crate) fn failure(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stderr).trim().to_string()
 }
 
@@ -110,7 +110,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn archive_paths_stay_inside(listing: &str) -> bool {
+pub(crate) fn archive_paths_stay_inside(listing: &str) -> bool {
     listing.lines().all(|line| Path::new(line).components().all(|part| matches!(part, Component::Normal(_) | Component::CurDir)))
 }
 
@@ -127,7 +127,7 @@ fn check_against_catalog(manifest: &Manifest, entry: &CatalogEntry) -> Result<()
     Ok(())
 }
 
-fn run_tar(command: &mut Command) -> Result<std::process::Output, String> {
+pub(crate) fn run_tar(command: &mut Command) -> Result<std::process::Output, String> {
     let output = command.output().map_err(|error| format!("Cannot run tar: {error}"))?;
     if output.status.success() { Ok(output) } else { Err(format!("Cannot unpack the download: {}", failure(&output))) }
 }

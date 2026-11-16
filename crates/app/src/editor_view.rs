@@ -374,6 +374,12 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Wraps the text again, after the font or its size changed.
+    pub fn forget_layout(&mut self, cx: &mut Context<Self>) {
+        self.rows.breaks.clear();
+        cx.notify();
+    }
+
     pub fn title(&self) -> String {
         self.path
             .as_deref()
@@ -764,7 +770,7 @@ impl EditorView {
                 .py(px(4.))
                 .rounded(px(4.))
                 .font(Self::font(FontStyle::Normal, FontWeight::NORMAL))
-                .text_size(px(theme::CODE_FONT_SIZE))
+                .text_size(px(theme::code_font_size()))
                 .text_color(theme::color(theme::palette().code_text))
                 .bg(theme::color(theme::palette().panel))
                 .border_1()
@@ -825,7 +831,7 @@ impl EditorView {
     // Layout helpers
 
     fn font(style: FontStyle, weight: FontWeight) -> Font {
-        let mut code_font = font(theme::CODE_FONT);
+        let mut code_font = font(theme::code_font());
         code_font.style = style;
         code_font.weight = weight;
         code_font
@@ -836,7 +842,7 @@ impl EditorView {
     }
 
     fn line_height() -> Pixels {
-        px(theme::CODE_LINE_HEIGHT)
+        px(theme::code_line_height())
     }
 
     fn sync_rows(&mut self, width: Pixels, window: &mut Window) {
@@ -854,7 +860,7 @@ impl EditorView {
             self.rows.reset(line_count)
         };
 
-        let font_size = px(theme::CODE_FONT_SIZE);
+        let font_size = px(theme::code_font_size());
         let text_system = window.text_system().clone();
         let font_id = text_system.resolve_font(&Self::plain_font());
         let char_width = text_system
@@ -901,7 +907,7 @@ impl EditorView {
         };
         window
             .text_system()
-            .shape_line(display, px(theme::CODE_FONT_SIZE), &[run], None)
+            .shape_line(display, px(theme::code_font_size()), &[run], None)
     }
 
     fn row_segment(&self, row: usize) -> (usize, Range<usize>) {
@@ -1109,13 +1115,8 @@ impl EditorView {
                 continue;
             }
             last = Some(kind);
-            let (color, italic) = theme::highlight_style(kind);
+            let (color, italic, weight) = theme::highlight_style(kind);
             let style = if italic { FontStyle::Italic } else { FontStyle::Normal };
-            let weight = if kind == Some(HighlightKind::Strong) {
-                FontWeight::BOLD
-            } else {
-                FontWeight::NORMAL
-            };
             runs.push(TextRun {
                 len: ch.len_utf8(),
                 font: Self::font(style, weight),
@@ -1127,7 +1128,7 @@ impl EditorView {
         }
         window
             .text_system()
-            .shape_line(display, px(theme::CODE_FONT_SIZE), &runs, None)
+            .shape_line(display, px(theme::code_font_size()), &runs, None)
     }
 }
 
@@ -1550,6 +1551,21 @@ impl Element for EditorElement {
                     ));
                 }
             }
+            // Ruled paper: a line under every row, down to the bottom of the page.
+            if theme::look().ruled_lines && !self.view.read(cx).plain {
+                let palette = theme::palette();
+                // Pale lines on dark paper need more of the line to show.
+                let color = theme::color(palette.divider).opacity(if theme::is_light(palette.bg) { 0.5 } else { 0.9 });
+                let first = prepaint.rows.first().map_or(bounds.top(), |row| row.y);
+                let mut y = first - line_height * ((first - bounds.top()) / line_height).ceil() + line_height - px(3.);
+                while y < bounds.bottom() {
+                    window.paint_quad(fill(
+                        Bounds::new(point(bounds.left() + gutter, y), size(bounds.size.width - gutter, px(1.))),
+                        color,
+                    ));
+                    y += line_height;
+                }
+            }
             for quad in prepaint.search_hits.drain(..) {
                 window.paint_quad(quad);
             }
@@ -1762,7 +1778,7 @@ impl EditorView {
                 };
                 window
                     .text_system()
-                    .shape_line(label, px(theme::CODE_FONT_SIZE), &[run], None)
+                    .shape_line(label, px(theme::code_font_size()), &[run], None)
             });
 
             let line_start = buffer.line_start(line);
@@ -1794,7 +1810,7 @@ impl EditorView {
                 } else {
                     left + px(FALLBACK_CHAR_WIDTH)
                 };
-                cursor_cell = Some((left, row as f32 * theme::CODE_LINE_HEIGHT, (right - left).max(px(1.))));
+                cursor_cell = Some((left, row as f32 * theme::code_line_height(), (right - left).max(px(1.))));
             }
 
             for selection in &selections {
@@ -1944,7 +1960,7 @@ impl EditorView {
         let mut trail = None;
         if let Some((x, document_y, width)) = cursor_cell {
             let target = (f32::from(x), document_y);
-            let height = theme::CODE_LINE_HEIGHT;
+            let height = theme::code_line_height();
             let width_value = f32::from(width);
             let to_screen = |(x, y): (f32, f32)| point(text_left + px(x), bounds.top() + px(y) - self.scroll_y);
             if self.last_cursor != Some(target) {

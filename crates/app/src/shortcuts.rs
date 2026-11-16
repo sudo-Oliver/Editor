@@ -45,6 +45,10 @@ pub fn sections(vim_mode: bool) -> Vec<Section> {
             ],
         },
         Section {
+            title: "Editor tour (Help menu)",
+            rows: plain(&[("→ or Return", "Next step"), ("←", "Previous step"), ("Esc", "End the tour")]),
+        },
+        Section {
             title: "Editing",
             rows: vec![
                 (modified("Z"), "Undo"),

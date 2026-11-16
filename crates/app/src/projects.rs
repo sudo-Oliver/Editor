@@ -140,6 +140,22 @@ fn folder_name(path: &Path) -> String {
 }
 
 /// The path with the home folder as `~`.
+/// The project that a file opened from Finder or the terminal belongs to: the
+/// open project if it holds the file, else the nearest folder above it with
+/// `.editor.toml` or `.git` below the home folder, else the file's own folder.
+pub fn project_root_for(file: &Path, current: Option<&Path>, home: &Path) -> PathBuf {
+    let folder = file.parent().unwrap_or(file);
+    if let Some(current) = current.filter(|current| file.starts_with(current)) {
+        return current.to_path_buf();
+    }
+    folder
+        .ancestors()
+        .take_while(|ancestor| ancestor.starts_with(home) && *ancestor != home)
+        .find(|ancestor| ancestor.join(".editor.toml").exists() || ancestor.join(".git").exists())
+        .unwrap_or(folder)
+        .to_path_buf()
+}
+
 pub fn tilde(path: &Path) -> String {
     match path.strip_prefix(home()) {
         Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
@@ -206,6 +222,112 @@ const EMPTY_TYPST: &str = "#set page(paper: \"a4\")
 
 = Introduction
 ";
+
+const WELCOME_LATEX: &str = "\\documentclass{article}
+\\usepackage{amsmath}
+
+\\title{Welcome}
+\\author{You}
+
+\\begin{document}
+\\maketitle
+
+\\section{How this works}
+
+You write on the left, and the PDF on the right shows the result.
+Change this sentence, and the PDF follows after a moment.
+
+\\section{Text from Claude}
+
+Ask Claude for LaTeX, copy what it writes and paste it here.
+To start a whole new document from it, use Paste from Claude in the project hub.
+
+\\section{A formula}
+
+Formulas go between dollar signs, like $a^2 + b^2 = c^2$, or on a line of their own:
+\\begin{equation}
+  e^{i\\pi} + 1 = 0
+\\end{equation}
+
+\\section{When something goes wrong}
+
+A card above the PDF says what broke and on which line, in plain words.
+The last good PDF stays visible below it.
+
+\\end{document}
+";
+
+const WELCOME_TYPST: &str = "#set page(paper: \"a4\")
+#set heading(numbering: \"1.\")
+
+#align(center, text(17pt)[*Welcome*])
+
+= How this works
+
+You write on the left, and the PDF on the right shows the result.
+Change this sentence, and the PDF follows after a moment.
+
+= Text from Claude
+
+Ask Claude for Typst, copy what it writes and paste it here.
+To start a whole new document from it, use Paste from Claude in the project hub.
+
+= A formula
+
+Formulas go between dollar signs, like $a^2 + b^2 = c^2$, or on a line of their own:
+$ e^(i pi) + 1 = 0 $
+
+= When something goes wrong
+
+A card above the PDF says what broke and on which line, in plain words.
+The last good PDF stays visible below it.
+";
+
+/// The example the setup opens, which explains the editor in its own text.
+pub fn welcome_template(language: TemplateLanguage) -> Template {
+    let files: &'static [(&'static str, &'static str)] = match language {
+        TemplateLanguage::Typst => &[("main.typ", WELCOME_TYPST)],
+        _ => &[("main.tex", WELCOME_LATEX)],
+    };
+    Template {
+        name: "Welcome".to_string(),
+        language: if language == TemplateLanguage::Typst { TemplateLanguage::Typst } else { TemplateLanguage::Latex },
+        description: "A short document that explains the editor.".to_string(),
+        source: TemplateSource::Builtin(files),
+    }
+}
+
+/// The PDF a build left last in the project's `.build` folder, and when.
+pub fn newest_pdf(project: &Path) -> Option<(PathBuf, std::time::SystemTime)> {
+    fs::read_dir(project.join(".build"))
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "pdf"))
+        .filter_map(|path| Some((fs::metadata(&path).ok()?.modified().ok()?, path)))
+        .max()
+        .map(|(modified, path)| (path, modified))
+}
+
+/// Which language pasted text is in. LaTeX wins a tie, as most people paste it.
+pub fn guess_language(text: &str) -> TemplateLanguage {
+    let latex = ["\\documentclass", "\\begin{", "\\section", "\\usepackage", "\\end{"].iter().filter(|word| text.contains(*word)).count();
+    let typst = ["#set ", "#import ", "#let ", "#show ", "\n= ", "#figure("].iter().filter(|word| text.contains(*word)).count()
+        + usize::from(text.starts_with("= "));
+    if typst > latex { TemplateLanguage::Typst } else { TemplateLanguage::Latex }
+}
+
+/// A new project whose main file holds `text`.
+pub fn create_from_text(dir: &Path, language: TemplateLanguage, text: &str) -> io::Result<()> {
+    fs::create_dir_all(dir)?;
+    let name = if language == TemplateLanguage::Typst { "main.typ" } else { "main.tex" };
+    let mut text = text.to_string();
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    fs::write(dir.join(name), text)?;
+    ensure_gitignore(dir)
+}
 
 fn builtins() -> Vec<Template> {
     let template = |name: &str, language, description: &str, files| Template {
@@ -409,8 +531,41 @@ pub fn create_project(template: &Template, dir: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn an_opened_file_finds_its_project() {
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join("thesis");
+        fs::create_dir_all(project.join(".git")).unwrap();
+        fs::create_dir_all(project.join("chapters")).unwrap();
+        let chapter = project.join("chapters/intro.tex");
+        assert_eq!(project_root_for(&chapter, None, home.path()), project);
+        // The open project wins when it holds the file.
+        let open = project.join("chapters");
+        assert_eq!(project_root_for(&chapter, Some(&open), home.path()), open);
+        // A loose file is its own folder's project; the home folder never is a project.
+        fs::create_dir_all(home.path().join(".git")).unwrap();
+        let loose = home.path().join("notes/todo.md");
+        assert_eq!(project_root_for(&loose, None, home.path()), home.path().join("notes"));
+    }
+
     fn entry(path: &str, title: &str, last_opened: u64) -> ProjectEntry {
         ProjectEntry { path: PathBuf::from(path), title: title.to_string(), last_opened }
+    }
+
+    #[test]
+    fn pasted_text_names_its_language() {
+        assert_eq!(guess_language("\\documentclass{article}\n\\begin{document}\nHi\n\\end{document}"), TemplateLanguage::Latex);
+        assert_eq!(guess_language("#set page(paper: \"a4\")\n= Intro\nText"), TemplateLanguage::Typst);
+        assert_eq!(guess_language("Just words"), TemplateLanguage::Latex);
+    }
+
+    #[test]
+    fn a_pasted_project_gets_its_main_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let dir = directory.path().join("p");
+        create_from_text(&dir, TemplateLanguage::Typst, "= Hi").unwrap();
+        assert_eq!(fs::read_to_string(dir.join("main.typ")).unwrap(), "= Hi\n");
+        assert!(dir.join(".gitignore").is_file());
     }
 
     #[test]

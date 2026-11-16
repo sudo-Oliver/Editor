@@ -51,6 +51,11 @@ impl ImageView {
         &self.path
     }
 
+    /// The file moved, for instance by a rename in the file tree.
+    pub fn set_path(&mut self, path: PathBuf) {
+        self.path = path;
+    }
+
     pub fn new(path: PathBuf, include: String, cx: &mut Context<Self>) -> Self {
         let read_path = path.clone();
         let svg_renderer = cx.svg_renderer();
