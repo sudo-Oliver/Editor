@@ -1,6 +1,16 @@
 use std::collections::HashMap;
 
-use editor_core::{Heading, Language};
+use editor_core::{Heading, HeadingKind, Language};
+use gpui::{AnyElement, Hsla, IntoElement, ParentElement, Styled, div, px, svg};
+
+// The outline reads like a contents page: one line down the left, chapters
+// as numbered pills on it, sections as dots.
+
+/// Where the line of the outline runs, from the left edge.
+pub const SPINE: f32 = 22.0;
+/// The width of the pill that numbers a chapter.
+pub const PILL: f32 = 30.0;
+pub const LINE: f32 = 18.0;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutlineItem {
@@ -13,24 +23,47 @@ pub struct OutlineItem {
     pub collapsed: bool,
     /// The number LaTeX would give it, counted by depth, such as `[1, 2]`
     /// for 1.2. None for a starred heading, which LaTeX leaves unnumbered.
+    /// Figures and tables count on their own, such as `[3]` for the third table.
     pub number: Option<Vec<usize>>,
+    pub kind: HeadingKind,
 }
+
+/// Figures and tables hang below the heading they follow, deeper than any heading.
+const FLOAT_LEVEL: usize = usize::MAX;
 
 /// Turns parsed headings into a tree, stored flat in document order.
 pub fn outline(headings: &[Heading], language: Language) -> Vec<OutlineItem> {
     let mut items: Vec<OutlineItem> = Vec::new();
     let mut parents: Vec<usize> = Vec::new();
     let mut counters: Vec<usize> = Vec::new();
+    let (mut figures, mut tables) = (0, 0);
+    // The references sit with the largest headings of the document.
+    let top = headings.iter().filter(|heading| heading.kind == HeadingKind::Section).map(|heading| heading.level).min().unwrap_or(0);
     for heading in headings {
-        let title = match language {
-            Language::Latex => clean_latex(&heading.title),
-            _ => clean_markup(&heading.title, language),
+        // A caption of Typst comes with its brackets.
+        let source = match heading.kind {
+            HeadingKind::Section => heading.title.as_str(),
+            _ => heading.title.trim().trim_start_matches('[').trim_end_matches(']'),
         };
-        // A heading stays out while its title is still being typed.
+        let mut title = match language {
+            Language::Latex => clean_latex(source),
+            _ => clean_markup(source, language),
+        };
+        let level = match heading.kind {
+            HeadingKind::Section => heading.level,
+            HeadingKind::Figure | HeadingKind::Table => FLOAT_LEVEL,
+            HeadingKind::References => top,
+        };
         if title.is_empty() {
-            continue;
+            title = match heading.kind {
+                // A heading stays out while its title is still being typed.
+                HeadingKind::Section => continue,
+                HeadingKind::Figure => "Figure".to_string(),
+                HeadingKind::Table => "Table".to_string(),
+                HeadingKind::References => "References".to_string(),
+            };
         }
-        while parents.last().is_some_and(|&parent| items[parent].level >= heading.level) {
+        while parents.last().is_some_and(|&parent| items[parent].level >= level) {
             parents.pop();
         }
         if let Some(&parent) = parents.last() {
@@ -38,22 +71,60 @@ pub fn outline(headings: &[Heading], language: Language) -> Vec<OutlineItem> {
         }
         parents.push(items.len());
         let depth = parents.len() - 1;
-        let number = heading.numbered.then(|| {
-            counters.resize(depth + 1, 0);
-            counters[depth] += 1;
-            counters.clone()
-        });
-        items.push(OutlineItem {
-            level: heading.level,
-            title,
-            line: heading.line,
-            depth,
-            has_children: false,
-            collapsed: false,
-            number,
-        });
+        let number = match heading.kind {
+            HeadingKind::Section => heading.numbered.then(|| {
+                counters.resize(depth + 1, 0);
+                counters[depth] += 1;
+                counters.clone()
+            }),
+            HeadingKind::Figure => {
+                figures += 1;
+                Some(vec![figures])
+            }
+            HeadingKind::Table => {
+                tables += 1;
+                Some(vec![tables])
+            }
+            HeadingKind::References => None,
+        };
+        items.push(OutlineItem { level, title, line: heading.line, depth, has_children: false, collapsed: false, number, kind: heading.kind });
     }
     items
+}
+
+/// What the outline writes before a title: `01` or `1.2` for a heading, the
+/// number alone for a figure or table, and a dash for what has no number.
+pub fn marker(item: &OutlineItem) -> String {
+    match (item.kind, item.number.as_deref()) {
+        (HeadingKind::Section, Some(number)) => label(number),
+        (HeadingKind::Figure | HeadingKind::Table, Some(number)) => number.iter().map(usize::to_string).collect(),
+        _ => "—".to_string(),
+    }
+}
+
+/// The marker as drawn: the icon of a figure, table or the references before
+/// its number, or the number alone.
+pub fn marker_element(item: &OutlineItem, color: Hsla) -> AnyElement {
+    match icon(item) {
+        Some(path) => div()
+            .flex()
+            .items_center()
+            .gap(px(3.))
+            .child(svg().path(path).size(px(11.)).flex_none().text_color(color))
+            .children((item.kind != HeadingKind::References).then(|| marker(item)))
+            .into_any_element(),
+        None => marker(item).into_any_element(),
+    }
+}
+
+/// The icon beside a figure, a table or the references.
+pub fn icon(item: &OutlineItem) -> Option<&'static str> {
+    match item.kind {
+        HeadingKind::Section => None,
+        HeadingKind::Figure => Some("icons/image.svg"),
+        HeadingKind::Table => Some("icons/table.svg"),
+        HeadingKind::References => Some("icons/book.svg"),
+    }
 }
 
 /// `01` for a chapter at the top, as on a contents page, and `1.2` below it.
@@ -210,7 +281,7 @@ mod tests {
     use super::*;
 
     fn heading(level: usize, title: &str, line: usize) -> Heading {
-        Heading { level, title: title.into(), line, numbered: true }
+        Heading { level, title: title.into(), line, numbered: true, kind: HeadingKind::Section }
     }
 
     fn shape(items: &[OutlineItem]) -> Vec<(&str, usize, bool)> {
@@ -289,5 +360,29 @@ mod tests {
         assert_eq!(clean_markup("**Bold** [Pandoc](https://pandoc.org) `raw` ##", Language::Markdown), "Bold Pandoc raw");
         assert_eq!(clean_latex("The \\LaTeX{} \\textbf{way} of $\\alpha$~\\& more"), "The LaTeX way of alpha & more");
         assert_eq!(clean_latex("{Intro\\label{sec:a}\\footnote{a {b} c} \\& 100\\% % note\n  more}"), "Intro & 100% more");
+    }
+
+    #[test]
+    fn figures_and_tables_hang_below_their_section_and_count_apart() {
+        let float = |kind, title: &str| Heading { level: 0, title: title.into(), line: 0, numbered: false, kind };
+        let headings = [
+            heading(2, "{A}", 0),
+            float(HeadingKind::Figure, "{A frog}"),
+            float(HeadingKind::Table, ""),
+            heading(3, "{B}", 3),
+            float(HeadingKind::Figure, "{Pond}"),
+            heading(2, "{C}", 5),
+            float(HeadingKind::References, ""),
+        ];
+        let items = outline(&headings, Language::Latex);
+        assert_eq!(
+            shape(&items),
+            [("A", 0, true), ("A frog", 1, false), ("Table", 1, false), ("B", 1, true), ("Pond", 2, false), ("C", 0, false), ("References", 0, false)]
+        );
+        let markers: Vec<String> = items.iter().map(marker).collect();
+        assert_eq!(markers, ["01", "1", "1", "1.1", "2", "02", "—"]);
+        // Typst captions come with their brackets.
+        let typst = outline(&[float(HeadingKind::Figure, "[A *bold* frog]")], Language::Typst);
+        assert_eq!(typst[0].title, "A bold frog");
     }
 }

@@ -420,6 +420,7 @@ impl PdfView {
                     self.content.insert(page, content);
                 }
             }
+            PdfEvent::Outline { .. } => {}
             PdfEvent::Failed { generation, message } => {
                 if generation == self.generation {
                     cx.emit(PdfViewEvent::Failed(message));

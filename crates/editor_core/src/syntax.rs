@@ -84,14 +84,28 @@ fn kind_for_capture(name: &str) -> Option<HighlightKind> {
     Some(kind)
 }
 
+/// What an entry of the outline stands for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HeadingKind {
+    #[default]
+    Section,
+    /// A figure with its caption as the title.
+    Figure,
+    Table,
+    /// Where the bibliography goes, without a title of its own.
+    References,
+}
+
 /// A document heading as written in the source, markup included.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Heading {
+    /// For a figure, table or the references, the level is not used.
     pub level: usize,
     pub title: String,
     pub line: usize,
     /// False for `\section*` and its kin, which LaTeX leaves without a number.
     pub numbered: bool,
+    pub kind: HeadingKind,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,11 +125,46 @@ pub struct Symbol {
     pub name: String,
 }
 
+/// The source a node points into: the rope of an open file, or the text of one
+/// read from disk.
+pub(crate) trait SourceText {
+    /// Compares without copying, as this runs for many nodes on every parse.
+    fn is(&self, range: Range<usize>, expected: &str) -> bool;
+    fn read(&self, range: Range<usize>) -> String;
+}
+
+impl SourceText for Rope {
+    fn is(&self, range: Range<usize>, expected: &str) -> bool {
+        range.len() == expected.len() && range.end <= self.len_bytes() && self.byte_slice(range) == expected
+    }
+
+    fn read(&self, range: Range<usize>) -> String {
+        if range.end > self.len_bytes() {
+            return String::new();
+        }
+        self.byte_slice(range).to_string()
+    }
+}
+
+impl SourceText for &str {
+    fn is(&self, range: Range<usize>, expected: &str) -> bool {
+        self.get(range) == Some(expected)
+    }
+
+    fn read(&self, range: Range<usize>) -> String {
+        self.get(range).unwrap_or_default().to_string()
+    }
+}
+
+/// An entry of the outline found at a node: its kind, its level and the bytes
+/// of its title, which a bibliography has none of.
+type Found = (HeadingKind, usize, Option<Range<usize>>);
+
 /// Finds headings in the parse tree of one grammar.
 #[derive(Clone, Copy)]
 struct HeadingRules {
-    /// Returns the level of a heading node and the bytes of its title.
-    find: fn(Node) -> Option<(usize, Range<usize>)>,
+    /// Returns what a node of one of `kinds` adds to the outline.
+    find: fn(Node, &dyn SourceText) -> Option<Found>,
     /// The nodes `find` answers for.
     kinds: &'static [&'static str],
     /// Nodes that cannot hold a real heading, which also saves walking them.
@@ -124,7 +173,17 @@ struct HeadingRules {
 
 const LATEX_HEADINGS: HeadingRules = HeadingRules {
     find: latex_heading,
-    kinds: &["part", "chapter", "section", "subsection", "subsubsection"],
+    kinds: &[
+        "part",
+        "chapter",
+        "section",
+        "subsection",
+        "subsubsection",
+        "caption",
+        "bibtex_include",
+        "generic_command",
+        "generic_environment",
+    ],
     skip: &[
         "text",
         "inline_formula",
@@ -137,7 +196,7 @@ const LATEX_HEADINGS: HeadingRules = HeadingRules {
 };
 const TYPST_HEADINGS: HeadingRules = HeadingRules {
     find: typst_heading,
-    kinds: &["heading"],
+    kinds: &["heading", "call"],
     skip: &["text", "math", "raw_blck", "heading"],
 };
 const MARKDOWN_HEADINGS: HeadingRules = HeadingRules {
@@ -146,40 +205,135 @@ const MARKDOWN_HEADINGS: HeadingRules = HeadingRules {
     skip: &["atx_heading", "setext_heading", "paragraph", "fenced_code_block", "indented_code_block"],
 };
 
-fn latex_heading(node: Node) -> Option<(usize, Range<usize>)> {
+fn latex_heading(node: Node, text: &dyn SourceText) -> Option<Found> {
     let level = match node.kind() {
         "part" => 0,
         "chapter" => 1,
         "section" => 2,
         "subsection" => 3,
         "subsubsection" => 4,
+        "caption" => {
+            let title = node.child_by_field_name("long")?.byte_range();
+            return Some((caption_kind(node, text), 0, Some(title)));
+        }
+        "bibtex_include" => return Some((HeadingKind::References, 0, None)),
+        "generic_command" => {
+            let command = node.child_by_field_name("command")?.byte_range();
+            return text.is(command, "\\printbibliography").then_some((HeadingKind::References, 0, None));
+        }
+        "generic_environment" => {
+            let name = node.child_by_field_name("begin")?.child_by_field_name("name")?.byte_range();
+            return text.is(name, "{thebibliography}").then_some((HeadingKind::References, 0, None));
+        }
         _ => return None,
     };
-    Some((level, node.child_by_field_name("text")?.byte_range()))
+    Some((HeadingKind::Section, level, Some(node.child_by_field_name("text")?.byte_range())))
 }
 
-fn typst_heading(node: Node) -> Option<(usize, Range<usize>)> {
+/// A caption names a table inside a table environment, and a figure otherwise.
+fn caption_kind(caption: Node, text: &dyn SourceText) -> HeadingKind {
+    let mut parent = caption.parent();
+    while let Some(node) = parent {
+        if node.kind() == "generic_environment"
+            && let Some(name) = node.child_by_field_name("begin").and_then(|begin| begin.child_by_field_name("name"))
+        {
+            let name = text.read(name.byte_range());
+            if name.contains("table") {
+                return HeadingKind::Table;
+            }
+            if name.contains("figure") {
+                return HeadingKind::Figure;
+            }
+        }
+        parent = node.parent();
+    }
+    HeadingKind::Figure
+}
+
+fn typst_heading(node: Node, text: &dyn SourceText) -> Option<Found> {
+    if node.kind() == "call" {
+        return typst_figure(node, text);
+    }
     if node.kind() != "heading" {
         return None;
     }
     let marker = node.child(0)?;
-    Some((marker.byte_range().len(), marker.end_byte()..node.end_byte()))
+    Some((HeadingKind::Section, marker.byte_range().len(), Some(marker.end_byte()..node.end_byte())))
 }
 
-fn markdown_heading(node: Node) -> Option<(usize, Range<usize>)> {
+/// `#figure(table(..), caption: [..])` and `#bibliography("refs.bib")`.
+fn typst_figure(call: Node, text: &dyn SourceText) -> Option<Found> {
+    let function = call.child_by_field_name("item")?.byte_range();
+    if text.is(function.clone(), "bibliography") {
+        return Some((HeadingKind::References, 0, None));
+    }
+    if !text.is(function, "figure") {
+        return None;
+    }
+    let (mut kind, mut caption) = (HeadingKind::Figure, None);
+    let mut cursor = call.walk();
+    let arguments = call.named_children(&mut cursor).find(|child| child.kind() == "group")?;
+    let mut cursor = arguments.walk();
+    for argument in arguments.named_children(&mut cursor) {
+        match argument.kind() {
+            "tagged" => {
+                let (Some(name), Some(value)) = (argument.named_child(0), argument.named_child(1)) else {
+                    continue;
+                };
+                if text.is(name.byte_range(), "caption") {
+                    caption = Some(value.byte_range());
+                } else if text.is(name.byte_range(), "kind") && text.read(value.byte_range()).contains("table") {
+                    kind = HeadingKind::Table;
+                }
+            }
+            "call" if argument.child_by_field_name("item").is_some_and(|item| text.is(item.byte_range(), "table")) => {
+                kind = HeadingKind::Table;
+            }
+            _ => {}
+        }
+    }
+    Some((kind, 0, caption))
+}
+
+fn markdown_heading(node: Node, _: &dyn SourceText) -> Option<Found> {
     match node.kind() {
         "atx_heading" => {
             let level = node.child(0)?.kind().strip_prefix("atx_h")?.strip_suffix("_marker")?.parse().ok()?;
-            Some((level, node.child(1)?.byte_range()))
+            Some((HeadingKind::Section, level, Some(node.child(1)?.byte_range())))
         }
         "setext_heading" => {
             let level = match node.child(1)?.kind() {
                 "setext_h1_underline" => 1,
                 _ => 2,
             };
-            Some((level, node.child(0)?.byte_range()))
+            Some((HeadingKind::Section, level, Some(node.child(0)?.byte_range())))
         }
         _ => None,
+    }
+}
+
+/// The heading at `node` of a LaTeX or Typst file, as the outline of an open file
+/// has it, for reading the headings of files that are not open.
+pub(crate) fn heading_at(node: Node, text: &str, language: Language) -> Option<Heading> {
+    let rules = match language {
+        Language::Latex => LATEX_HEADINGS,
+        Language::Typst => TYPST_HEADINGS,
+        _ => return None,
+    };
+    if !rules.kinds.contains(&node.kind()) {
+        return None;
+    }
+    Some(heading(node, (rules.find)(node, &text)?, &text))
+}
+
+fn heading(node: Node, (kind, level, title): Found, text: &dyn SourceText) -> Heading {
+    Heading {
+        level,
+        title: title.map(|title| text.read(title)).unwrap_or_default(),
+        line: node.start_position().row,
+        numbered: kind == HeadingKind::Section
+            && !node.child_by_field_name("command").is_some_and(|command| command.kind().ends_with('*')),
+        kind,
     }
 }
 
@@ -263,14 +417,9 @@ fn collect_outline(config: &LanguageConfig, tree: &Tree, rope: &Rope) -> (Vec<He
         if let Some(rules) = config.headings
             && heading_free_from.is_none()
             && config.heading_kinds.has(node)
-            && let Some((level, title)) = (rules.find)(node)
+            && let Some(found) = (rules.find)(node, rope)
         {
-            headings.push(Heading {
-                level,
-                title: rope.byte_slice(title).to_string(),
-                line: rope.byte_to_line(node.start_byte()),
-                numbered: !node.child_by_field_name("command").is_some_and(|command| command.kind().ends_with('*')),
-            });
+            headings.push(heading(node, found, rope));
         }
         if let Some(rules) = config.symbols
             && config.symbol_kinds.has(node)
@@ -873,3 +1022,4 @@ mod tests {
         assert!(!syntax.apply(old, &[]));
     }
 }
+
