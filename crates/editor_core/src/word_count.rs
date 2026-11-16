@@ -8,7 +8,7 @@ use std::{
 
 use tree_sitter::{Node, Parser};
 
-use crate::Language;
+use crate::{Heading, Language, syntax::heading_at};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SectionCount {
@@ -24,6 +24,9 @@ pub struct WordCount {
     pub inline_math: usize,
     pub display_math: usize,
     pub sections: Vec<SectionCount>,
+    /// The headings of the whole document in reading order, included files too,
+    /// as the outline shows them. A heading's line is the one in its own file.
+    pub outline: Vec<Heading>,
     /// Included files that could not be read, so that a low count gets noticed.
     pub missing: Vec<String>,
 }
@@ -204,6 +207,8 @@ impl Counter<'_> {
         });
         let mut stack = vec![(document.unwrap_or(root), Kind::Body)];
         while let Some((node, kind)) = stack.pop() {
+            // Before anything is skipped, as the bibliography counts no words but has its place.
+            self.count.outline.extend(heading_at(node, text, Language::Latex));
             let node_kind = node.kind();
             match node_kind {
                 "word" => {
@@ -287,6 +292,7 @@ impl Counter<'_> {
         let text = source.text;
         let mut stack = vec![(root, Kind::Body)];
         while let Some((node, kind)) = stack.pop() {
+            self.count.outline.extend(heading_at(node, text, Language::Typst));
             let mut child_kind = kind;
             match node.kind() {
                 "text" => {
@@ -359,6 +365,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::HeadingKind;
 
     fn count(main: &str, text: &str, others: &[(&str, &str)]) -> WordCount {
         let files: HashMap<PathBuf, String> =
@@ -408,6 +415,35 @@ mod tests {
     }
 
     #[test]
+    fn the_outline_follows_includes_in_reading_order() {
+        let text = doc("\\chapter{One}\n\\input{part}\n\\section*{Notes}\n\\chapter{Two}");
+        let counted = count("m.tex", &text, &[("part.tex", "\\section{Inside}\n\\subsection{Deeper}")]);
+        let outline: Vec<_> = counted.outline.iter().map(|heading| (heading.level, heading.title.as_str(), heading.numbered)).collect();
+        assert_eq!(
+            outline,
+            [(1, "{One}", true), (2, "{Inside}", true), (3, "{Deeper}", true), (2, "{Notes}", false), (1, "{Two}", true)]
+        );
+    }
+
+    #[test]
+    fn the_outline_has_figures_tables_and_the_references() {
+        let text = doc("\\section{A}\n\\begin{figure}\\caption{A frog}\\end{figure}\n\\begin{table}\\caption{Numbers}\\end{table}\n\\bibliography{refs}");
+        let kinds: Vec<_> = count("m.tex", &text, &[]).outline.iter().map(|heading| (heading.kind, heading.title.clone())).collect();
+        assert_eq!(
+            kinds,
+            [
+                (HeadingKind::Section, "{A}".to_string()),
+                (HeadingKind::Figure, "{A frog}".to_string()),
+                (HeadingKind::Table, "{Numbers}".to_string()),
+                (HeadingKind::References, String::new()),
+            ]
+        );
+        let typst = "= A\n#figure(image(\"f.png\"), caption: [A frog])\n#figure(table(columns: 2), caption: [Numbers])\n#bibliography(\"refs.bib\")\n";
+        let kinds: Vec<_> = count("m.typ", typst, &[]).outline.iter().map(|heading| heading.kind).collect();
+        assert_eq!(kinds, [HeadingKind::Section, HeadingKind::Figure, HeadingKind::Table, HeadingKind::References]);
+    }
+
+    #[test]
     fn a_cycle_of_includes_ends() {
         let counted = count("m.tex", &doc("a \\input{b}"), &[("b.tex", "b \\input{m}\\input{b}")]);
         assert_eq!(counted.body, 2);
@@ -421,6 +457,8 @@ mod tests {
         assert_eq!((counted.body, counted.headings, counted.captions), (9, 2, 2), "{counted:?}");
         assert_eq!((counted.inline_math, counted.display_math), (1, 1));
         assert_eq!(counted.sections[0].title, "Big Title");
+        let outline: Vec<_> = counted.outline.iter().map(|heading| (heading.level, heading.title.trim())).collect();
+        assert_eq!(outline, [(1, "Big Title <l>"), (0, "[Cap one]")]);
     }
 
     #[test]

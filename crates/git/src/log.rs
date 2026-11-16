@@ -2,6 +2,16 @@ use crate::Repository;
 
 pub const PAGE_SIZE: usize = 200;
 
+/// Where a project stands: its branch and the last commit on it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeadSummary {
+    /// None when HEAD is detached.
+    pub branch: Option<String>,
+    /// Such as `2 hours ago`.
+    pub age: String,
+    pub subject: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Commit {
     pub hash: String,
@@ -33,6 +43,17 @@ impl Repository {
 }
 
 impl Repository {
+    /// The branch and last commit, or None before the first commit.
+    pub fn head_summary(&self) -> Option<HeadSummary> {
+        let last = self.run(["log", "-1", "--format=%D%x00%ar%x00%s"]).ok()?;
+        let mut fields = last.trim_end_matches(['\n', '\r']).splitn(3, '\0');
+        // `HEAD -> main, origin/main`, or `HEAD, …` when detached.
+        let branch = fields.next()?.split(", ").find_map(|name| name.strip_prefix("HEAD -> ")).map(ToString::to_string);
+        let age = fields.next()?.to_string();
+        let subject = fields.next()?.to_string();
+        Some(HeadSummary { branch, age, subject })
+    }
+
     /// Changes when any branch, tag or HEAD moves, without reading history.
     pub fn refs_fingerprint(&self) -> Result<String, String> {
         let refs = self.run(["for-each-ref", "--format=%(objectname) %(refname)"])?;
@@ -181,5 +202,21 @@ mod tests {
         assert_eq!(commit.refs, vec!["HEAD -> main", "tag: v1"]);
         assert_eq!(commit.subject, "fix: a, b");
         assert!(parse_commit("root\0\0Ada\0now\0\0s").unwrap().parents.is_empty());
+    }
+
+    #[test]
+    fn head_summary_tells_branch_and_last_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = crate::test_support::repository(directory.path());
+        assert_eq!(repository.head_summary(), None);
+        std::fs::write(directory.path().join("a.tex"), "a\n").unwrap();
+        crate::test_support::git(directory.path(), &["add", "."]);
+        crate::test_support::git(directory.path(), &["commit", "-q", "-m", "Chapter 7 revised"]);
+        crate::test_support::git(directory.path(), &["switch", "-q", "-c", "draft-v3"]);
+        let summary = repository.head_summary().unwrap();
+        assert_eq!(summary.branch.as_deref(), Some("draft-v3"));
+        assert_eq!(summary.subject, "Chapter 7 revised");
+        crate::test_support::git(directory.path(), &["switch", "-q", "--detach"]);
+        assert_eq!(repository.head_summary().unwrap().branch, None);
     }
 }

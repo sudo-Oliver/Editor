@@ -41,7 +41,7 @@ use crate::{
     file_tree::{self, TreeEntry},
     git_panel::{self, GitPanel, GitPanelEvent},
     home_view::{HomeEvent, HomeView},
-    outline::{self, OutlineItem},
+    outline::{self, LINE as OUTLINE_LINE, OutlineItem, PILL as OUTLINE_PILL, SPINE as OUTLINE_SPINE},
     image_view::{ImageView, ImageViewEvent, include_snippet, is_image, relative_path},
     pdf_view::{PdfView, PdfViewEvent, ZOOM_STEP},
     nvim_themes, package_commands,
@@ -89,11 +89,6 @@ const SYMBOL_COLUMNS: f32 = 11.0;
 const TABLE_GRID: usize = 8;
 const PREVIEW_TOOLBAR_HEIGHT: f32 = 32.0;
 const MIN_PANE_WIDTH: f32 = 160.0;
-/// The outline reads like a contents page: one line down the left, chapters
-/// as numbered pills on it, sections as dots.
-const OUTLINE_SPINE: f32 = 22.0;
-const OUTLINE_PILL: f32 = 30.0;
-const OUTLINE_LINE: f32 = 18.0;
 /// The rows of the file tree: room to breathe, and one step of indent per level.
 const TREE_ROW: f32 = 34.0;
 const TREE_INSET: f32 = 12.0;
@@ -5067,7 +5062,7 @@ impl Workspace {
         let here = trail.last().copied();
         let rows = outline::visible(&self.outline).map(|(index, item)| {
             let line = item.line;
-            let label = item.number.as_deref().map_or_else(|| "—".to_string(), outline::label);
+            let label = outline::marker_element(item, theme::color(palette.ui_muted));
             let row = div()
                 .id(index)
                 .relative()
@@ -5110,7 +5105,7 @@ impl Workspace {
                             cx.notify();
                         }))
                     })
-                    .child(label);
+                    .child(outline::marker_element(item, theme::color(palette.on_accent)));
                 return row
                     .h(px(44.))
                     .items_center()
@@ -7865,6 +7860,7 @@ mod tests {
             has_children: false,
             collapsed: false,
             number: None,
+            kind: editor_core::HeadingKind::Section,
         };
         let items = [item(0, 0, "Intro"), item(1, 5, "Motivation"), item(0, 10, "Method"), item(1, 12, "Data"), item(2, 14, "Sources")];
         assert_eq!(heading_trail(&items, 3), [0]);
