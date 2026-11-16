@@ -118,6 +118,11 @@ pub fn default_path() -> Option<PathBuf> {
     Some(config_dir()?.join("settings.toml"))
 }
 
+/// The user's vim mappings, written like a `.vimrc`.
+pub fn vimrc_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("vimrc"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

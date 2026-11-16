@@ -1,89 +1,49 @@
 //! The content of the keyboard shortcuts dialog.
 
-#[cfg(target_os = "macos")]
-const MODIFIER: &str = "⌘";
-#[cfg(not(target_os = "macos"))]
-const MODIFIER: &str = "Ctrl+";
+use crate::{
+    actions::COMMANDS,
+    keymap::{self, Keymap},
+};
 
 pub struct Section {
     pub title: &'static str,
     pub rows: Vec<(String, &'static str)>,
 }
 
-#[cfg(target_os = "macos")]
-const LAYOUT_MODIFIER: &str = "⌃⌘";
-#[cfg(not(target_os = "macos"))]
-const LAYOUT_MODIFIER: &str = "Ctrl+Alt+";
-
-fn layout(key: &str) -> String {
-    format!("{LAYOUT_MODIFIER}{key}")
-}
-
-fn modified(key: &str) -> String {
-    format!("{MODIFIER}{key}")
-}
-
 fn plain(rows: &[(&str, &'static str)]) -> Vec<(String, &'static str)> {
     rows.iter().map(|(keys, label)| (keys.to_string(), *label)).collect()
 }
 
-/// The vim keys only appear for those who turned the mode on.
-pub fn sections(vim_mode: bool) -> Vec<Section> {
-    let mut sections = vec![
-        Section {
-            title: "General",
-            rows: vec![
-                (modified("S"), "Save"),
-                (modified("Return"), "Recompile"),
-                (modified("N"), "New file"),
-                (modified("O"), "Open folder"),
-                (modified("Shift+P"), "Project hub"),
-                (modified("Shift+G"), "Git panel"),
-                (modified("W"), "Close tab"),
-                (modified("1 to 9"), "Go to tab"),
-                (modified(","), "Settings"),
-            ],
-        },
-        Section {
-            title: "Editor tour (Help menu)",
-            rows: plain(&[("→ or Return", "Next step"), ("←", "Previous step"), ("Esc", "End the tour")]),
-        },
-        Section {
-            title: "Editing",
-            rows: vec![
-                (modified("Z"), "Undo"),
-                (modified("Shift+Z"), "Redo"),
-                (modified("B"), "Bold"),
-                (modified("I"), "Italic"),
-                (modified("D"), "Select next occurrence"),
-                (modified("Shift+C"), "Insert citation"),
-                (modified("Shift+D"), "Cite from a DOI"),
-                (modified("."), "Apply the package fix on this line"),
-            ],
-        },
-        Section {
-            title: "View",
-            rows: vec![
-                (layout("↓"), "Editor and PDF side by side"),
-                (layout("←"), "Editor only"),
-                (layout("→"), "PDF only"),
-                (layout("↑"), "PDF in its own tab"),
-                (modified("Shift+M"), "Focus mode"),
-                ("J, Space, →".to_string(), "Next slide in presentation mode"),
-                ("K, Shift+Space, ←".to_string(), "Previous slide"),
-                ("Esc".to_string(), "End presentation mode"),
-            ],
-        },
-        Section {
-            title: "PDF",
-            rows: vec![
-                (modified("Click"), "Jump from the PDF to the source"),
-                (modified("C"), "Copy the selected PDF text"),
-                (modified("["), "Back after following a link"),
-                (modified("]"), "Forward again"),
-            ],
-        },
-    ];
+/// Groups of commands that the dialog lists; the keys that move the cursor
+/// are the usual ones and stay on the shortcuts page of the settings.
+const LISTED_GROUPS: &[&str] = &["General", "Editing", "View", "PDF", "Presentation"];
+
+/// The shortcuts as `keymap` binds them. The vim keys only appear for those
+/// who turned the mode on.
+pub fn sections(vim_mode: bool, keymap: &Keymap) -> Vec<Section> {
+    let os = keymap::host_os();
+    let mut sections: Vec<Section> = LISTED_GROUPS
+        .iter()
+        .map(|group| Section {
+            title: group,
+            rows: COMMANDS
+                .iter()
+                .filter(|command| command.group == *group)
+                .filter_map(|command| {
+                    let keys = keymap.keys(command);
+                    (!keys.is_empty()).then(|| (keys.iter().map(|keys| keymap::display(keys, os)).collect::<Vec<_>>().join(", "), command.label))
+                })
+                .collect(),
+        })
+        .collect();
+    let click = if os == gpui::OperatingSystem::Mac { "⌘Click" } else { "Ctrl+Click" };
+    if let Some(pdf) = sections.iter_mut().find(|section| section.title == "PDF") {
+        pdf.rows.insert(0, (click.to_string(), "Jump from the PDF to the source"));
+    }
+    sections.insert(1, Section {
+        title: "Editor tour (Help menu)",
+        rows: plain(&[("→ or Return", "Next step"), ("←", "Previous step"), ("Esc", "End the tour")]),
+    });
     if vim_mode {
         sections.extend([
             Section {
@@ -147,8 +107,17 @@ mod tests {
 
     #[test]
     fn vim_keys_only_appear_in_vim_mode() {
-        let has_vim = |on: bool| sections(on).iter().any(|section| section.title.starts_with("Vim"));
+        let has_vim = |on: bool| sections(on, &Keymap::default()).iter().any(|section| section.title.starts_with("Vim"));
         assert!(!has_vim(false));
         assert!(has_vim(true));
+    }
+
+    #[test]
+    fn the_dialog_shows_the_user_keys() {
+        let (keymap, _) = Keymap::parse(r#"{ "save": "ctrl-alt-s", "project_hub": null }"#);
+        let general = sections(false, &keymap).into_iter().next().unwrap();
+        let save = general.rows.iter().find(|(_, label)| *label == "Save").unwrap();
+        assert_eq!(save.0, keymap::display("ctrl-alt-s", keymap::host_os()));
+        assert!(!general.rows.iter().any(|(_, label)| *label == "Project hub"));
     }
 }

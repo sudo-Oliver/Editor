@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use build::{BuildEvent, BuildManager, BuildOutcome, BuildRequest, Config, Diagnostic, Engine, Fix, Loaded, Severity, Trigger, find_main};
@@ -19,6 +19,7 @@ use editor_core::{
     Language, Mark, MarkSeverity,
     snippet::Snippet,
     vim::{self, Effect, Key, Leader, Mode},
+    vim_map::{self, Mapper, Mappings, Step},
     word_count::{self, WordCount},
 };
 use gpui::{
@@ -43,6 +44,7 @@ use crate::{
     home_view::{HomeEvent, HomeView},
     outline::{self, LINE as OUTLINE_LINE, OutlineItem, PILL as OUTLINE_PILL, SPINE as OUTLINE_SPINE},
     image_view::{ImageView, ImageViewEvent, include_snippet, is_image, relative_path},
+    keymap::{self, Keymap},
     pdf_view::{PdfView, PdfViewEvent, ZOOM_STEP},
     nvim_themes, package_commands,
     picker::{self, FontSlot, Picker, PickerKind},
@@ -83,7 +85,6 @@ const TOOL_RADIUS: f32 = 8.0;
 const BREADCRUMB_HEIGHT: f32 = 24.0;
 /// The editor in focus mode stays this wide, for lines that read well.
 const FOCUS_WIDTH: f32 = 860.0;
-const LAYOUT_SHORTCUTS: [&str; 4] = ["⌃⌘↓", "⌃⌘←", "⌃⌘→", "⌃⌘↑"];
 const SYMBOL_CELL: f32 = 32.0;
 const SYMBOL_COLUMNS: f32 = 11.0;
 const TABLE_GRID: usize = 8;
@@ -178,6 +179,7 @@ enum SettingsPage {
     Editor,
     Compiler,
     Tools,
+    Shortcuts,
 }
 
 /// The name field for a new file or folder at the top of the file tree.
@@ -227,7 +229,7 @@ enum MenuEntryKind {
 struct MenuEntry {
     kind: MenuEntryKind,
     label: String,
-    shortcut: &'static str,
+    shortcut: SharedString,
     handler: MenuHandler,
     /// Shown in the error color, for actions that remove something.
     danger: bool,
@@ -235,13 +237,13 @@ struct MenuEntry {
 
 fn entry(
     label: impl Into<String>,
-    shortcut: &'static str,
+    shortcut: impl Into<SharedString>,
     handler: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
 ) -> MenuEntry {
     MenuEntry {
         kind: MenuEntryKind::Action,
         label: label.into(),
-        shortcut,
+        shortcut: shortcut.into(),
         handler: Rc::new(handler),
         danger: false,
     }
@@ -514,6 +516,15 @@ pub struct Workspace {
     pdf_main: Option<PathBuf>,
     settings: Settings,
     settings_path: Option<PathBuf>,
+    /// The user's shortcuts, from `keymap.json`.
+    keymap: Keymap,
+    /// The user's vim mappings, from `vimrc`.
+    vim_mappings: Mappings,
+    vim_mapper: Mapper,
+    /// Runs keys that waited for a longer mapping in vain.
+    vim_map_timer: Option<Task<()>>,
+    /// The command on the shortcuts page that waits for its new keys.
+    recording_shortcut: Option<&'static str>,
     dialog: Option<Dialog>,
     dialog_focus: FocusHandle,
     picker: Option<Picker>,
@@ -733,6 +744,11 @@ impl Workspace {
             pdf_main: None,
             settings,
             settings_path,
+            keymap: Keymap::default(),
+            vim_mappings: Mappings::default(),
+            vim_mapper: Mapper::default(),
+            vim_map_timer: None,
+            recording_shortcut: None,
             dialog: None,
             dialog_focus: cx.focus_handle(),
             picker: None,
@@ -769,6 +785,8 @@ impl Workspace {
             git: git_sync::GitUi::default(),
         };
         workspace.reload_addons(cx);
+        workspace.reload_keymap(cx);
+        workspace.reload_vimrc(cx);
         if settings_migrated {
             workspace.save_settings(cx);
         }
@@ -1524,6 +1542,7 @@ impl Workspace {
             Ok(saved) => {
                 if saved {
                     self.notify_addons_saved(&view, cx);
+                    self.reload_key_files(&view, cx);
                 }
                 if saved && self.config.trigger == Trigger::Save {
                     self.build_when_free(cx);
@@ -1533,6 +1552,62 @@ impl Workspace {
             Err(error) => self.set_status(format!("Cannot save: {error}"), cx),
         }
         self.forget_saved_recovery(cx);
+    }
+
+    // Shortcuts
+
+    /// Binds the shortcuts of `keymap.json`, or the defaults without it.
+    fn reload_keymap(&mut self, cx: &mut Context<Self>) {
+        let (keymap, mut problems) = keymap::default_path().map(|path| Keymap::load(&path)).unwrap_or_default();
+        problems.extend(crate::actions::bind_keys(&keymap, cx));
+        self.keymap = keymap;
+        if let Some(problem) = problems.first() {
+            self.set_status(format!("keymap.json: {problem}"), cx);
+        }
+        cx.notify();
+    }
+
+    /// Saves and binds the shortcuts changed on the shortcuts page.
+    fn apply_keymap(&mut self, keymap: Keymap, cx: &mut Context<Self>) {
+        let problems = crate::actions::bind_keys(&keymap, cx);
+        self.keymap = keymap;
+        if let Some(path) = keymap::default_path()
+            && let Err(error) = self.keymap.save(&path)
+        {
+            self.set_status(format!("Cannot save keymap.json: {error}"), cx);
+        } else if let Some(problem) = problems.first() {
+            self.set_status(format!("keymap.json: {problem}"), cx);
+        }
+        cx.notify();
+    }
+
+    fn reload_vimrc(&mut self, cx: &mut Context<Self>) {
+        let text = settings::vimrc_path().and_then(|path| std::fs::read_to_string(path).ok()).unwrap_or_default();
+        let (mappings, problems) = Mappings::parse(&text);
+        self.vim_mappings = mappings;
+        self.vim_mapper.reset();
+        if let Some(problem) = problems.first() {
+            self.set_status(format!("vimrc line {}: {}", problem.line, problem.message), cx);
+        }
+    }
+
+    /// Takes up a saved `keymap.json` or `vimrc` at once.
+    fn reload_key_files(&mut self, view: &Entity<EditorView>, cx: &mut Context<Self>) {
+        let path = view.read(cx).path.clone();
+        if path.is_some() && path == keymap::default_path() {
+            self.reload_keymap(cx);
+            self.set_status("Shortcuts reloaded", cx);
+        } else if path.is_some() && path == settings::vimrc_path() {
+            self.reload_vimrc(cx);
+            if self.status.is_none() {
+                self.set_status(format!("{} vim mappings loaded", self.vim_mappings.len()), cx);
+            }
+        }
+    }
+
+    /// The first shortcut of a command, for a menu.
+    fn shortcut(&self, id: &str) -> SharedString {
+        self.keymap.label(id, keymap::host_os()).into()
     }
 
     fn set_status(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
@@ -2511,6 +2586,7 @@ impl Workspace {
 
     fn close_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dialog = None;
+        self.recording_shortcut = None;
         self.focus_active(window, cx);
         cx.notify();
     }
@@ -2650,6 +2726,11 @@ impl Workspace {
         if self.setup.is_some() {
             return;
         }
+        if self.recording_shortcut.is_some() {
+            cx.stop_propagation();
+            self.record_shortcut(&event.keystroke, cx);
+            return;
+        }
         if self.tour.is_some() {
             let modifiers = event.keystroke.modifiers;
             if !(modifiers.platform || modifiers.control || modifiers.alt) {
@@ -2758,25 +2839,64 @@ impl Workspace {
             }
             return;
         };
-        if !takes_keys && key != Key::Esc {
-            // `Tab` accepts here, and accepting records its own result.
-            if key != Key::Tab || !view.read(cx).completion_open() {
-                view.update(cx, |view, _| view.vim_record_insert(key));
+        // The input method composes without the user's mappings.
+        let step = if view.read(cx).is_composing() {
+            Step::Type
+        } else {
+            let mode = view.read(cx).vim_mode().unwrap_or_default();
+            self.vim_mapper.feed(&self.vim_mappings, mode, key, Instant::now())
+        };
+        let keys = match step {
+            Step::Run(keys) => keys,
+            Step::Insert { erase, mut keys } => {
+                keys.splice(0..0, std::iter::repeat_n(Key::Backspace, erase));
+                keys
             }
-            return;
-        }
-        // `Esc` belongs to the input method while it composes.
-        if !takes_keys && view.read(cx).is_composing() {
-            return;
-        }
+            Step::Type if !takes_keys && key != Key::Esc => {
+                // Other `Ctrl` keys go to the key bindings, as without vim.
+                // `Tab` accepts here, and accepting records its own result.
+                if !is_unknown_ctrl(key) && (key != Key::Tab || !view.read(cx).completion_open()) {
+                    view.update(cx, |view, _| view.vim_record_insert(key));
+                }
+                return;
+            }
+            // `Esc` belongs to the input method while it composes.
+            Step::Type if !takes_keys && view.read(cx).is_composing() => return,
+            Step::Type => vec![key],
+        };
         cx.stop_propagation();
-        let wants_clipboard = matches!(key, Key::Char('p' | 'P' | '.'));
-        let clipboard = wants_clipboard.then(|| cx.read_from_clipboard().and_then(|item| item.text())).flatten();
-        let effects = view.update(cx, |view, cx| view.vim_key(key, clipboard, cx));
-        for effect in effects {
-            self.apply_effect(effect, window, cx);
+        self.run_vim_keys(&view, keys, window, cx);
+        if self.vim_mapper.is_waiting() {
+            self.vim_map_timer = Some(cx.spawn_in(window, async move |this, cx| {
+                cx.background_executor().timer(vim_map::TIMEOUT).await;
+                this.update_in(cx, |this, window, cx| this.vim_mapping_timed_out(window, cx)).ok();
+            }));
         }
         cx.notify();
+    }
+
+    fn run_vim_keys(&mut self, view: &Entity<EditorView>, keys: Vec<Key>, window: &mut Window, cx: &mut Context<Self>) {
+        for key in keys {
+            // Unknown `Ctrl` keys do nothing in vim, but a mapping may use them.
+            if is_unknown_ctrl(key) {
+                continue;
+            }
+            let wants_clipboard = matches!(key, Key::Char('p' | 'P' | '.'));
+            let clipboard = wants_clipboard.then(|| cx.read_from_clipboard().and_then(|item| item.text())).flatten();
+            let effects = view.update(cx, |view, cx| view.vim_key(key, clipboard, cx));
+            for effect in effects {
+                self.apply_effect(effect, window, cx);
+            }
+        }
+    }
+
+    /// Runs the keys that waited for a longer mapping, once none came.
+    fn vim_mapping_timed_out(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let keys = self.vim_mapper.timeout(&self.vim_mappings, Instant::now());
+        if let Some(view) = self.active_view().filter(|_| !keys.is_empty()) {
+            self.run_vim_keys(&view, keys, window, cx);
+            cx.notify();
+        }
     }
 
     fn apply_effect(&mut self, effect: Effect, window: &mut Window, cx: &mut Context<Self>) {
@@ -4425,13 +4545,13 @@ impl Workspace {
         let check = |on: bool, label: &str| format!("{} {label}", if on { "✓" } else { "  " });
         match menu {
             Menu::File => vec![
-                entry("New file…", "⌘N", |this, window, cx| this.open_tree_input(false, window, cx)),
+                entry("New file…", self.shortcut("new_file"), |this, window, cx| this.open_tree_input(false, window, cx)),
                 entry("New folder…", "", |this, window, cx| this.open_tree_input(true, window, cx)),
                 entry("Add files…", "", |this, window, cx| this.prompt_add_files(window, cx)),
                 entry("Make a copy", "", |this, window, cx| this.make_copy(window, cx)),
                 menu_separator(),
                 entry("Version history", "", |this, _, cx| this.show_version_history(cx)),
-                entry("Commit and sync…", "⇧⌘G", |this, window, cx| this.open_git_panel(window, cx)),
+                entry("Commit and sync…", self.shortcut("git_panel"), |this, window, cx| this.open_git_panel(window, cx)),
                 entry("Word count…", "", |this, window, cx| this.show_word_count(window, cx)),
                 menu_separator(),
                 menu_heading("Download"),
@@ -4441,15 +4561,15 @@ impl Workspace {
                 entry("HTML draft…", "", |this, window, cx| this.download_draft(DraftFormat::Html, window, cx)),
                 entry("Markdown draft…", "", |this, window, cx| this.download_draft(DraftFormat::Markdown, window, cx)),
                 menu_separator(),
-                entry("Project hub…", "⇧⌘P", |this, window, cx| this.open_hub(window, cx)),
-                entry("Open folder…", "⌘O", |this, window, cx| this.prompt_open_folder(window, cx)),
+                entry("Project hub…", self.shortcut("project_hub"), |this, window, cx| this.open_hub(window, cx)),
+                entry("Open folder…", self.shortcut("open_folder"), |this, window, cx| this.prompt_open_folder(window, cx)),
                 entry("Save project as template…", "", |this, window, cx| this.save_project_as_template(window, cx)),
-                entry("Save", "⌘S", |this, window, cx| this.save_active(window, cx)),
-                entry("Recompile", "⌘↩", |this, _, cx| this.recompile_by_hand(cx)),
+                entry("Save", self.shortcut("save"), |this, window, cx| this.save_active(window, cx)),
+                entry("Recompile", self.shortcut("recompile"), |this, _, cx| this.recompile_by_hand(cx)),
             ],
             Menu::Edit => vec![
-                entry("Undo", "⌘Z", |this, _, cx| this.with_active(cx, |view, cx| view.undo_edit(cx))),
-                entry("Redo", "⇧⌘Z", |this, _, cx| this.with_active(cx, |view, cx| view.redo_edit(cx))),
+                entry("Undo", self.shortcut("undo"), |this, _, cx| this.with_active(cx, |view, cx| view.undo_edit(cx))),
+                entry("Redo", self.shortcut("redo"), |this, _, cx| this.with_active(cx, |view, cx| view.redo_edit(cx))),
             ],
             Menu::Insert => vec![
                 entry("Citation from a DOI", "", |this, _, cx| this.lookup_doi(cx)),
@@ -4462,17 +4582,17 @@ impl Workspace {
             ],
             Menu::View | Menu::Layout => {
                 let layout = self.layout;
-                let layout_entry = |target: PaneLayout, label: &str, shortcut: &'static str| {
+                let layout_entry = |target: PaneLayout, label: &str, shortcut: SharedString| {
                     entry(check(layout == target, label), shortcut, move |this, window, cx| this.set_layout(target, window, cx))
                 };
                 vec![
                     menu_heading("Layout"),
-                    layout_entry(PaneLayout::Split, "Split view", LAYOUT_SHORTCUTS[0]),
-                    layout_entry(PaneLayout::EditorOnly, "Editor only", LAYOUT_SHORTCUTS[1]),
-                    layout_entry(PaneLayout::PdfOnly, "PDF only", LAYOUT_SHORTCUTS[2]),
-                    layout_entry(PaneLayout::PdfTab, "Open PDF in separate tab", LAYOUT_SHORTCUTS[3]),
+                    layout_entry(PaneLayout::Split, "Split view", self.shortcut("layout_split")),
+                    layout_entry(PaneLayout::EditorOnly, "Editor only", self.shortcut("layout_editor")),
+                    layout_entry(PaneLayout::PdfOnly, "PDF only", self.shortcut("layout_pdf")),
+                    layout_entry(PaneLayout::PdfTab, "Open PDF in separate tab", self.shortcut("layout_pdf_tab")),
                     menu_separator(),
-                    entry(check(self.focus_mode, "Focus mode"), "⇧⌘M", |this, window, cx| this.toggle_focus_mode(window, cx)),
+                    entry(check(self.focus_mode, "Focus mode"), self.shortcut("focus_mode"), |this, window, cx| this.toggle_focus_mode(window, cx)),
                     entry("  Presentation mode", "", |this, window, cx| this.start_presentation(window, cx)),
                     menu_separator(),
                     entry(check(self.settings.show_breadcrumbs, "Show breadcrumbs"), "", |this, window, cx| {
@@ -4493,10 +4613,10 @@ impl Workspace {
                 ]
             }
             Menu::Format => vec![
-                entry("Bold", "⌘B", |this, _, cx| {
+                entry("Bold", self.shortcut("bold"), |this, _, cx| {
                     this.with_active(cx, |view, cx| view.format(FormatKind::Bold, cx))
                 }),
-                entry("Italic", "⌘I", |this, _, cx| {
+                entry("Italic", self.shortcut("italic"), |this, _, cx| {
                     this.with_active(cx, |view, cx| view.format(FormatKind::Italic, cx))
                 }),
             ],
@@ -4515,7 +4635,7 @@ impl Workspace {
                 let engine = self.config.engine;
                 let debounce = self.config.debounce_ms;
                 vec![
-                    entry("Recompile", "⌘↩", |this, _, cx| this.recompile_by_hand(cx)),
+                    entry("Recompile", self.shortcut("recompile"), |this, _, cx| this.recompile_by_hand(cx)),
                     entry("Recompile from scratch", "", |this, _, cx| this.recompile_from_scratch(cx)),
                     entry("Stop build", "", |this, _, _| this.build.cancel()),
                     entry(check(trigger == Trigger::Save, "Compile on save"), "", |this, _, cx| this.set_trigger(Trigger::Save, cx)),
@@ -4685,7 +4805,7 @@ impl Workspace {
                                 .child(
                                     div()
                                         .text_color(theme::color(theme::palette().ui_muted))
-                                        .child(item.shortcut),
+                                        .child(item.shortcut.clone()),
                                 )
                                 .into_any_element()
                         })),
@@ -6394,6 +6514,7 @@ impl Workspace {
         let (line, column) = view.map_or((1, 1), EditorView::cursor_position);
         let pending = match &self.tree_leader {
             Some(prefix) => format!("Space {prefix}"),
+            None if !self.vim_mapper.pending().is_empty() => key_names(self.vim_mapper.pending()),
             None => view.map_or_else(String::new, EditorView::vim_pending_keys),
         };
         let info = StatusInfo {
@@ -6896,6 +7017,179 @@ impl Workspace {
         ]
     }
 
+    /// Gives the command on the shortcuts page the keys just pressed. `Esc`
+    /// cancels, so it is no key for a command from here.
+    fn record_shortcut(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) {
+        let Some(id) = self.recording_shortcut else {
+            return;
+        };
+        if keystroke.key.is_empty() || matches!(keystroke.key.as_str(), "shift" | "control" | "alt" | "platform" | "function") {
+            return;
+        }
+        self.recording_shortcut = None;
+        if keystroke.key == "escape" && !keystroke.modifiers.modified() {
+            return cx.notify();
+        }
+        let Some(command) = COMMANDS.iter().find(|command| command.id == id) else {
+            return;
+        };
+        let mut keymap = self.keymap.clone();
+        keymap.set(command, vec![keymap::record(keystroke, keymap::host_os())]);
+        self.apply_keymap(keymap, cx);
+    }
+
+    /// Opens one of the user's own files as a tab, with `template` when it is new.
+    fn open_config_file(&mut self, path: Option<PathBuf>, template: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = path else {
+            return self.set_status("No folder for settings: HOME is not set.", cx);
+        };
+        if !path.exists() {
+            let written = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| crate::atomic::write(&path, template.as_bytes()));
+            if let Err(error) = written {
+                return self.set_status(format!("Cannot create {}: {error}", path.display()), cx);
+            }
+        }
+        self.close_dialog(window, cx);
+        self.show_hub = false;
+        self.open_file(path, window, cx);
+    }
+
+    fn settings_button(&self, id: &'static str, label: &'static str, cx: &mut Context<Self>, handler: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static) -> impl IntoElement {
+        div()
+            .id(id)
+            .flex_none()
+            .px(px(8.))
+            .py(px(3.))
+            .rounded(px(4.))
+            .cursor_pointer()
+            .bg(theme::color(theme::palette().divider))
+            .on_click(cx.listener(move |this, _, window, cx| handler(this, window, cx)))
+            .child(label)
+    }
+
+    fn render_shortcut_settings(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let os = keymap::host_os();
+        let palette = theme::palette();
+        let mut elements = vec![
+            Self::setting_row(
+                "Vim mappings",
+                format!(
+                    "{} from vimrc, written like a .vimrc: inoremap jk <Esc>, nnoremap <leader>w :w<CR>. The leader is Space unless the file sets mapleader.",
+                    match self.vim_mappings.len() {
+                        1 => "1 mapping".to_string(),
+                        count => format!("{count} mappings"),
+                    }
+                ),
+                self.settings_button("open-vimrc", "Edit vimrc", cx, |this, window, cx| {
+                    this.open_config_file(settings::vimrc_path(), VIMRC_TEMPLATE, window, cx);
+                }),
+            )
+            .into_any_element(),
+            Self::setting_row(
+                "Keymap file",
+                "keymap.json keeps the shortcuts changed below and can be edited by hand. Saving it applies it.",
+                self.settings_button("open-keymap", "Edit keymap.json", cx, |this, window, cx| {
+                    let template = this.keymap.to_json();
+                    this.open_config_file(keymap::default_path(), &template, window, cx);
+                }),
+            )
+            .into_any_element(),
+            div()
+                .flex_none()
+                .pt(px(6.))
+                .text_color(theme::color(palette.ui_muted))
+                .child("Click a shortcut and press the new keys. Esc cancels.")
+                .into_any_element(),
+        ];
+        let mut groups: Vec<&str> = Vec::new();
+        for command in COMMANDS {
+            if !groups.contains(&command.group) {
+                groups.push(command.group);
+            }
+        }
+        for group in groups {
+            elements.push(div().flex_none().pt(px(14.)).pb(px(4.)).font_weight(FontWeight::SEMIBOLD).child(group).into_any_element());
+            for command in COMMANDS.iter().filter(|command| command.group == group) {
+                let id = command.id;
+                let recording = self.recording_shortcut == Some(id);
+                let keys = self.keymap.keys(command);
+                let shown: SharedString = if recording {
+                    "Press keys…".into()
+                } else if keys.is_empty() {
+                    "None".into()
+                } else {
+                    keys.iter().map(|keys| keymap::display(keys, os)).collect::<Vec<_>>().join(", ").into()
+                };
+                let conflicts: Vec<&str> = keys
+                    .iter()
+                    .flat_map(|keys| self.keymap.conflicts(command, keys, os))
+                    .map(|other| other.label)
+                    .collect();
+                let changed = self.keymap.is_changed(command);
+                elements.push(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_none()
+                        .py(px(3.))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(12.))
+                                .child(div().flex_1().min_w_0().child(command.label))
+                                .when(changed, |row| {
+                                    row.child(
+                                        div()
+                                            .id(("shortcut-reset", COMMANDS.iter().position(|other| other.id == id).unwrap_or(0)))
+                                            .flex_none()
+                                            .cursor_pointer()
+                                            .text_color(theme::color(palette.ui_muted))
+                                            .hover(|style| style.text_color(theme::color(palette.ui_text)))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                if let Some(command) = COMMANDS.iter().find(|command| command.id == id) {
+                                                    let mut keymap = this.keymap.clone();
+                                                    keymap.reset(command);
+                                                    this.apply_keymap(keymap, cx);
+                                                }
+                                            }))
+                                            .child("Reset"),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .id(("shortcut-keys", COMMANDS.iter().position(|other| other.id == id).unwrap_or(0)))
+                                        .flex_none()
+                                        .min_w(px(110.))
+                                        .px(px(8.))
+                                        .py(px(2.))
+                                        .rounded(px(4.))
+                                        .cursor_pointer()
+                                        .font_family(theme::code_font())
+                                        .text_size(px(theme::code_font_size()))
+                                        .text_color(theme::color(if keys.is_empty() && !recording { palette.ui_muted } else { palette.function }))
+                                        .bg(theme::color(if recording { palette.accent_soft } else { palette.divider }))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.recording_shortcut = if this.recording_shortcut == Some(id) { None } else { Some(id) };
+                                            cx.notify();
+                                        }))
+                                        .child(shown),
+                                ),
+                        )
+                        .when(!conflicts.is_empty(), |row| {
+                            row.child(
+                                div()
+                                    .text_color(theme::color(palette.error))
+                                    .child(format!("Also bound to: {}", conflicts.join(", "))),
+                            )
+                        })
+                        .into_any_element(),
+                );
+            }
+        }
+        elements
+    }
+
     fn render_tool_settings(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut elements = vec![
             div()
@@ -7187,7 +7481,7 @@ impl Workspace {
     }
 
     fn render_shortcuts(&self) -> Vec<AnyElement> {
-        let mut elements: Vec<AnyElement> = shortcuts::sections(self.settings.vim_mode)
+        let mut elements: Vec<AnyElement> = shortcuts::sections(self.settings.vim_mode, &self.keymap)
             .into_iter()
             .map(|section| {
                 div()
@@ -7242,6 +7536,7 @@ impl Workspace {
             .when(page != current, |style| style.hover(|style| style.bg(theme::color(theme::palette().divider))))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.dialog = Some(Dialog::Settings(page));
+                this.recording_shortcut = None;
                 cx.notify();
             }))
             .child(label)
@@ -7261,6 +7556,7 @@ impl Workspace {
             Dialog::Settings(SettingsPage::Editor) => self.render_editor_settings(cx),
             Dialog::Settings(SettingsPage::Compiler) => self.render_compiler_settings(cx),
             Dialog::Settings(SettingsPage::Tools) => self.render_tool_settings(cx),
+            Dialog::Settings(SettingsPage::Shortcuts) => self.render_shortcut_settings(cx),
             Dialog::Shortcuts => self.render_shortcuts(),
             Dialog::WordCount => self.render_word_count(),
             #[cfg(feature = "collab")]
@@ -7333,7 +7629,8 @@ impl Workspace {
                                             .border_color(theme::color(theme::palette().divider))
                                             .child(self.settings_tab(SettingsPage::Editor, page, "Editor", cx))
                                             .child(self.settings_tab(SettingsPage::Compiler, page, "Compiler", cx))
-                                            .child(self.settings_tab(SettingsPage::Tools, page, "Writing tools", cx)),
+                                            .child(self.settings_tab(SettingsPage::Tools, page, "Writing tools", cx))
+                                            .child(self.settings_tab(SettingsPage::Shortcuts, page, "Shortcuts", cx)),
                                     )
                                 },
                             )
@@ -7538,6 +7835,40 @@ fn git_branch(root: &Path) -> Option<String> {
     })
 }
 
+/// What a new `vimrc` holds, so that the format explains itself.
+const VIMRC_TEMPLATE: &str = "\" Vim mappings for the editor, written like a .vimrc and applied on save.
+\" Supported: map, nmap, vmap, xmap, imap and their noremap forms
+\" (noremap, nnoremap, vnoremap, xnoremap, inoremap), and let mapleader.
+\" The leader is Space unless set here, like the built-in Space commands.
+\"
+\" inoremap jk <Esc>
+\" nnoremap H ^
+\" nnoremap L $
+\" nnoremap <leader>q :q<CR>
+";
+
+/// Keys that wait for a mapping, for the status bar.
+fn key_names(keys: &[Key]) -> String {
+    keys.iter()
+        .map(|key| match key {
+            Key::Char(' ') => "Space".to_string(),
+            Key::Char(ch) => ch.to_string(),
+            Key::Ctrl(ch) => format!("Ctrl+{ch}"),
+            Key::Esc => "Esc".to_string(),
+            Key::Enter => "Enter".to_string(),
+            Key::Tab => "Tab".to_string(),
+            Key::Backspace => "Backspace".to_string(),
+            Key::Delete => "Delete".to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A `Ctrl` key that vim has no command for and that only a mapping can use.
+fn is_unknown_ctrl(key: Key) -> bool {
+    matches!(key, Key::Ctrl(ch) if !matches!(ch, 'd' | 'u' | 'r'))
+}
+
 /// Turns a keystroke into a vim key. Characters come from `key_char`, which
 /// respects the keyboard layout: on a German layout, `/` is Shift+7 and `{` is Alt+8.
 fn translate_key(keystroke: &Keystroke, map_navigation: bool) -> Option<Key> {
@@ -7545,7 +7876,7 @@ fn translate_key(keystroke: &Keystroke, map_navigation: bool) -> Option<Key> {
     if keystroke.modifiers.control {
         let mut chars = name.chars();
         return match (chars.next(), chars.next()) {
-            (Some(ch @ ('d' | 'u' | 'r')), None) => Some(Key::Ctrl(ch)),
+            (Some(ch), None) if ch.is_ascii_graphic() => Some(Key::Ctrl(ch)),
             _ => None,
         };
     }
