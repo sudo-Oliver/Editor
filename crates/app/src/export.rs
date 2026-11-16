@@ -38,8 +38,14 @@ fn commit(temp: NamedTempFile, target: &Path) -> Result<(), String> {
 
 fn hash_file(path: &Path) -> io::Result<Vec<u8>> {
     let mut hasher = Sha256::new();
-    io::copy(&mut File::open(path)?, &mut hasher)?;
-    Ok(hasher.finalize().to_vec())
+    let (mut file, mut chunk) = (File::open(path)?, vec![0; 64 * 1024]);
+    loop {
+        let read = file.read(&mut chunk)?;
+        if read == 0 {
+            return Ok(hasher.finalize().to_vec());
+        }
+        hasher.update(&chunk[..read]);
+    }
 }
 
 /// A PDF starts with its version and ends with an end marker, which a cut-off file lacks.
