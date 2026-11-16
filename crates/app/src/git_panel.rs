@@ -655,7 +655,7 @@ impl GitPanel {
                     cx.emit(GitPanelEvent::OpenFile(path));
                 }
             }))
-            .child(div().flex_none().w(px(10.)).font_family(theme::CODE_FONT).text_color(theme::color(color)).child(letter.to_string()))
+            .child(div().flex_none().w(px(10.)).font_family(theme::code_font()).text_color(theme::color(color)).child(letter.to_string()))
             .child(
                 div()
                     .flex()
@@ -812,9 +812,9 @@ impl GitPanel {
                                 .top_0()
                                 .left(px(6.))
                                 .right(px(6.))
-                                .font_family(theme::CODE_FONT)
-                                .text_size(px(theme::CODE_FONT_SIZE))
-                                .line_height(px(theme::CODE_LINE_HEIGHT))
+                                .font_family(theme::code_font())
+                                .text_size(px(theme::code_font_size()))
+                                .line_height(px(theme::code_line_height()))
                                 .text_color(theme::color(theme::palette().ui_muted))
                                 .child(placeholder),
                         )

@@ -11,12 +11,16 @@ pub struct OutlineItem {
     pub depth: usize,
     pub has_children: bool,
     pub collapsed: bool,
+    /// The number LaTeX would give it, counted by depth, such as `[1, 2]`
+    /// for 1.2. None for a starred heading, which LaTeX leaves unnumbered.
+    pub number: Option<Vec<usize>>,
 }
 
 /// Turns parsed headings into a tree, stored flat in document order.
 pub fn outline(headings: &[Heading], language: Language) -> Vec<OutlineItem> {
     let mut items: Vec<OutlineItem> = Vec::new();
     let mut parents: Vec<usize> = Vec::new();
+    let mut counters: Vec<usize> = Vec::new();
     for heading in headings {
         let title = match language {
             Language::Latex => clean_latex(&heading.title),
@@ -33,16 +37,31 @@ pub fn outline(headings: &[Heading], language: Language) -> Vec<OutlineItem> {
             items[parent].has_children = true;
         }
         parents.push(items.len());
+        let depth = parents.len() - 1;
+        let number = heading.numbered.then(|| {
+            counters.resize(depth + 1, 0);
+            counters[depth] += 1;
+            counters.clone()
+        });
         items.push(OutlineItem {
             level: heading.level,
             title,
             line: heading.line,
-            depth: parents.len() - 1,
+            depth,
             has_children: false,
             collapsed: false,
+            number,
         });
     }
     items
+}
+
+/// `01` for a chapter at the top, as on a contents page, and `1.2` below it.
+pub fn label(number: &[usize]) -> String {
+    match number {
+        [chapter] => format!("{chapter:02}"),
+        _ => number.iter().map(usize::to_string).collect::<Vec<_>>().join("."),
+    }
 }
 
 /// Lists the items that no collapsed parent hides, with their index.
@@ -191,7 +210,7 @@ mod tests {
     use super::*;
 
     fn heading(level: usize, title: &str, line: usize) -> Heading {
-        Heading { level, title: title.into(), line }
+        Heading { level, title: title.into(), line, numbered: true }
     }
 
     fn shape(items: &[OutlineItem]) -> Vec<(&str, usize, bool)> {
@@ -215,6 +234,24 @@ mod tests {
             shape(&outline(&headings, Language::Latex)),
             vec![("A b", 0, true), ("Skips a level", 1, false), ("C", 1, false), ("D", 0, false), ("E", 0, false)]
         );
+    }
+
+    #[test]
+    fn headings_are_numbered_by_depth() {
+        let mut starred = heading(2, "{Preface}", 1);
+        starred.numbered = false;
+        let headings = [
+            heading(2, "{A}", 0),
+            starred,
+            heading(3, "{B}", 2),
+            heading(4, "{Skips}", 3),
+            heading(3, "{C}", 4),
+            heading(2, "{D}", 5),
+            heading(3, "{E}", 6),
+        ];
+        let labels: Vec<_> =
+            outline(&headings, Language::Latex).iter().map(|item| item.number.as_deref().map_or("—".into(), label)).collect();
+        assert_eq!(labels, ["01", "—", "1.1", "1.1.1", "1.2", "02", "2.1"]);
     }
 
     #[test]

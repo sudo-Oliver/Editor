@@ -31,6 +31,35 @@ pub enum PickerKind {
     Branches,
     /// Neovim colorschemes, shown while moving through them.
     Themes,
+    /// Installed fonts, shown while moving through them.
+    Fonts(FontSlot),
+}
+
+/// Which text a font picked in the settings is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FontSlot {
+    Editor,
+    Interface,
+}
+
+/// The label of the picker item that goes back to the font of the mode.
+pub const DEFAULT_FONT: &str = "Default";
+
+/// The installed fonts by family, after one that keeps the default.
+pub fn font_items(names: Vec<String>) -> Vec<PickerItem> {
+    let item = |label: String, detail: Option<&str>| PickerItem {
+        path: PathBuf::new(),
+        label,
+        position: None,
+        summary: None,
+        detail: detail.map(str::to_string),
+    };
+    let mut names: Vec<String> = names.into_iter().filter(|name| !name.starts_with('.')).collect();
+    names.sort_by_key(|name| name.to_lowercase());
+    names.dedup();
+    std::iter::once(item(DEFAULT_FONT.to_string(), Some("Of the mode")))
+        .chain(names.into_iter().map(|name| item(name, None)))
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -352,7 +381,7 @@ mod tests {
         let themes = Themes::from([("vesper".to_string(), palette), ("koda".to_string(), palette)]);
         let items = theme_items(&themes);
         let labels: Vec<String> = match_in_order(&items, "").into_iter().map(|item| item.label).collect();
-        assert_eq!(labels, ["overleaf-dark", "overleaf-light", "koda", "vesper"]);
+        assert_eq!(labels, ["overleaf-dark", "overleaf-light", "paper", "koda", "vesper"]);
         assert_eq!(match_in_order(&items, "ves")[0].label, "vesper");
     }
 

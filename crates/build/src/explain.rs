@@ -84,10 +84,21 @@ pub fn explain(diagnostic: &Diagnostic) -> Option<Explanation> {
 
 fn explain_tool(message: &str) -> Option<Explanation> {
     let tool = message.strip_suffix(" is not installed.")?;
-    found(
-        format!("The compiler {tool} is not installed"),
-        "Install it, then click Recompile. The README lists what each file type needs.",
-    )
+    let language = match tool {
+        "tectonic" | "latexmk" | "pdflatex" | "lualatex" => "LaTeX",
+        "typst" => "Typst",
+        _ => {
+            return found(
+                format!("{tool} is not installed"),
+                format!("This file type needs the program {tool}. Install it, then click Recompile."),
+            );
+        }
+    };
+    Some(Explanation {
+        title: format!("{language} is not set up yet"),
+        hint: format!("Turning your text into a PDF needs the {language} compiler. Install it here, then click Recompile."),
+        fix: Some(Fix::InstallTool(language.to_string())),
+    })
 }
 
 fn needs_package(title: String, item: &str, package: &str) -> Option<Explanation> {
@@ -415,6 +426,14 @@ fn locate_column(diagnostic: &mut Diagnostic, source: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_missing_compiler_offers_its_setup() {
+        let explained = |message: &str| explain(&Diagnostic { message: message.to_string(), ..Default::default() }).unwrap();
+        assert_eq!(explained("tectonic is not installed.").fix, Some(Fix::InstallTool("LaTeX".to_string())));
+        assert_eq!(explained("typst is not installed.").fix, Some(Fix::InstallTool("Typst".to_string())));
+        assert_eq!(explained("pandoc is not installed.").fix, None);
+    }
 
     fn with_context(message: &str, context: &str) -> Diagnostic {
         Diagnostic { message: message.into(), context: Some(context.into()), ..Default::default() }

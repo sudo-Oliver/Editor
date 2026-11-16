@@ -1,0 +1,30 @@
+#!/bin/sh
+# Opens files and folders in Editor from the terminal, like `code` for VS Code:
+#
+#   editor .            the current folder as a project
+#   editor main.tex     the file, in the project it belongs to
+#   editor              just the app
+#
+# It hands the paths to macOS, which starts Editor or passes them to the
+# running one.
+set -eu
+
+# This script lives in Editor.app/Contents/Resources/bin and is usually
+# reached through a link, so the app is found by following the links.
+script="$0"
+while [ -L "$script" ]; do
+  target="$(readlink "$script")"
+  case "$target" in
+    /*) script="$target" ;;
+    *) script="$(dirname "$script")/$target" ;;
+  esac
+done
+app="$(cd "$(dirname "$script")/../../.." && pwd)"
+
+for path in "$@"; do
+  if [ ! -e "$path" ]; then
+    echo "editor: $path does not exist" >&2
+    exit 1
+  fi
+done
+exec open -a "$app" "$@"

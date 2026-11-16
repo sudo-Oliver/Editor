@@ -204,7 +204,12 @@ impl PdfView {
                 }));
             }
             Err(error) => {
-                view.error = Some(format!("{error} Run scripts/fetch-pdfium.sh."));
+                eprintln!("PDFium did not load: {error}");
+                view.error = Some(if cfg!(debug_assertions) {
+                    format!("{error} Run scripts/fetch-pdfium.sh.")
+                } else {
+                    "The PDF viewer is missing from this copy of the app. Install Editor again from the download page.".to_string()
+                });
             }
         }
         view
@@ -471,7 +476,7 @@ impl PdfView {
     }
 
     fn on_scroll(&mut self, event: &ScrollEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let delta = event.delta.pixel_delta(px(theme::CODE_LINE_HEIGHT));
+        let delta = event.delta.pixel_delta(px(theme::code_line_height()));
         if self.presenting {
             if self.slide_turned_at.is_some_and(|at| at.elapsed() < SLIDE_PAUSE) {
                 return;
@@ -899,16 +904,19 @@ fn rect_bounds(rect: &Rect, origin: gpui::Point<Pixels>, zoom: f32) -> Bounds<Pi
     )
 }
 
-fn library_directory() -> PathBuf {
+/// Where PDFium is: named by `EDITOR_PDFIUM_DIR`, next to the program, or in
+/// the app bundle's `Frameworks` folder. Builds made with cargo also look in the
+/// checkout's `vendor` folder.
+pub(crate) fn library_directory() -> PathBuf {
     if let Some(directory) = std::env::var_os("EDITOR_PDFIUM_DIR") {
         return directory.into();
     }
     let name = pdfium_file_name();
-    let beside_binary = std::env::current_exe()
-        .ok()
-        .and_then(|binary| binary.parent().map(Path::to_path_buf))
-        .filter(|directory| directory.join(name).is_file());
-    beside_binary.unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vendor/pdfium/lib"))
+    let binary_directory = std::env::current_exe().ok().and_then(|binary| binary.parent().map(Path::to_path_buf));
+    let candidates = binary_directory.iter().flat_map(|directory| [directory.clone(), directory.join("../Frameworks")]);
+    let vendor = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vendor/pdfium/lib");
+    let found = candidates.chain(cfg!(debug_assertions).then_some(vendor.clone())).find(|directory| directory.join(name).is_file());
+    found.unwrap_or(vendor)
 }
 
 #[cfg(target_os = "macos")]
