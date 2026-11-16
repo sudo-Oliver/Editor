@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::RwLock};
 
-use gpui::{FontWeight, Hsla, Rgba, SharedString, rgb};
+use gpui::{FontWeight, Hsla, PathBuilder, Pixels, Point, Rgba, SharedString, rgb};
 use serde::{Deserialize, Serialize};
 
 use editor_core::HighlightKind;
@@ -631,6 +631,18 @@ pub const RADIUS_LG: f32 = 10.0;
 pub const CODE_FONT: &str = "Menlo";
 #[cfg(not(target_os = "macos"))]
 pub const CODE_FONT: &str = "DejaVu Sans Mono";
+
+/// A filled shape through `points`, or `None` when it has no area to fill.
+pub fn polygon(points: impl IntoIterator<Item = Point<Pixels>>) -> Option<gpui::Path> {
+    let mut points = points.into_iter();
+    let mut builder = PathBuilder::fill();
+    builder.move_to(points.next()?);
+    for point in points {
+        builder.line_to(point);
+    }
+    builder.close();
+    builder.build().ok()
+}
 
 pub fn color(value: u32) -> Hsla {
     let color: Rgba = rgb(value);

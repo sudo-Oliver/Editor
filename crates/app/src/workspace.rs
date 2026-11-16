@@ -5429,11 +5429,15 @@ impl Workspace {
                 let right = bounds.right() - px(TAB_GAP / 2.);
                 let top_left = point(edge(left, left_forward, true), bounds.top());
                 let top_right = point(edge(right, right_forward, true), bounds.top());
-                let mut path = gpui::Path::new(point(edge(left, left_forward, false), bounds.bottom()));
-                path.line_to(top_left);
-                path.line_to(top_right);
-                path.line_to(point(edge(right, right_forward, false), bounds.bottom()));
-                window.paint_path(path, theme::color(if active { theme::palette().tab_active } else { theme::palette().tab_inactive }));
+                let corners = [
+                    point(edge(left, left_forward, false), bounds.bottom()),
+                    top_left,
+                    top_right,
+                    point(edge(right, right_forward, false), bounds.bottom()),
+                ];
+                if let Some(path) = theme::polygon(corners) {
+                    window.paint_path(path, theme::color(if active { theme::palette().tab_active } else { theme::palette().tab_inactive }));
+                }
                 if active {
                     let line = Bounds::new(top_left, size(top_right.x - top_left.x, px(1.)));
                     window.paint_quad(fill(line, theme::color(theme::palette().focus)));

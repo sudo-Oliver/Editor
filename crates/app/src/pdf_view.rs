@@ -490,7 +490,7 @@ impl PdfView {
             }
             return;
         }
-        if event.modifiers.secondary() {
+        if event.modifiers.secondary(cx) {
             let anchor = self.bounds.map_or(point(px(0.), px(0.)), |bounds| {
                 point(event.position.x - bounds.left(), event.position.y - bounds.top())
             });
@@ -565,7 +565,7 @@ impl PdfView {
         let Some(point) = self.page_point(event.position) else {
             return;
         };
-        if event.modifiers.secondary() {
+        if event.modifiers.secondary(cx) {
             if point.inside {
                 cx.emit(PdfViewEvent::BackwardSearch { page: point.page, x: point.x, y: point.y });
             }
