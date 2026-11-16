@@ -14,6 +14,9 @@ use crate::explain::edit_distance;
 pub enum Fix {
     AddPackage(String),
     RemovePackage(String),
+    /// Opens the setup of a missing compiler, named as the user knows it, such
+    /// as "LaTeX".
+    InstallTool(String),
 }
 
 impl Fix {
@@ -21,6 +24,7 @@ impl Fix {
         match self {
             Self::AddPackage(package) => format!("Add \\usepackage{{{package}}}"),
             Self::RemovePackage(package) => format!("Remove {package}"),
+            Self::InstallTool(tool) => format!("Install {tool}…"),
         }
     }
 }

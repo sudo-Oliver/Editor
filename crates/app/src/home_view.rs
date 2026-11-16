@@ -4,18 +4,22 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    sync::Arc,
+    time::SystemTime,
 };
 
 use gpui::{
-    AnyElement, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Keystroke, PathPromptOptions, PromptLevel,
-    SharedString, Subscription, Window, div, prelude::*, px, svg,
+    AnyElement, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Keystroke, ObjectFit, PathPromptOptions, PromptLevel,
+    RenderImage, SharedString, Subscription, Task, Window, div, img, prelude::*, px, svg,
 };
+use pdf::{PageRequest, PdfEvent, PdfWorker};
 
 use crate::{
     editor_view::EditorView,
     picker::fuzzy_score,
     projects::{self, Registry, Template, TemplateLanguage, TemplateSource},
     theme,
+    toolchain::{self, Tool, Toolchain},
 };
 
 #[cfg(target_os = "macos")]
@@ -23,9 +27,16 @@ const TRAFFIC_LIGHT_SPACE: f32 = 78.0;
 #[cfg(not(target_os = "macos"))]
 const TRAFFIC_LIGHT_SPACE: f32 = 8.0;
 const BAND_HEIGHT: f32 = 40.0;
-const CONTENT_WIDTH: f32 = 1040.0;
+const CONTENT_WIDTH: f32 = 1100.0;
+const SIDEBAR_WIDTH: f32 = 220.0;
+const CONTENT_PADDING: f32 = 32.0;
 const ROW_HEIGHT: f32 = 40.0;
 const FIELD_HEIGHT: f32 = 28.0;
+const CARD_WIDTH: f32 = 248.0;
+const CARD_GAP: f32 = 16.0;
+const THUMBNAIL_HEIGHT: f32 = 150.0;
+/// Rendered wider than shown, so that the page stays sharp on Retina screens.
+const THUMBNAIL_PIXELS: u32 = 2 * CARD_WIDTH as u32;
 
 pub enum HomeEvent {
     Open(PathBuf),
@@ -35,12 +46,28 @@ pub enum HomeEvent {
     Trashed(PathBuf),
     #[cfg(feature = "collab")]
     JoinSession,
+    /// Projects show as cards, or as rows when false.
+    CardsChanged(bool),
+    StartTour,
+    /// Add the `editor` command for the terminal.
+    InstallCommand,
+    RunSetup,
+    ShowShortcuts,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum HubTab {
+enum HubPage {
     Projects,
     Templates,
+    Tools,
+    Help,
+}
+
+/// The first page of a project's PDF, as of the PDF's last change.
+enum Thumbnail {
+    Loading,
+    Ready(Arc<RenderImage>, SystemTime),
+    None,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -60,6 +87,8 @@ enum HubDialog {
         name: Entity<EditorView>,
         location: PathBuf,
         template: usize,
+        /// Text from the clipboard that becomes the main file, in place of a template.
+        pasted: Option<(TemplateLanguage, String)>,
         error: Option<String>,
         busy: bool,
     },
@@ -80,7 +109,16 @@ pub struct HomeView {
     templates: Vec<Template>,
     /// Found once per project, as it reads the folder.
     languages: HashMap<PathBuf, TemplateLanguage>,
-    tab: HubTab,
+    page: HubPage,
+    cards: bool,
+    /// Cards per row at the last render, for moving up and down with the keys.
+    columns: usize,
+    /// The project whose "…" menu is open.
+    card_menu: Option<PathBuf>,
+    thumbnails: HashMap<PathBuf, Thumbnail>,
+    thumbnail_task: Option<Task<()>>,
+    toolchain: Entity<Toolchain>,
+    _toolchain_observer: Subscription,
     search: Entity<EditorView>,
     selected: usize,
     rename: Option<Rename>,
@@ -97,7 +135,7 @@ pub struct HomeView {
 impl EventEmitter<HomeEvent> for HomeView {}
 
 impl HomeView {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(toolchain: Entity<Toolchain>, cx: &mut Context<Self>) -> Self {
         let registry_path = projects::registry_path();
         let registry = registry_path.as_deref().map(Registry::load).unwrap_or_default();
         let library = projects::library_path();
@@ -107,13 +145,21 @@ impl HomeView {
             this.selected = 0;
             cx.notify();
         });
+        let _toolchain_observer = cx.observe(&toolchain, |_, _, cx| cx.notify());
         let mut view = Self {
             registry,
             registry_path,
             library,
             templates,
             languages: HashMap::new(),
-            tab: HubTab::Projects,
+            page: HubPage::Projects,
+            cards: true,
+            columns: 1,
+            card_menu: None,
+            thumbnails: HashMap::new(),
+            thumbnail_task: None,
+            toolchain,
+            _toolchain_observer,
             search,
             selected: 0,
             rename: None,
@@ -137,9 +183,26 @@ impl HomeView {
         cx.notify();
     }
 
-    pub fn set_context(&mut self, has_project: bool, vim_mode: bool) {
+    /// Makes the welcome example in the usual place, under a name that is free.
+    pub fn create_welcome(&mut self, language: TemplateLanguage, cx: &mut Context<Self>) -> Result<PathBuf, String> {
+        let location = self.registry.location();
+        let template = projects::welcome_template(language);
+        let (dir, title) = (1..100)
+            .map(|number| if number == 1 { "Welcome".to_string() } else { format!("Welcome {number}") })
+            .find_map(|title| projects::new_project_dir(&location, &title).ok().map(|dir| (dir, title)))
+            .ok_or_else(|| "There is no free name for the welcome project.".to_string())?;
+        projects::create_project(&template, &dir).map_err(|error| format!("Cannot create the welcome project: {error}"))?;
+        self.registry.touch(&dir, projects::now());
+        self.registry.rename(&dir, &title);
+        self.save_registry();
+        cx.notify();
+        Ok(dir)
+    }
+
+    pub fn set_context(&mut self, has_project: bool, vim_mode: bool, cards: bool) {
         self.has_project = has_project;
         self.vim_mode = vim_mode;
+        self.cards = cards;
     }
 
     /// The hub opens with the cursor in the search, so typing filters at once.
@@ -153,10 +216,12 @@ impl HomeView {
 
     /// Each visit starts on the projects with an empty search.
     pub fn show(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.tab = HubTab::Projects;
+        self.page = HubPage::Projects;
         self.selected = 0;
         self.rename = None;
         self.dialog = None;
+        self.card_menu = None;
+        self.load_thumbnails(cx);
         self.search.update(cx, |field, cx| {
             let end = field.state.buffer().len();
             field.edit_from_outside(0..end, "", cx);
@@ -221,10 +286,16 @@ impl HomeView {
     }
 
     fn row_count(&self, cx: &Context<Self>) -> usize {
-        match self.tab {
-            HubTab::Projects => self.visible_projects(cx).len(),
-            HubTab::Templates => self.visible_templates(cx).len(),
+        match self.page {
+            HubPage::Projects => self.visible_projects(cx).len(),
+            HubPage::Templates => self.visible_templates(cx).len(),
+            HubPage::Tools | HubPage::Help => 0,
         }
+    }
+
+    /// Cards move by one sideways and by a row up and down.
+    fn grid_shown(&self) -> bool {
+        self.page == HubPage::Templates || (self.page == HubPage::Projects && self.cards)
     }
 
     /// Takes the keys of the hub. Returns false for keys that should go on to the
@@ -253,17 +324,24 @@ impl HomeView {
             return true;
         }
         let search_focused = self.search.read(cx).focus_handle(cx).is_focused(window);
+        let (grid, row) = (self.grid_shown(), self.columns.max(1) as isize);
         let step = match key {
-            "down" => 1,
-            "up" => -1,
-            "j" if self.vim_mode && !search_focused => 1,
-            "k" if self.vim_mode && !search_focused => -1,
+            "down" => if grid { row } else { 1 },
+            "up" => if grid { -row } else { -1 },
+            "right" if grid && !search_focused => 1,
+            "left" if grid && !search_focused => -1,
+            "j" if self.vim_mode && !search_focused => if grid { row } else { 1 },
+            "k" if self.vim_mode && !search_focused => if grid { -row } else { -1 },
+            "l" if self.vim_mode && grid && !search_focused => 1,
+            "h" if self.vim_mode && grid && !search_focused => -1,
             "enter" => {
                 self.activate_selected(window, cx);
                 return true;
             }
             "escape" => {
-                if self.has_project {
+                if self.card_menu.take().is_some() {
+                    cx.notify();
+                } else if self.has_project {
                     cx.emit(HomeEvent::Close);
                 } else if search_focused && !self.query(cx).is_empty() {
                     self.search.update(cx, |field, cx| {
@@ -274,7 +352,7 @@ impl HomeView {
                 return true;
             }
             "tab" => {
-                self.switch_tab(if self.tab == HubTab::Projects { HubTab::Templates } else { HubTab::Projects }, window, cx);
+                self.switch_page(if self.page == HubPage::Projects { HubPage::Templates } else { HubPage::Projects }, window, cx);
                 return true;
             }
             _ => return false,
@@ -287,22 +365,24 @@ impl HomeView {
         true
     }
 
-    fn switch_tab(&mut self, tab: HubTab, window: &mut Window, cx: &mut Context<Self>) {
-        self.tab = tab;
+    fn switch_page(&mut self, page: HubPage, window: &mut Window, cx: &mut Context<Self>) {
+        self.page = page;
         self.selected = 0;
         self.rename = None;
+        self.card_menu = None;
         self.focus(window, cx);
     }
 
     fn activate_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.tab {
-            HubTab::Projects => {
+        match self.page {
+            HubPage::Tools | HubPage::Help => {}
+            HubPage::Projects => {
                 if let Some(&index) = self.visible_projects(cx).get(self.selected) {
                     let path = self.registry.projects[index].path.clone();
                     self.open_project(path, cx);
                 }
             }
-            HubTab::Templates => {
+            HubPage::Templates => {
                 if let Some(&index) = self.visible_templates(cx).get(self.selected) {
                     self.open_new_project(index, window, cx);
                 }
@@ -358,7 +438,34 @@ impl HomeView {
         self.dialog_observers = vec![cx.observe(&name, |_, _, cx| cx.notify())];
         window.focus(&name.read(cx).focus_handle(cx), cx);
         let template = template.min(self.templates.len().saturating_sub(1));
-        self.dialog = Some(HubDialog::NewProject { name, location: self.registry.location(), template, error: None, busy: false });
+        self.dialog = Some(HubDialog::NewProject { name, location: self.registry.location(), template, pasted: None, error: None, busy: false });
+        cx.notify();
+    }
+
+    /// The template named `name`, such as "Empty LaTeX", for the cards on top.
+    fn template_named(&self, name: &str) -> usize {
+        self.templates.iter().position(|template| template.name == name).unwrap_or(0)
+    }
+
+    /// A new project from what Claude or anyone else wrote, taken from the clipboard.
+    fn paste_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = cx.read_from_clipboard().and_then(|item| item.text()).unwrap_or_default();
+        if text.trim().is_empty() {
+            self.message = Some("The clipboard is empty. Copy the LaTeX or Typst from Claude first, then click Paste from Claude again.".to_string());
+            return cx.notify();
+        }
+        let language = projects::guess_language(&text);
+        let name = plain_field("", cx);
+        self.dialog_observers = vec![cx.observe(&name, |_, _, cx| cx.notify())];
+        window.focus(&name.read(cx).focus_handle(cx), cx);
+        self.dialog = Some(HubDialog::NewProject {
+            name,
+            location: self.registry.location(),
+            template: 0,
+            pasted: Some((language, text)),
+            error: None,
+            busy: false,
+        });
         cx.notify();
     }
 
@@ -399,7 +506,7 @@ impl HomeView {
 
     fn confirm_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match &mut self.dialog {
-            Some(HubDialog::NewProject { name, location, template, error, busy }) => {
+            Some(HubDialog::NewProject { name, location, template, pasted, error, busy }) => {
                 if *busy {
                     return;
                 }
@@ -417,9 +524,17 @@ impl HomeView {
                 };
                 *busy = true;
                 let location = location.clone();
+                let pasted = pasted.clone();
                 cx.spawn_in(window, async move |this, cx| {
                     let target = dir.clone();
-                    let created = cx.background_spawn(async move { projects::create_project(&template, &target) }).await;
+                    let created = cx
+                        .background_spawn(async move {
+                            match pasted {
+                                Some((language, text)) => projects::create_from_text(&target, language, &text),
+                                None => projects::create_project(&template, &target),
+                            }
+                        })
+                        .await;
                     this.update_in(cx, |this, window, cx| match created {
                         Ok(()) => {
                             this.registry.default_location = Some(location);
@@ -463,7 +578,7 @@ impl HomeView {
                     this.update_in(cx, |this, window, cx| match saved {
                         Ok(_) => {
                             this.close_dialog(window, cx);
-                            this.tab = HubTab::Templates;
+                            this.page = HubPage::Templates;
                             this.message = Some("Saved to your templates.".to_string());
                             cx.notify();
                         }
@@ -591,6 +706,72 @@ impl HomeView {
         .detach();
     }
 
+    // Thumbnails
+
+    /// Renders the first page of each project's PDF, one project after the other,
+    /// on a PDFium thread of its own. A PDF that did not change is not redone.
+    fn load_thumbnails(&mut self, cx: &mut Context<Self>) {
+        let wanted: Vec<(PathBuf, PathBuf, SystemTime)> = self
+            .registry
+            .projects
+            .iter()
+            .filter_map(|entry| {
+                let (pdf, modified) = projects::newest_pdf(&entry.path)?;
+                let current = matches!(self.thumbnails.get(&entry.path), Some(Thumbnail::Ready(_, seen)) if *seen == modified);
+                (!current).then(|| (entry.path.clone(), pdf, modified))
+            })
+            .collect();
+        for entry in &self.registry.projects {
+            if projects::newest_pdf(&entry.path).is_none() {
+                self.thumbnails.insert(entry.path.clone(), Thumbnail::None);
+            }
+        }
+        if wanted.is_empty() {
+            return;
+        }
+        for (project, _, _) in &wanted {
+            self.thumbnails.entry(project.clone()).or_insert(Thumbnail::Loading);
+        }
+        let recolor = None;
+        self.thumbnail_task = Some(cx.spawn(async move |this, cx| {
+            let library = crate::pdf_view::library_directory();
+            let Ok((worker, mut events)) = cx.background_spawn(async move { PdfWorker::spawn(&library) }).await else {
+                return;
+            };
+            for (generation, (project, pdf, modified)) in wanted.into_iter().enumerate() {
+                let generation = generation as u64;
+                let Ok(bytes) = std::fs::read(&pdf) else {
+                    continue;
+                };
+                worker.load(generation, bytes);
+                let request = PageRequest { page: 0, width_px: THUMBNAIL_PIXELS, recolor };
+                worker.render(generation, vec![request]);
+                let image = loop {
+                    match events.recv().await {
+                        Some(PdfEvent::Rendered { generation: done, request, height_px, bgra }) if done == generation => {
+                            break image::RgbaImage::from_raw(request.width_px, height_px, bgra)
+                                .map(|buffer| Arc::new(RenderImage::new([image::Frame::new(buffer)])));
+                        }
+                        Some(PdfEvent::Failed { generation: done, .. }) if done == generation => break None,
+                        Some(_) => {}
+                        None => return,
+                    }
+                };
+                let result = this.update(cx, |this, cx| {
+                    let thumbnail = match image {
+                        Some(image) => Thumbnail::Ready(image, modified),
+                        None => Thumbnail::None,
+                    };
+                    this.thumbnails.insert(project, thumbnail);
+                    cx.notify();
+                });
+                if result.is_err() {
+                    return;
+                }
+            }
+        }));
+    }
+
     // Rendering
 
     fn render_band(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -598,55 +779,90 @@ impl HomeView {
             .flex()
             .flex_none()
             .items_center()
-            .justify_between()
+            .justify_end()
             .h(px(BAND_HEIGHT))
             .pl(px(TRAFFIC_LIGHT_SPACE))
             .pr(px(10.))
-            .border_b_1()
-            .border_color(theme::color(theme::palette().panel))
+            .bg(theme::color(theme::palette().panel))
+            .when(self.has_project, |element| {
+                element.child(button("hub-back", "Back to project", false, cx, |_, _, cx| cx.emit(HomeEvent::Close)))
+            })
+    }
+
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = theme::palette();
+        let item = |id: &'static str, icon: &'static str, text: &'static str, target: HubPage, cx: &mut Context<Self>| {
+            let active = self.page == target;
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .h(px(34.))
+                .px(px(10.))
+                .rounded(px(theme::RADIUS_MD))
+                .cursor_pointer()
+                .when(active, |style| style.bg(theme::color(palette.accent_soft)).font_weight(FontWeight::SEMIBOLD))
+                .when(!active, |style| style.text_color(theme::color(palette.ui_muted)).hover(|style| style.bg(theme::color(palette.divider)).text_color(theme::color(palette.ui_text))))
+                .on_click(cx.listener(move |this, _, window, cx| this.switch_page(target, window, cx)))
+                .child(svg().path(format!("icons/{icon}.svg")).size(px(16.)).flex_none().text_color(theme::color(if active { palette.accent } else { palette.ui_muted })))
+                .child(text)
+        };
+        #[cfg(feature = "collab")]
+        let join = Some(
+            div()
+                .id("hub-join")
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .h(px(34.))
+                .px(px(10.))
+                .rounded(px(theme::RADIUS_MD))
+                .cursor_pointer()
+                .text_color(theme::color(palette.ui_muted))
+                .hover(|style| style.bg(theme::color(palette.divider)).text_color(theme::color(palette.ui_text)))
+                .on_click(cx.listener(|_, _, _, cx| cx.emit(HomeEvent::JoinSession)))
+                .child(svg().path("icons/people.svg").size(px(16.)).flex_none().text_color(theme::color(palette.ui_muted)))
+                .child("Join live session…"),
+        );
+        #[cfg(not(feature = "collab"))]
+        let join: Option<gpui::Stateful<gpui::Div>> = None;
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w(px(SIDEBAR_WIDTH))
+            .h_full()
+            .px(px(12.))
+            .pb(px(12.))
+            .gap(px(2.))
+            .bg(theme::color(palette.panel))
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(8.))
-                    .child(svg().path("icons/notepad.svg").size(px(18.)).flex_none().text_color(theme::color(theme::palette().accent)))
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Project hub")),
+                    .gap(px(10.))
+                    .px(px(10.))
+                    .pt(px(8.))
+                    .pb(px(20.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(32.))
+                            .rounded(px(theme::RADIUS_MD))
+                            .bg(theme::color(palette.accent))
+                            .child(svg().path("icons/logo.svg").size(px(20.)).text_color(theme::color(palette.on_accent))),
+                    )
+                    .child(div().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child("Editor")),
             )
-            .when(self.has_project, |element| {
-                element.child(button("hub-back", "✕  Back to project", false, cx, |_, _, cx| cx.emit(HomeEvent::Close)))
-            })
-    }
-
-    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let tab = |id: &'static str, label: &'static str, target: HubTab, cx: &mut Context<Self>| {
-            let active = self.tab == target;
-            div()
-                .id(id)
-                .px(px(12.))
-                .py(px(4.))
-                .rounded(px(4.))
-                .cursor_pointer()
-                .when(active, |style| style.bg(theme::color(theme::palette().accent_soft)).text_color(theme::color(theme::palette().ui_text)))
-                .when(!active, |style| style.text_color(theme::color(theme::palette().ui_muted)).hover(|style| style.bg(theme::color(theme::palette().panel))))
-                .on_click(cx.listener(move |this, _, window, cx| this.switch_tab(target, window, cx)))
-                .child(label)
-        };
-        #[cfg(feature = "collab")]
-        let join = Some(button("hub-join", "Join live session…", false, cx, |_, _, cx| cx.emit(HomeEvent::JoinSession)).into_any_element());
-        #[cfg(not(feature = "collab"))]
-        let join: Option<gpui::AnyElement> = None;
-        div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(px(8.))
-            .child(tab("hub-tab-projects", "Projects", HubTab::Projects, cx))
-            .child(tab("hub-tab-templates", "Templates", HubTab::Templates, cx))
+            .child(item("hub-nav-projects", "folder", "Projects", HubPage::Projects, cx))
+            .child(item("hub-nav-templates", "book", "Templates", HubPage::Templates, cx))
+            .child(item("hub-nav-tools", "wrench", "Writing tools", HubPage::Tools, cx))
+            .child(item("hub-nav-help", "help", "Help", HubPage::Help, cx))
             .child(div().flex_1())
             .children(join)
-            .child(button("hub-import", "Import folder as template…", false, cx, |this, window, cx| this.prompt_import_template(window, cx)))
-            .child(button("hub-open", "Open folder…", false, cx, |this, _, cx| this.prompt_open_folder(cx)))
-            .child(button("hub-new", "New project", true, cx, |this, window, cx| this.open_new_project(0, window, cx)))
     }
 
     fn render_search(&self) -> impl IntoElement {
@@ -655,9 +871,10 @@ impl HomeView {
             .flex_none()
             .items_center()
             .gap(px(8.))
+            .w(px(260.))
             .h(px(32.))
-            .px(px(8.))
-            .rounded(px(4.))
+            .px(px(10.))
+            .rounded(px(theme::RADIUS_MD))
             .bg(theme::color(theme::palette().panel))
             .border_1()
             .border_color(theme::color(theme::palette().divider))
@@ -665,16 +882,295 @@ impl HomeView {
             .child(div().flex_1().min_w_0().h(px(FIELD_HEIGHT)).overflow_hidden().child(self.search.clone()))
     }
 
-    fn render_projects(&self, cx: &mut Context<Self>) -> AnyElement {
-        let visible = self.visible_projects(cx);
-        if visible.is_empty() {
-            let text = if self.registry.projects.is_empty() {
-                "No projects yet. Make a new one, or open a folder you already have."
-            } else {
-                "No project matches the search."
-            };
-            return empty_note(text).into_any_element();
+    fn render_header(&self, title: &'static str, controls: Vec<AnyElement>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(10.))
+            .child(div().flex_1().text_size(px(theme::TITLE_FONT_SIZE)).font_weight(FontWeight::SEMIBOLD).child(title))
+            .children(controls)
+    }
+
+    fn render_view_switch(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = theme::palette();
+        let option = |id: &'static str, icon: &'static str, cards: bool, cx: &mut Context<Self>| {
+            let active = self.cards == cards;
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(28.))
+                .rounded(px(theme::RADIUS_SM))
+                .cursor_pointer()
+                .when(active, |style| style.bg(theme::color(palette.accent_soft)))
+                .when(!active, |style| style.hover(|style| style.bg(theme::color(palette.divider))))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.cards = cards;
+                    this.selected = 0;
+                    cx.emit(HomeEvent::CardsChanged(cards));
+                    cx.notify();
+                }))
+                .child(svg().path(format!("icons/{icon}.svg")).size(px(16.)).text_color(theme::color(if active { palette.ui_text } else { palette.ui_muted })))
+        };
+        div()
+            .flex()
+            .flex_none()
+            .p(px(2.))
+            .gap(px(2.))
+            .rounded(px(theme::RADIUS_MD))
+            .border_1()
+            .border_color(theme::color(palette.divider))
+            .child(option("hub-view-cards", "grid", true, cx))
+            .child(option("hub-view-list", "list", false, cx))
+    }
+
+    /// A large choice with an icon, a title and one line on what it does.
+    fn action_card(
+        &self,
+        id: &'static str,
+        icon: &'static str,
+        title: &'static str,
+        text: &'static str,
+        cx: &mut Context<Self>,
+        handler: impl Fn(&mut HomeView, &mut Window, &mut Context<HomeView>) + 'static,
+    ) -> impl IntoElement {
+        let palette = theme::palette();
+        div()
+            .id(id)
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .gap(px(10.))
+            .p(px(16.))
+            .rounded(px(theme::RADIUS_LG))
+            .cursor_pointer()
+            .bg(theme::color(palette.panel))
+            .border_1()
+            .border_color(theme::color(palette.divider))
+            .hover(|style| style.border_color(theme::color(palette.accent)))
+            .on_click(cx.listener(move |this, _, window, cx| handler(this, window, cx)))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(36.))
+                    .rounded(px(theme::RADIUS_MD))
+                    .bg(theme::color(palette.accent_soft))
+                    .child(svg().path(format!("icons/{icon}.svg")).size(px(20.)).text_color(theme::color(palette.ui_text))),
+            )
+            .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+            .child(div().text_color(theme::color(palette.ui_muted)).child(text))
+    }
+
+    fn render_start(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (latex, typst) = (self.template_named("Empty LaTeX"), self.template_named("Empty Typst"));
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .gap(px(10.))
+            .child(section_title("Start something new"))
+            .child(
+                div()
+                    .flex()
+                    .gap(px(12.))
+                    .child(self.action_card("hub-start-latex", "file-tex", "Blank LaTeX", "An empty article, like a new Overleaf project.", cx, move |this, window, cx| {
+                        this.open_new_project(latex, window, cx)
+                    }))
+                    .child(self.action_card("hub-start-typst", "file-typ", "Blank Typst", "A short document in the newer Typst language.", cx, move |this, window, cx| {
+                        this.open_new_project(typst, window, cx)
+                    }))
+                    .child(self.action_card("hub-start-paste", "clipboard", "Paste from Claude", "Copied LaTeX or Typst becomes a new project.", cx, |this, window, cx| {
+                        this.paste_project(window, cx)
+                    }))
+                    .child(self.action_card("hub-start-open", "folder", "Open folder", "A project you already have on this Mac.", cx, |this, _, cx| {
+                        this.prompt_open_folder(cx)
+                    })),
+            )
+    }
+
+    fn render_projects_page(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let search = self.render_search().into_any_element();
+        let switch = self.render_view_switch(cx).into_any_element();
+        let mut elements = vec![
+            self.render_header("Projects", vec![search, switch]).into_any_element(),
+            self.render_start(cx).into_any_element(),
+        ];
+        if let Some(message) = self.message.clone() {
+            elements.push(div().text_color(theme::color(theme::palette().ui_muted)).child(message).into_any_element());
         }
+        let visible = self.visible_projects(cx);
+        if self.registry.projects.is_empty() {
+            elements.push(empty_state("folder", "Your projects will appear here", "Start with one of the choices above, or open a folder you already have.").into_any_element());
+            return elements;
+        }
+        elements.push(section_title(format!("Recent · {}", visible.len())).into_any_element());
+        if visible.is_empty() {
+            elements.push(empty_note("No project matches the search.").into_any_element());
+        } else if self.cards {
+            elements.push(self.render_project_cards(&visible, cx));
+        } else {
+            elements.push(self.render_project_rows(&visible, cx));
+        }
+        elements
+    }
+
+    fn render_project_cards(&self, visible: &[usize], cx: &mut Context<Self>) -> AnyElement {
+        let palette = theme::palette();
+        let now = projects::now();
+        let cards = visible.iter().enumerate().map(|(position, &index)| {
+            let entry = &self.registry.projects[index];
+            let path = entry.path.clone();
+            let exists = path.is_dir();
+            let selected = position == self.selected;
+            let language = self.languages.get(&path).copied().filter(|_| exists);
+            let renaming = self.rename.as_ref().filter(|rename| rename.target == RenameTarget::Project(path.clone()));
+            let title: AnyElement = match renaming {
+                Some(rename) => field_box(&rename.field).into_any_element(),
+                None => div().truncate().font_weight(FontWeight::SEMIBOLD).child(entry.title.clone()).into_any_element(),
+            };
+            let preview: AnyElement = match self.thumbnails.get(&path) {
+                Some(Thumbnail::Ready(image, _)) => img(image.clone()).size_full().object_fit(ObjectFit::Cover).into_any_element(),
+                _ => {
+                    let icon = match language {
+                        Some(TemplateLanguage::Typst) => "file-typ",
+                        Some(TemplateLanguage::Latex) => "file-tex",
+                        _ => "folder",
+                    };
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size_full()
+                        .child(svg().path(format!("icons/{icon}.svg")).size(px(40.)).text_color(theme::color(palette.ui_muted)))
+                        .into_any_element()
+                }
+            };
+            let menu_open = self.card_menu.as_ref() == Some(&path);
+            let (open_path, menu_path) = (path.clone(), path.clone());
+            let menu = menu_open.then(|| self.render_card_menu(index, &path, &entry.title, exists, cx));
+            div()
+                .id(("hub-card", index))
+                .relative()
+                .flex()
+                .flex_col()
+                .flex_none()
+                .w(px(CARD_WIDTH))
+                .rounded(px(theme::RADIUS_LG))
+                .cursor_pointer()
+                .bg(theme::color(palette.panel))
+                .border_2()
+                .border_color(theme::color(if selected { palette.accent } else { palette.divider }))
+                .when(!selected, |style| style.hover(|style| style.border_color(theme::color(palette.ui_muted))))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if this.rename.is_none() {
+                        this.open_project(open_path.clone(), cx);
+                    }
+                }))
+                .child(
+                    div()
+                        .h(px(THUMBNAIL_HEIGHT))
+                        .w_full()
+                        .overflow_hidden()
+                        .rounded_t(px(theme::RADIUS_LG - 2.))
+                        .bg(theme::color(if self.thumbnails.contains_key(&path) && matches!(self.thumbnails.get(&path), Some(Thumbnail::Ready(..))) {
+                            0xffffffff
+                        } else {
+                            palette.bg
+                        }))
+                        .when(!exists, |style| style.opacity(0.4))
+                        .child(preview),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.))
+                        .p(px(12.))
+                        .border_t_1()
+                        .border_color(theme::color(palette.divider))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .child(div().flex_1().min_w_0().child(title))
+                                .child(
+                                    div()
+                                        .id(("hub-card-menu", index))
+                                        .flex_none()
+                                        .p(px(2.))
+                                        .rounded(px(theme::RADIUS_SM))
+                                        .hover(|style| style.bg(theme::color(palette.divider)))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.card_menu = if this.card_menu.as_ref() == Some(&menu_path) { None } else { Some(menu_path.clone()) };
+                                            cx.notify();
+                                        }))
+                                        .child(svg().path("icons/dots.svg").size(px(16.)).text_color(theme::color(palette.ui_muted))),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .text_color(theme::color(palette.ui_muted))
+                                .children(language.map(badge))
+                                .child(if exists { projects::ago(now, entry.last_opened) } else { "Folder not found".to_string() }),
+                        ),
+                )
+                .children(menu)
+        });
+        div().flex().flex_wrap().gap(px(CARD_GAP)).children(cards).into_any_element()
+    }
+
+    fn render_card_menu(&self, index: usize, path: &Path, title: &str, exists: bool, cx: &mut Context<Self>) -> AnyElement {
+        let palette = theme::palette();
+        let (rename_path, template_path, reveal_path, remove_path) = (path.to_path_buf(), path.to_path_buf(), path.to_path_buf(), path.to_path_buf());
+        let current_title = title.to_string();
+        div()
+            .id(("hub-card-menu-list", index))
+            .absolute()
+            .right(px(8.))
+            .bottom(px(44.))
+            .flex()
+            .flex_col()
+            .min_w(px(180.))
+            .p(px(4.))
+            .rounded(px(theme::RADIUS_MD))
+            .bg(theme::color(palette.panel))
+            .border_1()
+            .border_color(theme::color(palette.divider))
+            .shadow_lg()
+            .occlude()
+            .when(exists, |element| {
+                element
+                    .child(menu_item(("hub-card-rename", index), "Rename", cx, move |this, window, cx| {
+                        this.card_menu = None;
+                        this.start_rename(RenameTarget::Project(rename_path.clone()), &current_title, window, cx);
+                    }))
+                    .child(menu_item(("hub-card-template", index), "Save as template…", cx, move |this, window, cx| {
+                        this.card_menu = None;
+                        this.open_save_template(template_path.clone(), window, cx);
+                    }))
+                    .child(menu_item(("hub-card-reveal", index), "Show in Finder", cx, move |this, _, cx| {
+                        this.card_menu = None;
+                        cx.reveal_path(&reveal_path);
+                    }))
+            })
+            .child(menu_item(("hub-card-remove", index), "Remove…", cx, move |this, window, cx| {
+                this.card_menu = None;
+                this.remove_project(remove_path.clone(), window, cx);
+            }))
+            .into_any_element()
+    }
+
+    fn render_project_rows(&self, visible: &[usize], cx: &mut Context<Self>) -> AnyElement {
         let now = projects::now();
         let header = div()
             .flex()
@@ -689,7 +1185,7 @@ impl HomeView {
             .child(div().flex_1().child("Location"))
             .child(div().w(px(110.)).child("Last opened"))
             .child(div().w(px(250.)));
-        let rows = visible.into_iter().enumerate().map(|(position, index)| {
+        let rows = visible.iter().enumerate().map(|(position, &index)| {
             let entry = &self.registry.projects[index];
             let path = entry.path.clone();
             let exists = path.is_dir();
@@ -710,7 +1206,7 @@ impl HomeView {
                 .gap(px(12.))
                 .h(px(ROW_HEIGHT))
                 .px(px(10.))
-                .rounded(px(4.))
+                .rounded(px(theme::RADIUS_MD))
                 .cursor_pointer()
                 .when(selected, |style| style.bg(theme::color(theme::palette().accent_soft)))
                 .when(!selected, |style| style.hover(|style| style.bg(theme::color(theme::palette().panel))))
@@ -754,12 +1250,26 @@ impl HomeView {
         div().flex().flex_col().child(header).children(rows).into_any_element()
     }
 
-    fn render_templates(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_templates_page(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let palette = theme::palette();
+        let search = self.render_search().into_any_element();
+        let import = button("hub-import", "Import folder as template…", false, cx, |this, window, cx| this.prompt_import_template(window, cx)).into_any_element();
+        let mut elements = vec![
+            self.render_header("Templates", vec![search, import]).into_any_element(),
+            div()
+                .text_color(theme::color(palette.ui_muted))
+                .child("A template is a project to start from. Save any project as one from its \u{2026} menu.")
+                .into_any_element(),
+        ];
+        if let Some(message) = self.message.clone() {
+            elements.push(div().text_color(theme::color(palette.ui_muted)).child(message).into_any_element());
+        }
         let visible = self.visible_templates(cx);
         if visible.is_empty() {
-            return empty_note("No template matches the search.").into_any_element();
+            elements.push(empty_note("No template matches the search.").into_any_element());
+            return elements;
         }
-        let rows = visible.into_iter().enumerate().map(|(position, index)| {
+        let cards = visible.into_iter().enumerate().map(|(position, index)| {
             let template = &self.templates[index];
             let selected = position == self.selected;
             let folder = match &template.source {
@@ -771,42 +1281,51 @@ impl HomeView {
                 .and_then(|dir| self.rename.as_ref().filter(|rename| rename.target == RenameTarget::Template(dir.clone())));
             let name: AnyElement = match renaming {
                 Some(rename) => field_box(&rename.field).into_any_element(),
-                None => div().truncate().font_weight(FontWeight::MEDIUM).child(template.name.clone()).into_any_element(),
+                None => div().truncate().font_weight(FontWeight::SEMIBOLD).child(template.name.clone()).into_any_element(),
             };
             let description = if template.description.is_empty() { "No description." } else { template.description.as_str() };
+            let icon = match template.language {
+                TemplateLanguage::Latex => "file-tex",
+                TemplateLanguage::Typst => "file-typ",
+                TemplateLanguage::Other => "folder",
+            };
             let current_name = template.name.clone();
             div()
                 .id(("hub-template", index))
                 .flex()
+                .flex_col()
                 .flex_none()
-                .items_center()
-                .gap(px(12.))
-                .h(px(ROW_HEIGHT))
-                .px(px(10.))
-                .rounded(px(4.))
+                .gap(px(8.))
+                .w(px(CARD_WIDTH))
+                .p(px(14.))
+                .rounded(px(theme::RADIUS_LG))
                 .cursor_pointer()
-                .when(selected, |style| style.bg(theme::color(theme::palette().accent_soft)))
-                .when(!selected, |style| style.hover(|style| style.bg(theme::color(theme::palette().panel))))
+                .bg(theme::color(palette.panel))
+                .border_2()
+                .border_color(theme::color(if selected { palette.accent } else { palette.divider }))
+                .when(!selected, |style| style.hover(|style| style.border_color(theme::color(palette.ui_muted))))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     if this.rename.is_none() {
                         this.open_new_project(index, window, cx);
                     }
                 }))
-                .child(div().w(px(240.)).min_w_0().child(name))
-                .child(div().w(px(64.)).child(badge(template.language)))
-                .child(div().flex_1().min_w_0().truncate().text_color(theme::color(theme::palette().ui_muted)).child(description.to_string()))
                 .child(
                     div()
                         .flex()
-                        .w(px(300.))
-                        .justify_end()
+                        .items_center()
+                        .justify_between()
+                        .child(svg().path(format!("icons/{icon}.svg")).size(px(24.)).text_color(theme::color(palette.accent)))
+                        .child(badge(template.language)),
+                )
+                .child(name)
+                .child(div().h(px(36.)).overflow_hidden().text_color(theme::color(palette.ui_muted)).child(description.to_string()))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
                         .gap(px(2.))
-                        .child(link(("hub-use", index), "New project from it", cx, move |this, window, cx| {
-                            this.open_new_project(index, window, cx);
-                        }))
-                        .when_none(&folder, |element| {
-                            element.child(div().px(px(6.)).text_color(theme::color(theme::palette().ui_muted)).child("Built-in"))
-                        })
+                        .child(div().flex_1().text_color(theme::color(palette.accent)).font_weight(FontWeight::SEMIBOLD).child("Use"))
+                        .when_none(&folder, |element| element.child(div().text_color(theme::color(palette.ui_muted)).child("Built-in")))
                         .when_some(folder.clone(), |element, dir| {
                             let (rename_dir, reveal_dir, delete_dir) = (dir.clone(), dir.clone(), dir);
                             let delete_name = current_name.clone();
@@ -814,19 +1333,65 @@ impl HomeView {
                                 .child(link(("hub-template-rename", index), "Rename", cx, move |this, window, cx| {
                                     this.start_rename(RenameTarget::Template(rename_dir.clone()), &current_name, window, cx);
                                 }))
-                                .child(link(("hub-template-reveal", index), "Show in Finder", cx, move |_, _, cx| cx.reveal_path(&reveal_dir)))
+                                .child(link(("hub-template-reveal", index), "Show", cx, move |_, _, cx| cx.reveal_path(&reveal_dir)))
                                 .child(link(("hub-template-delete", index), "Delete…", cx, move |this, window, cx| {
                                     this.delete_template(delete_dir.clone(), delete_name.clone(), window, cx);
                                 }))
                         }),
                 )
         });
-        div().flex().flex_col().children(rows).into_any_element()
+        elements.push(div().flex().flex_wrap().gap(px(CARD_GAP)).children(cards).into_any_element());
+        elements
+    }
+
+    fn render_tools_page(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let palette = theme::palette();
+        let setup = button("hub-run-setup", "Run setup again", false, cx, |_, _, cx| cx.emit(HomeEvent::RunSetup)).into_any_element();
+        vec![
+            self.render_header("Writing tools", vec![setup]).into_any_element(),
+            div()
+                .text_color(theme::color(palette.ui_muted))
+                .child("A compiler turns what you write into a PDF. You need the one for the language you write in. Overleaf has these on its servers, here they live on your Mac.")
+                .into_any_element(),
+            div().children(toolchain::installer_choice(&self.toolchain, cx)).into_any_element(),
+            div()
+                .flex()
+                .flex_col()
+                .px(px(16.))
+                .py(px(4.))
+                .rounded(px(theme::RADIUS_LG))
+                .bg(theme::color(palette.panel))
+                .border_1()
+                .border_color(theme::color(palette.divider))
+                .children(toolchain::tool_rows(&self.toolchain, &Tool::ALL, cx))
+                .into_any_element(),
+            div().text_size(px(11.)).text_color(theme::color(palette.ui_muted)).child(toolchain::promise(&self.toolchain, cx)).into_any_element(),
+        ]
+    }
+
+    fn render_help_page(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        vec![
+            self.render_header("Help", Vec::new()).into_any_element(),
+            div()
+                .flex()
+                .gap(px(12.))
+                .child(self.action_card("hub-help-tour", "play", "Take the editor tour", "A short walk through the editor, one part at a time.", cx, |_, _, cx| {
+                    cx.emit(HomeEvent::StartTour)
+                }))
+                .child(self.action_card("hub-help-keys", "vim", "Keyboard shortcuts", "Every key the editor knows.", cx, |_, _, cx| cx.emit(HomeEvent::ShowShortcuts)))
+                .child(self.action_card("hub-help-tools", "wrench", "Set up again", "Choose LaTeX, Typst or both and install what is missing.", cx, |_, _, cx| {
+                    cx.emit(HomeEvent::RunSetup)
+                }))
+                .child(self.action_card("hub-help-command", "folder", "Terminal command", "Type editor . in Terminal to open a folder here.", cx, |_, _, cx| {
+                    cx.emit(HomeEvent::InstallCommand)
+                }))
+                .into_any_element(),
+        ]
     }
 
     fn render_dialog(&self, dialog: &HubDialog, cx: &mut Context<Self>) -> impl IntoElement {
         let (title, body, error, busy, confirm): (&str, AnyElement, Option<&String>, bool, &str) = match dialog {
-            HubDialog::NewProject { name, location, template, error, busy } => {
+            HubDialog::NewProject { name, location, template, pasted, error, busy } => {
                 let entries: Vec<(TemplateLanguage, String, String)> =
                     self.templates.iter().map(|entry| (entry.language, entry.name.clone(), entry.description.clone())).collect();
                 let templates: Vec<AnyElement> = entries.into_iter().enumerate().map(|(index, (language, name, description))| {
@@ -868,10 +1433,41 @@ impl HomeView {
                             .child(div().flex_1().min_w_0().truncate().child(projects::tilde(&location.join(field_text(name, cx).trim()))))
                             .child(button("hub-browse", "Browse…", false, cx, |this, _, cx| this.browse_location(cx))),
                     )
-                    .child(label("Template"))
-                    .child(div().id("hub-dialog-templates").flex().flex_col().max_h(px(260.)).overflow_y_scroll().children(templates))
+                    .when(pasted.is_none(), |element| {
+                        element
+                            .child(label("Template"))
+                            .child(div().id("hub-dialog-templates").flex().flex_col().max_h(px(260.)).overflow_y_scroll().children(templates))
+                    })
+                    .when_some(pasted.as_ref(), |element, (language, text)| {
+                        let lines = text.lines().count();
+                        let preview: String = text.lines().take(8).collect::<Vec<_>>().join("\n");
+                        element
+                            .child(label("From the clipboard"))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .text_color(theme::color(theme::palette().ui_muted))
+                                    .child(badge(*language))
+                                    .child(format!("{lines} lines become {}", if *language == TemplateLanguage::Typst { "main.typ" } else { "main.tex" })),
+                            )
+                            .child(
+                                div()
+                                    .max_h(px(150.))
+                                    .overflow_hidden()
+                                    .p(px(8.))
+                                    .rounded(px(theme::RADIUS_SM))
+                                    .bg(theme::color(theme::palette().bg))
+                                    .font_family(theme::code_font())
+                                    .text_size(px(theme::code_font_size()))
+                                    .text_color(theme::color(theme::palette().ui_muted))
+                                    .child(preview),
+                            )
+                    })
                     .into_any_element();
-                ("New project", body, error.as_ref(), *busy, "Create")
+                let title = if pasted.is_some() { "New project from the clipboard" } else { "New project" };
+                (title, body, error.as_ref(), *busy, "Create")
             }
             HubDialog::SaveTemplate { from, language, name, description, error, busy } => {
                 let body = div()
@@ -918,13 +1514,13 @@ impl HomeView {
                     .flex_col()
                     .gap(px(10.))
                     .w(px(560.))
-                    .p(px(16.))
-                    .rounded(px(6.))
+                    .p(px(20.))
+                    .rounded(px(theme::RADIUS_LG))
                     .bg(theme::color(theme::palette().panel))
                     .border_1()
                     .border_color(theme::color(theme::palette().divider))
                     .shadow_lg()
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+                    .child(div().text_size(px(17.)).font_weight(FontWeight::SEMIBOLD).child(title))
                     .child(body)
                     .when_some(error.cloned(), |element, error| {
                         element.child(div().text_color(theme::color(theme::palette().error)).child(error))
@@ -945,9 +1541,13 @@ impl HomeView {
 
 impl Render for HomeView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let list = match self.tab {
-            HubTab::Projects => self.render_projects(cx),
-            HubTab::Templates => self.render_templates(cx),
+        let available = (window.viewport_size().width.to_f64() as f32 - SIDEBAR_WIDTH - 2. * CONTENT_PADDING).min(CONTENT_WIDTH);
+        self.columns = (((available + CARD_GAP) / (CARD_WIDTH + CARD_GAP)).floor() as usize).max(1);
+        let content = match self.page {
+            HubPage::Projects => self.render_projects_page(cx),
+            HubPage::Templates => self.render_templates_page(cx),
+            HubPage::Tools => self.render_tools_page(cx),
+            HubPage::Help => self.render_help_page(cx),
         };
         let dialog = self.dialog.as_ref().map(|dialog| self.render_dialog(dialog, cx).into_any_element());
         // A click on the empty hub must not leave the keys nowhere.
@@ -964,25 +1564,33 @@ impl Render for HomeView {
             .bg(theme::color(theme::palette().bg))
             .text_color(theme::color(theme::palette().ui_text))
             .text_size(px(theme::UI_FONT_SIZE))
+            .when_some(theme::look().ui_font, |root, font| root.font_family(font))
+            .on_click(cx.listener(|this, _, _, cx| {
+                if this.card_menu.take().is_some() {
+                    cx.notify();
+                }
+            }))
             .child(self.render_band(cx))
             .child(
-                div().flex().flex_1().min_h_0().justify_center().child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(12.))
-                        .w_full()
-                        .max_w(px(CONTENT_WIDTH))
-                        .h_full()
-                        .px(px(24.))
-                        .pt(px(20.))
-                        .child(self.render_toolbar(cx))
-                        .child(self.render_search())
-                        .when_some(self.message.clone(), |element, message| {
-                            element.child(div().text_color(theme::color(theme::palette().ui_muted)).child(message))
-                        })
-                        .child(div().id("hub-list").flex_1().min_h_0().overflow_y_scroll().pb(px(20.)).child(list)),
-                ),
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.render_sidebar(cx))
+                    .child(
+                        div().id("hub-content").flex().flex_1().min_w_0().justify_center().overflow_y_scroll().child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(24.))
+                                .w_full()
+                                .max_w(px(CONTENT_WIDTH + 2. * CONTENT_PADDING))
+                                .px(px(CONTENT_PADDING))
+                                .pt(px(24.))
+                                .pb(px(40.))
+                                .children(content),
+                        ),
+                    ),
             )
             .children(dialog)
     }
@@ -1014,6 +1622,48 @@ fn field_box(field: &Entity<EditorView>) -> impl IntoElement {
 
 fn label(text: &'static str) -> impl IntoElement {
     div().pt(px(4.)).text_color(theme::color(theme::palette().ui_muted)).child(text)
+}
+
+fn section_title(text: impl Into<SharedString>) -> impl IntoElement {
+    div().text_size(px(11.)).font_weight(FontWeight::SEMIBOLD).text_color(theme::color(theme::palette().ui_muted)).child(text.into().to_uppercase())
+}
+
+/// What an empty page shows, with room to breathe so that it reads as a start
+/// rather than as a fault.
+fn empty_state(icon: &'static str, title: &'static str, text: &'static str) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(8.))
+        .py(px(48.))
+        .rounded(px(theme::RADIUS_LG))
+        .border_1()
+        .border_dashed()
+        .border_color(theme::color(theme::palette().divider))
+        .child(svg().path(format!("icons/{icon}.svg")).size(px(40.)).text_color(theme::color(theme::palette().ui_muted)))
+        .child(div().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).child(title))
+        .child(div().text_color(theme::color(theme::palette().ui_muted)).child(text))
+}
+
+fn menu_item(
+    id: impl Into<gpui::ElementId>,
+    text: &'static str,
+    cx: &mut Context<HomeView>,
+    handler: impl Fn(&mut HomeView, &mut Window, &mut Context<HomeView>) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .px(px(10.))
+        .py(px(6.))
+        .rounded(px(theme::RADIUS_SM))
+        .cursor_pointer()
+        .hover(|style| style.bg(theme::color(theme::palette().accent_soft)))
+        .on_click(cx.listener(move |this, _, window, cx| {
+            cx.stop_propagation();
+            handler(this, window, cx);
+        }))
+        .child(text)
 }
 
 fn empty_note(text: &'static str) -> impl IntoElement {
@@ -1050,10 +1700,11 @@ fn button(
     div()
         .id(id)
         .flex_none()
-        .px(px(10.))
-        .py(px(4.))
-        .rounded(px(4.))
+        .px(px(12.))
+        .py(px(6.))
+        .rounded(px(theme::RADIUS_MD))
         .cursor_pointer()
+        .font_weight(FontWeight::MEDIUM)
         .when(primary, |style| style.bg(theme::color(palette.accent)).text_color(theme::color(palette.on_accent)))
         .when(!primary, |style| style.bg(theme::color(palette.divider)).hover(|style| style.bg(theme::color(palette.accent_soft))))
         .on_click(cx.listener(move |this, _, window, cx| {

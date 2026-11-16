@@ -86,6 +86,7 @@ actions!(
         LayoutPdfTab,
         ToggleFocusMode,
         ToggleHub,
+        StartTour,
         OpenGitPanel,
         StartPresentation,
         ExitPresentation,

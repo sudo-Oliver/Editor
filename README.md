@@ -3,9 +3,37 @@
 A native, local alternative to Overleaf for Typst, LaTeX and Markdown, written in Rust with GPUI.
 The editor, the compilers and the PDF preview all run on your machine.
 
-## Setup
+## Install
 
-The app calls external compilers. Install the ones you need:
+Download `Editor-<version>.dmg` from the [releases](https://github.com/sudo-Oliver/Editor/releases), open it and drag Editor into Applications.
+It runs on Apple silicon and Intel Macs with macOS 11 or later.
+With Homebrew, `brew install --cask sudo-oliver/tap/editor` does the same and adds the `editor` command.
+
+Files open from Finder (Open With, or drag them onto the Dock icon), and from the terminal like VS Code's `code`:
+
+```sh
+editor .            # this folder as a project
+editor main.tex     # the file, in the project it belongs to
+```
+
+Without Homebrew's cask, Help, "Add editor command for Terminal…" adds the command.
+
+On the first start, a short setup asks whether you write LaTeX, Typst or both, and installs what turns your text into a PDF.
+Nothing else is needed: no Homebrew, no terminal and no admin password.
+The tools go into the app's own folder (`~/.config/editor/tools`), are checked against a fingerprint before use, and can be removed under Writing tools.
+If you have Homebrew, the setup offers to install them with it instead (`brew install tectonic`, `brew install typst`), and that is the default.
+If you already have MacTeX or Typst, the setup sees them and the app uses them.
+Then a welcome document opens and a tour shows each part of the editor. Help, Editor tour plays it again.
+
+## Building a release
+
+`scripts/bundle-macos.sh` builds `target/bundle/Editor.app` for both architectures and packs it into a dmg.
+Without signing details it signs ad hoc, which is enough for your own Mac.
+A release needs an Apple Developer ID; the script header lists the environment variables, and `.github/workflows/release.yml` reads them from repository secrets when a `v*` tag is pushed.
+
+## Setup for development
+
+The app calls external compilers. Install the ones you need, or let the app install Typst and Tectonic for you:
 
 - Typst: `typst`
 - LaTeX: a TeX distribution with `latexmk` and `pdflatex` or `lualatex`, or `tectonic`
