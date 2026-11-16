@@ -23,7 +23,7 @@ use editor_core::{
 use gpui::{
     AnyElement, Anchor, App, AsyncWindowContext, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Entity, FocusHandle, Focusable, FontWeight, Keystroke,
     KeystrokeEvent, MouseButton, MouseDownEvent, MouseMoveEvent, PathPromptOptions, Pixels, Point, Render, ScrollHandle, ScrollStrategy, SharedString, UniformListScrollHandle,
-    EntityId, PromptLevel, Subscription, Task, WeakEntity, Window, anchored, black, canvas, deferred, div, fill, point, prelude::*, px, size, uniform_list, svg,
+    EntityId, ListAlignment, ListState, PromptLevel, StyleRefinement, Subscription, Task, WeakEntity, Window, anchored, black, canvas, deferred, div, fill, list, point, prelude::*, px, size, uniform_list, svg,
 };
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use synctex::SyncTex;
@@ -40,7 +40,7 @@ use crate::{
     file_tree::{self, TreeEntry},
     git_panel::{self, GitPanel, GitPanelEvent},
     home_view::{HomeEvent, HomeView},
-    outline::{self, LINE as OUTLINE_LINE, OutlineItem, PILL as OUTLINE_PILL, SPINE as OUTLINE_SPINE},
+    outline::{self, OutlineItem},
     image_view::{ImageView, ImageViewEvent, include_snippet, is_image, relative_path},
     pdf_view::{PdfView, PdfViewEvent, ZOOM_STEP},
     nvim_themes, package_commands,
@@ -421,6 +421,11 @@ pub struct Workspace {
     documents: Vec<OpenDocument>,
     active: Option<usize>,
     outline: Vec<OutlineItem>,
+    /// The outline items shown, without what collapsed chapters hide.
+    outline_rows: RefCell<Vec<usize>>,
+    /// The headings that lead to the cursor, as of the last frame.
+    outline_trail: RefCell<Vec<usize>>,
+    outline_list: ListState,
     outline_version: (usize, u64),
     /// The active document and the number of documents when the active view last
     /// got the names of the others.
@@ -669,6 +674,9 @@ impl Workspace {
             documents: Vec::new(),
             active: None,
             outline: Vec::new(),
+            outline_rows: RefCell::default(),
+            outline_trail: RefCell::default(),
+            outline_list: ListState::new(0, ListAlignment::Top, px(200.)),
             outline_version: (usize::MAX, 0),
             symbols_version: (usize::MAX, 0),
             package_hints: Vec::new(),
@@ -797,7 +805,7 @@ impl Workspace {
                 let (vim_mode, cards) = (workspace.settings.vim_mode, workspace.settings.hub_cards);
                 cx.defer_in(window, move |_, window, cx| {
                     home.update(cx, |home, cx| {
-                        home.set_context(false, vim_mode, cards);
+                        home.set_context(false, vim_mode, cards, cx);
                         home.show(window, cx);
                     })
                 });
@@ -865,7 +873,7 @@ impl Workspace {
         self.show_hub = true;
         let (has_project, vim_mode, cards) = (self.root.is_some(), self.settings.vim_mode, self.settings.hub_cards);
         self.home.update(cx, |home, cx| {
-            home.set_context(has_project, vim_mode, cards);
+            home.set_context(has_project, vim_mode, cards, cx);
             home.show(window, cx);
         });
         cx.notify();
@@ -917,7 +925,7 @@ impl Workspace {
             entry.panel.update(cx, |panel, cx| panel.set_root(None, cx));
         }
         let (vim_mode, cards) = (self.settings.vim_mode, self.settings.hub_cards);
-        self.home.update(cx, |home, _| home.set_context(false, vim_mode, cards));
+        self.home.update(cx, |home, cx| home.set_context(false, vim_mode, cards, cx));
         cx.notify();
     }
 
@@ -945,7 +953,7 @@ impl Workspace {
         let (vim_mode, cards) = (self.settings.vim_mode, self.settings.hub_cards);
         self.home.update(cx, |home, cx| {
             home.touch(&root, cx);
-            home.set_context(true, vim_mode, cards);
+            home.set_context(true, vim_mode, cards, cx);
         });
         self.git_panel.update(cx, |panel, cx| panel.set_root(Some(root.clone()), cx));
         self.tracked_edits.clear();
@@ -2602,6 +2610,8 @@ impl Workspace {
             for document in &self.documents {
                 document.view.update(cx, |view, cx| view.forget_layout(cx));
             }
+            // Cached views draw again only when told.
+            cx.refresh_windows();
         }
         if let Some(path) = &self.settings_path
             && let Err(error) = self.settings.save(path)
@@ -5171,150 +5181,51 @@ impl Workspace {
             .collect()
     }
 
+    /// The outline as a list that builds only the rows on screen, since a book
+    /// has hundreds of headings, figures and tables.
     fn render_outline(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let palette = theme::palette();
         let cursor_line = match self.active_tab() {
             Some(Tab::Document(index)) => Some(self.documents[index].view.read(cx).cursor_position().0 - 1),
             _ => None,
         };
-        let trail = cursor_line.map_or_else(Vec::new, |line| heading_trail(&self.outline, line));
-        let here = trail.last().copied();
-        let rows = outline::visible(&self.outline).map(|(index, item)| {
-            let line = item.line;
-            let label = outline::marker_element(item, theme::color(palette.ui_muted));
-            let row = div()
-                .id(index)
-                .relative()
-                .w_full()
-                .flex()
-                .cursor_pointer()
-                .hover(|style| style.bg(theme::color(palette.divider).opacity(0.35)))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    if let Some(view) = this.active_view() {
-                        view.update(cx, |view, cx| view.go_to_line(line, 0, window, cx));
-                    }
-                }));
-            if item.depth == 0 {
-                // The pill sits on a line across the panel and folds the chapter.
-                let in_trail = trail.first() == Some(&index);
-                let pill = div()
-                    .id(("outline-toggle", index))
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .justify_center()
-                    .w(px(OUTLINE_PILL))
-                    .h(px(20.))
-                    .rounded_full()
-                    .bg(theme::color(palette.panel))
-                    .text_size(px(11.))
-                    .font_weight(FontWeight::MEDIUM)
-                    .map(|pill| {
-                        if item.collapsed {
-                            pill.border_1().border_color(theme::color(palette.accent)).text_color(theme::color(palette.ui_text))
-                        } else {
-                            let ink = theme::color(palette.accent).opacity(if in_trail { 1. } else { 0.6 });
-                            pill.bg(ink).text_color(theme::color(palette.on_accent))
-                        }
-                    })
-                    .when(item.has_children, |pill| {
-                        pill.on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.outline[index].collapsed ^= true;
-                            cx.notify();
-                        }))
-                    })
-                    .child(outline::marker_element(item, theme::color(palette.on_accent)));
-                return row
-                    .h(px(44.))
-                    .items_center()
-                    .pl(px(OUTLINE_SPINE - OUTLINE_PILL / 2.))
-                    .pr(px(12.))
-                    .child(div().absolute().left_0().right_0().top(px(22.)).h(px(1.)).bg(theme::color(palette.divider)))
-                    .child(pill)
-                    .child(
-                        div()
-                            .relative()
-                            .min_w_0()
-                            .ml(px(6.))
-                            .px(px(6.))
-                            .bg(theme::color(palette.panel))
-                            .font_weight(FontWeight::MEDIUM)
-                            .truncate()
-                            .child(item.title.clone()),
-                    )
-                    .into_any_element();
-            }
-            // Sections hang on the line as dots, without indent: the number
-            // and the dot tell the depth, and the title keeps the width.
-            let dot_top = 6. + OUTLINE_LINE / 2.;
-            let dot = if here == Some(index) {
-                div()
-                    .absolute()
-                    .left(px(OUTLINE_SPINE - 4.5))
-                    .top(px(dot_top - 4.5))
-                    .size(px(9.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_full()
-                    .border_1()
-                    .border_color(theme::color(palette.ui_text))
-                    .bg(theme::color(palette.panel))
-                    .child(div().size(px(3.)).rounded_full().bg(theme::color(palette.ui_text)))
-            } else {
-                div()
-                    .absolute()
-                    .left(px(OUTLINE_SPINE - 2.5))
-                    .top(px(dot_top - 2.5))
-                    .size(px(5.))
-                    .rounded_full()
-                    .map(|dot| {
-                        if item.depth == 1 {
-                            dot.bg(theme::color(palette.ui_text))
-                        } else {
-                            dot.border_1().border_color(theme::color(palette.ui_text)).bg(theme::color(palette.panel))
-                        }
-                    })
-            };
-            row.items_start()
-                .py(px(6.))
-                .pl(px(OUTLINE_SPINE + 12.))
-                .pr(px(12.))
-                .line_height(px(OUTLINE_LINE))
-                .child(dot)
-                .child(
-                    div()
-                        .flex_none()
-                        .w(px(34.))
-                        .font_family(theme::code_font())
-                        .text_size(px(11.))
-                        .text_color(theme::color(palette.ui_muted))
-                        .child(label),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .line_clamp(2)
-                        .text_ellipsis()
-                        .when(here == Some(index), |title| title.font_weight(FontWeight::MEDIUM))
-                        .child(item.title.clone()),
-                )
-                .into_any_element()
-        });
-        div().id("outline").flex_1().min_h_0().overflow_y_scroll().child(
-            div()
-                .relative()
-                .w_full()
-                .pb(px(12.))
-                .child(div().absolute().top_0().bottom_0().left(px(OUTLINE_SPINE - 0.5)).w(px(1.)).bg(theme::color(palette.divider)))
-                .children(rows),
+        *self.outline_trail.borrow_mut() = cursor_line.map_or_else(Vec::new, |line| heading_trail(&self.outline, line));
+        let rows: Vec<usize> = outline::visible(&self.outline).map(|(index, _)| index).collect();
+        if *self.outline_rows.borrow() != rows {
+            self.outline_list.reset(rows.len());
+            *self.outline_rows.borrow_mut() = rows;
+        }
+        div().flex_1().min_h_0().child(
+            list(self.outline_list.clone(), cx.processor(|this, row, _, cx| this.render_outline_row(row, cx))).size_full(),
         )
     }
 
-    /// A quiet title in sentence case with its count, as on a page of notes. A
-    /// click folds the section.
+    fn render_outline_row(&mut self, row: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Some(index) = self.outline_rows.borrow().get(row).copied() else {
+            return div().into_any_element();
+        };
+        let item = &self.outline[index];
+        let trail = self.outline_trail.borrow();
+        let place = outline::Place { in_trail: trail.first() == Some(&index), here: trail.last() == Some(&index) };
+        let (line, has_children) = (item.line, item.has_children);
+        outline::row(index, item, place, None, |pill| {
+            pill.when(has_children, |pill| {
+                pill.on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.outline[index].collapsed ^= true;
+                    cx.notify();
+                }))
+            })
+        })
+        .cursor_pointer()
+        .hover(|style| style.bg(theme::color(theme::palette().divider).opacity(0.35)))
+        .on_click(cx.listener(move |this, _, window, cx| {
+            if let Some(view) = this.active_view() {
+                view.update(cx, |view, cx| view.go_to_line(line, 0, window, cx));
+            }
+        }))
+        .into_any_element()
+    }
+
     fn panel_header(
         &self,
         id: &'static str,
@@ -6404,8 +6315,9 @@ impl Workspace {
             (0, warnings) => format!("No errors, {warnings} warnings. The PDF is complete."),
             (errors, warnings) => format!("{errors} errors, {warnings} warnings."),
         };
-        let lines: Vec<&str> = self.build_log.lines().collect();
-        let shown = &lines[lines.len().saturating_sub(MAX_LOG_LINES_SHOWN)..];
+        // Only the end of the log shows, so only the end is read, and only when open.
+        let mut shown: Vec<&str> = if self.show_raw_log { self.build_log.lines().rev().take(MAX_LOG_LINES_SHOWN).collect() } else { Vec::new() };
+        shown.reverse();
         div()
             .id("logs")
             .size_full()
@@ -7620,7 +7532,7 @@ impl Workspace {
                 .size_full()
                 .when(has_errors && !self.error_card_dismissed, |element| element.child(self.render_error_card(cx)))
                 .when(has_errors && self.error_card_dismissed, |element| element.child(self.render_error_banner(cx)))
-                .child(div().flex_1().min_h_0().child(self.pdf.clone()))
+                .child(div().flex_1().min_h_0().child(self.pdf.clone().cached(StyleRefinement::default().size_full())))
                 .into_any_element()
         }
     }
@@ -7829,7 +7741,7 @@ impl Render for Workspace {
             .when(hub, |element| {
                 let page = match setup {
                     Some(setup) => setup.into_any_element(),
-                    None => self.home.clone().into_any_element(),
+                    None => self.home.clone().cached(StyleRefinement::default().size_full()).into_any_element(),
                 };
                 element.child(div().flex().flex_1().min_h_0().child(page))
             })
@@ -7843,7 +7755,7 @@ impl Render for Workspace {
                         .flex_1()
                         .min_h_0()
                         .bg(gpui::black())
-                        .child(self.pdf.clone())
+                        .child(self.pdf.clone().cached(StyleRefinement::default().size_full()))
                         .when(controls, |element| {
                             element.child(div().absolute().top(px(12.)).right(px(12.)).child(self.exit_button(
                                 "exit-presentation",
@@ -7897,7 +7809,7 @@ impl Render for Workspace {
                                 .children(self.git_note().map(|note| {
                                     div().flex_none().px(px(10.)).py(px(6.)).text_color(theme::color(theme::palette().warning)).child(note)
                                 }))
-                                .child(div().flex_1().min_h_0().child(self.git_panel.clone()))
+                                .child(div().flex_1().min_h_0().child(self.git_panel.clone().cached(StyleRefinement::default().size_full())))
                                 .into_any_element(),
                             LeftPanel::Addons => self.render_addons_panel(cx).into_any_element(),
                             #[cfg(feature = "collab")]
@@ -7906,7 +7818,7 @@ impl Render for Workspace {
                                 .flex_none()
                                 .w(self.file_panel_width)
                                 .h_full()
-                                .children(self.addon_panels.get(index).map(|entry| entry.panel.clone()))
+                                .children(self.addon_panels.get(index).map(|entry| entry.panel.clone().cached(StyleRefinement::default().size_full())))
                                 .into_any_element(),
                         };
                         element

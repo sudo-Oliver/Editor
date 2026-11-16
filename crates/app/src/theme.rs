@@ -639,10 +639,10 @@ pub fn color(value: u32) -> Hsla {
 
 /// Returns the color, the italic flag and the weight of a syntax kind. Paper
 /// mode carries structure by weight, as ink on a page has one color.
-pub fn highlight_style(kind: Option<HighlightKind>) -> (u32, bool, FontWeight) {
+/// Takes the palette and mode as read once, since drawing asks for every run of text.
+pub fn highlight_style(palette: &Palette, paper: bool, kind: Option<HighlightKind>) -> (u32, bool, FontWeight) {
     use HighlightKind::*;
-    let palette = palette();
-    if look().paper {
+    if paper {
         // Ink tells commands from text, slant tells arguments from commands,
         // and weight is kept for what the document itself makes bold.
         let (color, italic) = match kind {

@@ -166,9 +166,10 @@ pub fn label_items(labels: Vec<String>) -> Vec<PickerItem> {
         .collect()
 }
 
-/// Entries keep their order until the query asks for something.
+/// Entries keep their order until the query asks for something. A large
+/// bibliography shows its first entries, as typing finds the rest.
 pub fn match_in_order(entries: &[PickerItem], query: &str) -> Vec<PickerItem> {
-    if query.trim().is_empty() { entries.to_vec() } else { match_entries(entries, query) }
+    if query.trim().is_empty() { entries.iter().take(MAX_RESULTS).cloned().collect() } else { match_entries(entries, query) }
 }
 
 /// Entries that match `query` in the label or detail, best first.

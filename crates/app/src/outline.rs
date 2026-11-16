@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use editor_core::{Heading, HeadingKind, Language};
-use gpui::{AnyElement, Hsla, IntoElement, ParentElement, Styled, div, px, svg};
+use gpui::{AnyElement, Div, ElementId, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Stateful, Styled, div, prelude::FluentBuilder, px, svg};
+
+use crate::theme;
 
 // The outline reads like a contents page: one line down the left, chapters
 // as numbered pills on it, sections as dots.
@@ -100,6 +102,132 @@ pub fn marker(item: &OutlineItem) -> String {
         (HeadingKind::Figure | HeadingKind::Table, Some(number)) => number.iter().map(usize::to_string).collect(),
         _ => "—".to_string(),
     }
+}
+
+/// Where a row stands to the place being read: in the chain of headings that
+/// leads there, or the place itself.
+#[derive(Clone, Copy, Default)]
+pub struct Place {
+    pub in_trail: bool,
+    pub here: bool,
+}
+
+/// One row of the outline as on a contents page: a chapter is a numbered pill on
+/// a line across, a section a dot on the line down, with its number. `pill`
+/// gets the chapter's pill, for a click on it; `trailing` goes at the end, such as
+/// a page number. The caller adds what a click on the row does.
+pub fn row(
+    id: impl Into<ElementId>,
+    item: &OutlineItem,
+    place: Place,
+    trailing: Option<AnyElement>,
+    pill: impl FnOnce(Stateful<Div>) -> Stateful<Div>,
+) -> Stateful<Div> {
+    let palette = theme::palette();
+    // Each row draws its piece of the line down, as only the rows on screen exist.
+    let spine = div().absolute().top_0().bottom_0().left(px(SPINE - 0.5)).w(px(1.)).bg(theme::color(palette.divider));
+    let row = div().id(id).relative().w_full().flex().child(spine);
+    if item.depth == 0 {
+        let label_color = if item.collapsed { palette.ui_text } else { palette.on_accent };
+        let chapter = div()
+            .id("outline-pill")
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .w(px(PILL))
+            .h(px(20.))
+            .rounded_full()
+            .bg(theme::color(palette.panel))
+            .text_size(px(11.))
+            .font_weight(FontWeight::MEDIUM)
+            .map(|pill| {
+                if item.collapsed {
+                    pill.border_1().border_color(theme::color(palette.accent)).text_color(theme::color(palette.ui_text))
+                } else {
+                    let ink = theme::color(palette.accent).opacity(if place.in_trail { 1. } else { 0.6 });
+                    pill.bg(ink).text_color(theme::color(palette.on_accent))
+                }
+            })
+            .child(marker_element(item, theme::color(label_color)));
+        return row
+            .h(px(44.))
+            .items_center()
+            .pl(px(SPINE - PILL / 2.))
+            .pr(px(12.))
+            .child(div().absolute().left_0().right_0().top(px(22.)).h(px(1.)).bg(theme::color(palette.divider)))
+            .child(pill(chapter))
+            .child(
+                div()
+                    .relative()
+                    .min_w_0()
+                    .ml(px(6.))
+                    .px(px(6.))
+                    .bg(theme::color(palette.panel))
+                    .font_weight(FontWeight::MEDIUM)
+                    .truncate()
+                    .child(item.title.clone()),
+            )
+            .child(div().flex_1())
+            .children(trailing.map(|trailing| div().relative().pl(px(6.)).bg(theme::color(palette.panel)).child(trailing)));
+    }
+    // Sections hang on the line as dots, without indent: the number and the dot
+    // tell the depth, and the title keeps the width.
+    let dot_top = 6. + LINE / 2.;
+    let dot = if place.here {
+        div()
+            .absolute()
+            .left(px(SPINE - 4.5))
+            .top(px(dot_top - 4.5))
+            .size(px(9.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .border_1()
+            .border_color(theme::color(palette.ui_text))
+            .bg(theme::color(palette.panel))
+            .child(div().size(px(3.)).rounded_full().bg(theme::color(palette.ui_text)))
+    } else {
+        div()
+            .absolute()
+            .left(px(SPINE - 2.5))
+            .top(px(dot_top - 2.5))
+            .size(px(5.))
+            .rounded_full()
+            .map(|dot| {
+                if item.depth == 1 {
+                    dot.bg(theme::color(palette.ui_text))
+                } else {
+                    dot.border_1().border_color(theme::color(palette.ui_text)).bg(theme::color(palette.panel))
+                }
+            })
+    };
+    row.items_start()
+        .py(px(6.))
+        .pl(px(SPINE + 12.))
+        .pr(px(12.))
+        .line_height(px(LINE))
+        .child(dot)
+        .child(
+            div()
+                .flex_none()
+                .w(px(34.))
+                .font_family(theme::code_font())
+                .text_size(px(11.))
+                .text_color(theme::color(palette.ui_muted))
+                .child(marker_element(item, theme::color(palette.ui_muted))),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .line_clamp(2)
+                .text_ellipsis()
+                .when(place.here, |title| title.font_weight(FontWeight::MEDIUM))
+                .child(item.title.clone()),
+        )
+        .children(trailing.map(|trailing| div().flex_none().pl(px(8.)).child(trailing)))
 }
 
 /// The marker as drawn: the icon of a figure, table or the references before

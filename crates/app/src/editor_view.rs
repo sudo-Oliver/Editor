@@ -60,6 +60,29 @@ pub enum EditorEvent {
 }
 
 const MAX_ROW_CHANGES: usize = 64;
+/// Up to this many changed lines are shaped at once; more, as after a resize, are
+/// counted first and shaped where they show.
+const EXACT_WRAP_LINES: usize = 256;
+/// Lines off screen shaped per frame, until all of them are.
+const REFINE_LINES_PER_FRAME: usize = 200;
+
+/// What wrapping needs from the text system, taken once per frame.
+struct LineWrap {
+    width: Pixels,
+    char_width: Pixels,
+    wrapper: gpui::LineWrapperHandle,
+}
+
+impl LineWrap {
+    fn new(width: Pixels, window: &mut Window) -> Self {
+        let font_size = px(theme::code_font_size());
+        let text_system = window.text_system().clone();
+        let font_id = text_system.resolve_font(&EditorView::plain_font());
+        let char_width = text_system.ch_advance(font_id, font_size).unwrap_or(px(7.2));
+        let wrapper = text_system.line_wrapper(EditorView::plain_font(), font_size);
+        Self { width, char_width, wrapper }
+    }
+}
 /// Marks of changed lines wait for typing to pause.
 const LINE_DIFF_DELAY: Duration = Duration::from_millis(300);
 const CONFLICT_START: &str = "<<<<<<<";
@@ -78,6 +101,11 @@ struct RowsDirty {
 struct Rows {
     width: Pixels,
     breaks: Vec<Option<Vec<u32>>>,
+    /// Lines whose breaks are counted from characters instead of shaped, after a
+    /// change of width. They get shaped when they show, or a few each frame.
+    estimated: Vec<bool>,
+    /// How many of `estimated` are true, so that a frame without them checks nothing.
+    estimated_lines: usize,
     starts: Vec<u32>,
 }
 
@@ -90,8 +118,21 @@ impl Rows {
         1 + self.breaks[line].as_ref().map_or(0, Vec::len) as u32
     }
 
+    fn set_estimated(&mut self, line: usize, estimated: bool) {
+        if self.estimated[line] != estimated {
+            self.estimated[line] = estimated;
+            if estimated {
+                self.estimated_lines += 1;
+            } else {
+                self.estimated_lines -= 1;
+            }
+        }
+    }
+
     fn reset(&mut self, line_count: usize) -> RowsDirty {
         self.breaks = vec![None; line_count];
+        self.estimated = vec![false; line_count];
+        self.estimated_lines = 0;
         self.starts.clear();
         RowsDirty { lines: 0..line_count, shifted: true }
     }
@@ -106,10 +147,13 @@ impl Rows {
         for change in changes {
             let start = change.start_line.min(self.breaks.len());
             let end = (start + change.removed_lines).min(self.breaks.len());
+            self.estimated_lines -= self.estimated[start..end].iter().filter(|estimated| **estimated).count();
             if end - start == change.inserted_lines {
                 self.breaks[start..end].fill(None);
+                self.estimated[start..end].fill(false);
             } else {
                 self.breaks.splice(start..end, std::iter::repeat_n(None, change.inserted_lines));
+                self.estimated.splice(start..end, std::iter::repeat_n(false, change.inserted_lines));
                 shifted = true;
             }
             // Later changes count lines after the earlier ones, so the range moves along.
@@ -341,10 +385,11 @@ impl EditorView {
         let Some(base) = self.diff_base.clone() else {
             return;
         };
-        let text = self.state.buffer().to_string();
+        // A rope clone shares its chunks; the text is made only after the pause.
+        let rope = self.state.buffer().rope().clone();
         self.diff_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(delay).await;
-            let hunks = cx.background_spawn(async move { line_diff(&base, &text).unwrap_or_default() }).await;
+            let hunks = cx.background_spawn(async move { line_diff(&base, &rope.to_string()).unwrap_or_default() }).await;
             this.update(cx, |this, cx| {
                 this.diff_task = None;
                 if this.diff_hunks != hunks {
@@ -910,54 +955,112 @@ impl EditorView {
         px(theme::code_line_height())
     }
 
-    fn sync_rows(&mut self, width: Pixels, window: &mut Window) {
+    fn sync_rows(&mut self, width: Pixels, viewport: Pixels, window: &mut Window) {
         let changes = self.state.take_line_changes();
         let width_changed = (self.rows.width - width).abs() > px(0.5);
         let line_count = self.state.buffer().line_count();
         let dirty = if width_changed || self.rows.breaks.is_empty() {
             self.rows.width = width;
-            self.rows.reset(line_count)
+            Some(self.rows.reset(line_count))
         } else if !changes.is_empty() {
-            self.rows.apply_changes(&changes, line_count)
+            Some(self.rows.apply_changes(&changes, line_count))
         } else if self.rows.starts.len() == line_count + 1 {
-            return;
+            None
         } else {
-            self.rows.reset(line_count)
+            Some(self.rows.reset(line_count))
         };
 
-        let font_size = px(theme::code_font_size());
-        let text_system = window.text_system().clone();
-        let font_id = text_system.resolve_font(&Self::plain_font());
-        let char_width = text_system
-            .ch_advance(font_id, font_size)
-            .unwrap_or(px(7.2));
-        let mut wrapper = text_system.line_wrapper(Self::plain_font(), font_size);
-        let buffer = self.state.buffer();
-        for line in dirty.lines.clone() {
-            let Some(breaks) = self.rows.breaks.get_mut(line) else {
-                break;
-            };
-            if breaks.is_some() {
-                continue;
-            }
-            // No character takes more cells than bytes, so a line that fits by its
-            // bytes needs no text and no shaping. Wide CJK has three bytes for two cells.
-            let bytes = buffer.line_end(line) - buffer.line_start(line);
-            if char_width * bytes as f32 <= width {
-                *breaks = Some(Vec::new());
-                continue;
-            }
-            let text = buffer.line_text(line);
-            let display = text.replace('\t', " ");
-            let fragments = [LineFragment::text(&display)];
-            let boundaries = wrapper
-                .wrap_line(&fragments, width, gpui::IndentAdjustment::NoIndent)
-                .map(|boundary| boundary.ix as u32)
-                .collect();
-            *breaks = Some(boundaries);
+        if dirty.is_none() && self.rows.estimated_lines == 0 {
+            return;
         }
-        drop(wrapper);
-        self.rows.update_starts(&dirty);
+        let mut wrap = LineWrap::new(width, window);
+        if let Some(dirty) = dirty {
+            // Typing changes a few lines, which get shaped at once. A whole document,
+            // after a resize or on opening, is counted first and shaped where it shows.
+            let exact = dirty.lines.len() <= EXACT_WRAP_LINES;
+            for line in dirty.lines.clone() {
+                if self.rows.breaks.get(line).is_none_or(Option::is_some) {
+                    continue;
+                }
+                self.wrap_line(line, exact, &mut wrap);
+            }
+            self.rows.update_starts(&dirty);
+        }
+        if self.rows.estimated_lines == 0 {
+            return;
+        }
+
+        // The rows on screen and the cursor's row must be right before they paint.
+        let line_height = Self::line_height();
+        let first_row = (self.scroll_y / line_height).max(0.) as usize;
+        let last_row = first_row + (viewport / line_height) as usize + 2;
+        let (first_line, _) = self.rows.locate(first_row);
+        let (last_line, _) = self.rows.locate(last_row);
+        let cursor_line = self.state.buffer().offset_to_line(self.cursor_offset());
+        let shown = first_line..last_line + 1;
+        let mut changed = None;
+        for line in shown.clone().chain(std::iter::once(cursor_line)) {
+            if self.rows.estimated.get(line) == Some(&true) {
+                self.wrap_line(line, true, &mut wrap);
+                changed = Some(changed.map_or(line, |first: usize| first.min(line)));
+            }
+        }
+        // Then a few more each frame, until all are shaped. A line above the screen
+        // that gains or loses rows moves the scroll along, so the text stays put.
+        let mut shaped = 0;
+        let mut moved_rows = 0i64;
+        for line in (0..self.rows.estimated.len()).filter(|line| !shown.contains(line)) {
+            if shaped == REFINE_LINES_PER_FRAME {
+                break;
+            }
+            if !self.rows.estimated[line] {
+                continue;
+            }
+            let before = self.rows.rows_of_line(line);
+            self.wrap_line(line, true, &mut wrap);
+            if line < first_line {
+                moved_rows += i64::from(self.rows.rows_of_line(line)) - i64::from(before);
+            }
+            changed = Some(changed.map_or(line, |first: usize| first.min(line)));
+            shaped += 1;
+        }
+        if let Some(first) = changed {
+            self.rows.update_starts(&RowsDirty { lines: first..line_count, shifted: true });
+            self.scroll_y += line_height * moved_rows as f32;
+        }
+        if self.rows.estimated_lines > 0 {
+            window.request_animation_frame();
+        }
+    }
+
+    /// Finds the breaks of one line: shaped when `exact`, or else counted from its
+    /// characters, which costs no shaping and is close for running text.
+    fn wrap_line(&mut self, line: usize, exact: bool, wrap: &mut LineWrap) {
+        let buffer = self.state.buffer();
+        // No character takes more cells than bytes, so a line that fits by its
+        // bytes needs no text and no shaping. Wide CJK has three bytes for two cells.
+        let bytes = buffer.line_end(line) - buffer.line_start(line);
+        let (breaks, estimated) = if wrap.char_width * bytes as f32 <= wrap.width {
+            (Vec::new(), false)
+        } else if exact {
+            let display = buffer.line_text(line).replace('\t', " ");
+            let fragments = [LineFragment::text(&display)];
+            let breaks = wrap.wrapper.wrap_line(&fragments, wrap.width, gpui::IndentAdjustment::NoIndent).map(|boundary| boundary.ix as u32).collect();
+            (breaks, false)
+        } else {
+            let per_row = ((wrap.width / wrap.char_width) as usize).max(1);
+            let mut breaks = Vec::new();
+            let mut byte = 0;
+            for (index, character) in buffer.rope().line(line).chars().enumerate() {
+                if index > 0 && index % per_row == 0 {
+                    breaks.push(byte as u32);
+                }
+                byte += character.len_utf8();
+            }
+            (breaks, true)
+        };
+        self.rows.breaks[line] = Some(breaks);
+        self.rows.set_estimated(line, estimated);
     }
 
     fn shape_plain(&self, text: &str, window: &mut Window) -> ShapedLine {
@@ -1164,12 +1267,7 @@ impl EditorView {
         kinds
     }
 
-    fn shape_styled(
-        &self,
-        text: &str,
-        kinds: &[Option<HighlightKind>],
-        window: &mut Window,
-    ) -> ShapedLine {
+    fn shape_styled(text: &str, kinds: &[Option<HighlightKind>], palette: &theme::Palette, look: &theme::Look, window: &mut Window) -> ShapedLine {
         let display: SharedString = text.replace('\t', " ").into();
         let mut runs: Vec<TextRun> = Vec::new();
         let mut last: Option<Option<HighlightKind>> = None;
@@ -1180,20 +1278,20 @@ impl EditorView {
                 continue;
             }
             last = Some(kind);
-            let (color, italic, weight) = theme::highlight_style(kind);
-            let style = if italic { FontStyle::Italic } else { FontStyle::Normal };
+            let (color, italic, weight) = theme::highlight_style(palette, look.paper, kind);
+            let mut run_font = font(look.code_font.clone());
+            run_font.style = if italic { FontStyle::Italic } else { FontStyle::Normal };
+            run_font.weight = weight;
             runs.push(TextRun {
                 len: ch.len_utf8(),
-                font: Self::font(style, weight),
+                font: run_font,
                 color: theme::color(color),
                 background_color: None,
                 underline: None,
                 strikethrough: None,
             });
         }
-        window
-            .text_system()
-            .shape_line(display, px(theme::code_font_size()), &runs, None)
+        window.text_system().shape_line(display, px(look.code_size), &runs, None)
     }
 }
 
@@ -1731,10 +1829,13 @@ impl Element for EditorElement {
 
 impl EditorView {
     fn prepaint_rows(&mut self, bounds: Bounds<Pixels>, window: &mut Window) -> EditorPrepaint {
+        // Read once per frame: each read takes a lock and copies.
+        let palette = theme::palette();
+        let look = theme::look();
         self.bounds = Some(bounds);
         let line_height = Self::line_height();
         let text_width = (bounds.size.width - self.gutter_width() - px(TEXT_RIGHT_PADDING)).max(px(40.));
-        self.sync_rows(text_width, window);
+        self.sync_rows(text_width, bounds.size.height, window);
 
         if std::mem::take(&mut self.autoscroll) {
             let (line, column) = self.state.buffer().offset_to_point(self.cursor_offset());
@@ -1768,7 +1869,7 @@ impl EditorView {
         let byte_range = buffer.line_start(first_line)..buffer.line_end(last_line);
 
         // Wider spans paint first, so that nested nodes keep their own color.
-        let mut spans = self.state.syntax().highlights(buffer.rope(), byte_range);
+        let mut spans = self.state.syntax().highlights(buffer.rope(), byte_range.clone());
         spans.sort_by_key(|span| std::cmp::Reverse(span.range.len()));
 
         let selections: Vec<Selection> = self.state.selections().as_slice().to_vec();
@@ -1786,11 +1887,14 @@ impl EditorView {
         let mut hits_in_line: Vec<Range<usize>> = Vec::new();
 
         let code_font = Self::plain_font();
-        let number_color = theme::color(theme::palette().line_number);
-        let active_number_color = theme::color(theme::palette().line_number_active);
-        let error_lines: std::collections::HashSet<usize> = self
-            .state
-            .marks()
+        let number_color = theme::color(palette.line_number);
+        let active_number_color = theme::color(palette.line_number_active);
+        // Only what reaches the rows on screen, so each row checks a few and not all.
+        let shown = byte_range;
+        let marks: Vec<&Mark> = self.state.marks().iter().filter(|mark| mark.range.start <= shown.end && mark.range.end >= shown.start).collect();
+        let decorations: Vec<&Decoration> =
+            self.state.decorations().iter().filter(|decoration| decoration.range.start <= shown.end && decoration.range.end >= shown.start).collect();
+        let error_lines: std::collections::HashSet<usize> = marks
             .iter()
             .filter(|mark| mark.severity == MarkSeverity::Error)
             .map(|mark| buffer.offset_to_line(mark.range.start))
@@ -1817,7 +1921,7 @@ impl EditorView {
             }
             let (_, text, kinds) = cached_line.as_ref().expect("line cache was just filled");
             let range = self.rows.segment(line, segment, text.len());
-            let shaped = self.shape_styled(&text[range.clone()], &kinds[range.clone()], window);
+            let shaped = Self::shape_styled(&text[range.clone()], &kinds[range.clone()], &palette, &look, window);
             let y = bounds.top() + line_height * row as f32 - self.scroll_y;
 
             let number = (segment == 0 && !self.plain).then(|| {
@@ -1831,7 +1935,7 @@ impl EditorView {
                     len: label.len(),
                     font: code_font.clone(),
                     color: if error_lines.contains(&line) {
-                        theme::color(theme::palette().error)
+                        theme::color(palette.error)
                     } else if cursor_line == Some(line) {
                         active_number_color
                     } else {
@@ -1843,7 +1947,7 @@ impl EditorView {
                 };
                 window
                     .text_system()
-                    .shape_line(label, px(theme::code_font_size()), &[run], None)
+                    .shape_line(label, px(look.code_size), &[run], None)
             });
 
             let line_start = buffer.line_start(line);
@@ -1860,7 +1964,7 @@ impl EditorView {
                             point(text_left + shaped.x_for_index(from - row_start), y),
                             point(text_left + shaped.x_for_index(to - row_start), y + line_height),
                         ),
-                        theme::color(theme::palette().search_match),
+                        theme::color(palette.search_match),
                     ));
                 }
             }
@@ -1891,7 +1995,7 @@ impl EditorView {
                             point(text_left + shaped.x_for_index(from), y),
                             point(text_left + right, y + line_height),
                         ),
-                        theme::color(theme::palette().selection),
+                        theme::color(palette.selection),
                     ));
                 }
                 let head = selection.head;
@@ -1903,22 +2007,22 @@ impl EditorView {
                             point(text_left + shaped.x_for_index(head - row_start), y),
                             size(px(1.5), line_height),
                         ),
-                        theme::color(theme::palette().caret),
+                        theme::color(palette.caret),
                     ));
                 }
             }
 
             let baseline = y + line_height - px(3.);
-            for mark in self.state.marks() {
+            for mark in &marks {
                 let from = mark.range.start.max(row_start);
                 let to = mark.range.end.min(row_end);
                 if from < to {
                     let left = shaped.x_for_index(from - row_start);
                     let right = shaped.x_for_index(to - row_start);
                     let color = match mark.severity {
-                        MarkSeverity::Error => theme::palette().error,
-                        MarkSeverity::Warning => theme::palette().warning,
-                        MarkSeverity::Hint => theme::palette().ui_muted,
+                        MarkSeverity::Error => palette.error,
+                        MarkSeverity::Warning => palette.warning,
+                        MarkSeverity::Hint => palette.ui_muted,
                     };
                     squiggles.push((point(text_left + left, baseline), right - left, color));
                 }
@@ -1931,10 +2035,10 @@ impl EditorView {
                         break;
                     }
                     let (color, mark) = match hunk.kind {
-                        HunkKind::Added => (theme::palette().st_green, Bounds::new(point(bounds.left() + px(1.), y), size(px(GUTTER_MARK_WIDTH), line_height))),
-                        HunkKind::Modified => (theme::palette().function, Bounds::new(point(bounds.left() + px(1.), y), size(px(GUTTER_MARK_WIDTH), line_height))),
+                        HunkKind::Added => (palette.st_green, Bounds::new(point(bounds.left() + px(1.), y), size(px(GUTTER_MARK_WIDTH), line_height))),
+                        HunkKind::Modified => (palette.function, Bounds::new(point(bounds.left() + px(1.), y), size(px(GUTTER_MARK_WIDTH), line_height))),
                         // A thin bar where the lines went, between this line and the one before.
-                        HunkKind::Deleted => (theme::palette().error, Bounds::new(point(bounds.left() + px(1.), y - px(1.)), size(px(8.), px(2.)))),
+                        HunkKind::Deleted => (palette.error, Bounds::new(point(bounds.left() + px(1.), y - px(1.)), size(px(8.), px(2.)))),
                     };
                     if hunk.kind == HunkKind::Deleted || hunk.lines.contains(&line) {
                         gutter_marks.push(fill(mark, theme::color(color)));
@@ -1948,14 +2052,14 @@ impl EditorView {
                 } else if in_side(&conflict.theirs) {
                     (CONFLICT_THEIRS, 0.16)
                 } else if conflict.base.as_ref().is_some_and(in_side) {
-                    (theme::palette().ui_muted, 0.12)
+                    (palette.ui_muted, 0.12)
                 } else {
                     // A marker line.
-                    (theme::palette().ui_muted, 0.28)
+                    (palette.ui_muted, 0.28)
                 };
                 shades.push(fill(Bounds::from_corners(point(text_left, y), point(bounds.right(), y + line_height)), theme::color(color).opacity(alpha)));
             }
-            for decoration in self.state.decorations() {
+            for decoration in &decorations {
                 let range = &decoration.range;
                 let at_point = range.is_empty()
                     && range.start >= row_start
@@ -1988,7 +2092,7 @@ impl EditorView {
                             let label: SharedString = label.clone().into();
                             let run = TextRun {
                                 len: label.len(),
-                                font: Self::plain_font(),
+                                font: code_font.clone(),
                                 color: theme::color(0xffffff),
                                 background_color: None,
                                 underline: None,
@@ -2050,7 +2154,7 @@ impl EditorView {
             if shows_block {
                 block = Some(fill(
                     Bounds::new(to_screen(target), size(width, line_height)),
-                    theme::color(theme::palette().caret),
+                    theme::color(palette.caret),
                 ));
             }
         }

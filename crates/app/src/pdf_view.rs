@@ -121,6 +121,8 @@ pub struct PdfView {
     zoom: f32,
     fit_width: bool,
     zoomed_at: Option<Instant>,
+    /// The width of the widest page in points, which fitting and centering use.
+    widest_page: f32,
     settle_task: Option<Task<()>>,
     invert: bool,
     scroll: gpui::Point<Pixels>,
@@ -166,6 +168,7 @@ impl PdfView {
             zoom: 1.0,
             fit_width: true,
             zoomed_at: None,
+            widest_page: 0.0,
             settle_task: None,
             invert: false,
             scroll: point(px(0.), px(0.)),
@@ -388,6 +391,7 @@ impl PdfView {
         match event {
             PdfEvent::Loaded { generation, pages } => {
                 if generation == self.generation {
+                    self.widest_page = pages.iter().map(|(width, _)| *width).fold(0.0, f32::max);
                     self.pages = pages;
                     self.error = None;
                     self.last_requested.clear();
@@ -441,15 +445,18 @@ impl PdfView {
     }
 
     fn content_size(&self) -> (f32, f32) {
-        let width = self.pages.iter().map(|(width, _)| *width).fold(0.0, f32::max) * self.zoom;
         let height = self.pages.iter().map(|(_, height)| height * self.zoom + PAGE_GAP).sum::<f32>() + PAGE_GAP;
-        (width + SIDE_MARGIN * 2.0, height)
+        (self.content_width(), height)
     }
 
+    fn content_width(&self) -> f32 {
+        self.widest_page * self.zoom + SIDE_MARGIN * 2.0
+    }
+
+    /// Needs no walk over the pages, as it runs for each page drawn.
     fn page_left(&self, page: usize, viewport: Pixels) -> f32 {
         let width = self.pages[page].0 * self.zoom;
-        let (content_width, _) = self.content_size();
-        ((f32::from(viewport).max(content_width) - width) / 2.0).max(SIDE_MARGIN)
+        ((f32::from(viewport).max(self.content_width()) - width) / 2.0).max(SIDE_MARGIN)
     }
 
     fn clamp_scroll(&mut self, viewport: gpui::Size<Pixels>) {
@@ -746,8 +753,19 @@ impl PdfView {
             return self.prepare_slide(bounds, window);
         }
         if self.fit_width {
-            let widest = self.pages.iter().map(|(width, _)| *width).fold(1.0, f32::max);
-            self.zoom = ((f32::from(bounds.size.width) - SIDE_MARGIN * 2.0) / widest).clamp(MIN_ZOOM, MAX_ZOOM);
+            let zoom = ((f32::from(bounds.size.width) - SIDE_MARGIN * 2.0) / self.widest_page.max(1.0)).clamp(MIN_ZOOM, MAX_ZOOM);
+            // A pane being dragged changes the width every frame. Like a pinch, that
+            // scales the pages there are and renders them sharp once it stops.
+            if (zoom - self.zoom).abs() > f32::EPSILON {
+                self.zoom = zoom;
+                self.zoomed_at = Some(Instant::now());
+            }
+        }
+        // One more frame after the change settles renders the pages sharp.
+        if self.zoomed_at.is_some_and(|at| at.elapsed() < ZOOM_SETTLE) {
+            window.request_animation_frame();
+        } else {
+            self.zoomed_at = None;
         }
         self.advance_scroll(bounds.size, window);
         self.clamp_scroll(bounds.size);

@@ -9,8 +9,8 @@ use std::{
 };
 
 use gpui::{
-    Anchor, AnyElement, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Keystroke, ObjectFit, PathPromptOptions,
-    PromptLevel, RenderImage, ScrollEvent, SharedString, Subscription, Task, Window, anchored, canvas, deferred, div, img, prelude::*, px, svg,
+    Anchor, AnyElement, Context, ListAlignment, ListState, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Keystroke, ObjectFit, PathPromptOptions,
+    PromptLevel, RenderImage, ScrollEvent, SharedString, Subscription, Task, Window, anchored, canvas, deferred, div, img, list, prelude::*, px, svg,
 };
 use editor_core::{Language, word_count};
 use pdf::{OutlineEntry, PageRequest, PdfEvent, PdfWorker};
@@ -102,6 +102,7 @@ struct Preview {
     contents: Vec<OutlineItem>,
     /// The page of each entry of `contents`, where the PDF's bookmarks tell it.
     contents_pages: Vec<Option<usize>>,
+    contents_list: ListState,
     bookmarks: Vec<OutlineEntry>,
     /// Scroll left over from the last page turn, so that a trackpad turns one page at a time.
     scroll: f32,
@@ -114,6 +115,11 @@ impl Preview {
     /// headings in the same order. Without headings from the sources, the
     /// bookmarks are the contents.
     fn link_pages(&mut self) {
+        self.find_pages();
+        self.contents_list.reset(self.contents.len());
+    }
+
+    fn find_pages(&mut self) {
         let sources = self.sheet.as_ref().map_or(&[][..], |sheet| &sheet.contents);
         if sources.is_empty() {
             self.contents = self
@@ -315,10 +321,11 @@ impl HomeView {
         Ok(dir)
     }
 
-    pub fn set_context(&mut self, has_project: bool, vim_mode: bool, cards: bool) {
+    pub fn set_context(&mut self, has_project: bool, vim_mode: bool, cards: bool, cx: &mut Context<Self>) {
         self.has_project = has_project;
         self.vim_mode = vim_mode;
         self.cards = cards;
+        cx.notify();
     }
 
     /// The hub opens with the cursor in the search, so typing filters at once.
@@ -995,6 +1002,7 @@ impl HomeView {
             pages: HashMap::new(),
             contents: Vec::new(),
             contents_pages: Vec::new(),
+            contents_list: ListState::new(0, ListAlignment::Top, px(200.)),
             bookmarks: Vec::new(),
             scroll: 0.,
             _task: task,
@@ -1683,130 +1691,10 @@ impl HomeView {
     }
 
     /// The contents of the previewed document, drawn like the outline beside the
-    /// editor: chapters as numbered pills on a line, sections as dots. An entry
-    /// whose page the PDF tells turns the preview to it.
+    /// editor, as a list that builds only the rows on screen. An entry whose page
+    /// the PDF tells turns the preview to it.
     fn render_contents(&self, preview: &Preview, cx: &mut Context<Self>) -> AnyElement {
         let palette = theme::palette();
-        let pages = &preview.contents_pages;
-        // The entry of the page shown is the last one that starts on it or before.
-        let here = pages.iter().rposition(|page| page.is_some_and(|page| page <= preview.page));
-        let chapter = here.and_then(|here| preview.contents[..=here].iter().rposition(|item| item.depth == 0));
-        let rows = preview.contents.iter().enumerate().map(|(index, item)| {
-            let page = pages.get(index).copied().flatten();
-            let label = outline::marker_element(item, theme::color(palette.ui_muted));
-            let row = div()
-                .id(("hub-preview-chapter", index))
-                .relative()
-                .w_full()
-                .flex()
-                .when_some(page, |row, page| {
-                    row.cursor_pointer().hover(|style| style.bg(theme::color(palette.divider).opacity(0.35))).on_click(cx.listener(
-                        move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.go_to_page(page, cx);
-                        },
-                    ))
-                });
-            let page_number = div()
-                .flex_none()
-                .pl(px(8.))
-                .font_family(theme::MONO_FONT)
-                .text_size(px(11.))
-                .text_color(theme::color(palette.ui_muted))
-                .children(page.map(|page| (page + 1).to_string()));
-            if item.depth == 0 {
-                let ink = theme::color(palette.accent).opacity(if chapter == Some(index) { 1. } else { 0.6 });
-                return row
-                    .h(px(40.))
-                    .items_center()
-                    .pl(px(outline::SPINE - outline::PILL / 2.))
-                    .child(div().absolute().left_0().right_0().top(px(20.)).h(px(1.)).bg(theme::color(palette.divider)))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_none()
-                            .items_center()
-                            .justify_center()
-                            .w(px(outline::PILL))
-                            .h(px(20.))
-                            .rounded_full()
-                            .bg(ink)
-                            .text_size(px(11.))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme::color(palette.on_accent))
-                            .child(outline::marker_element(item, theme::color(palette.on_accent))),
-                    )
-                    .child(
-                        div()
-                            .relative()
-                            .min_w_0()
-                            .ml(px(6.))
-                            .px(px(6.))
-                            .bg(theme::color(palette.panel))
-                            .font_weight(FontWeight::MEDIUM)
-                            .truncate()
-                            .child(item.title.clone()),
-                    )
-                    .child(div().flex_1())
-                    .child(page_number.relative().bg(theme::color(palette.panel)))
-                    .into_any_element();
-            }
-            let dot_top = 5. + outline::LINE / 2.;
-            let dot = if here == Some(index) {
-                div()
-                    .absolute()
-                    .left(px(outline::SPINE - 4.5))
-                    .top(px(dot_top - 4.5))
-                    .size(px(9.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_full()
-                    .border_1()
-                    .border_color(theme::color(palette.ui_text))
-                    .bg(theme::color(palette.panel))
-                    .child(div().size(px(3.)).rounded_full().bg(theme::color(palette.ui_text)))
-            } else {
-                div()
-                    .absolute()
-                    .left(px(outline::SPINE - 2.5))
-                    .top(px(dot_top - 2.5))
-                    .size(px(5.))
-                    .rounded_full()
-                    .map(|dot| {
-                        if item.depth == 1 {
-                            dot.bg(theme::color(palette.ui_text))
-                        } else {
-                            dot.border_1().border_color(theme::color(palette.ui_text)).bg(theme::color(palette.panel))
-                        }
-                    })
-            };
-            row.items_start()
-                .py(px(5.))
-                .pl(px(outline::SPINE + 12.))
-                .line_height(px(outline::LINE))
-                .child(dot)
-                .child(
-                    div()
-                        .flex_none()
-                        .w(px(34.))
-                        .font_family(theme::code_font())
-                        .text_size(px(11.))
-                        .text_color(theme::color(palette.ui_muted))
-                        .child(label),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .line_clamp(2)
-                        .text_ellipsis()
-                        .when(here == Some(index), |title| title.font_weight(FontWeight::MEDIUM))
-                        .child(item.title.clone()),
-                )
-                .child(page_number)
-                .into_any_element()
-        });
         div()
             .flex()
             .flex_col()
@@ -1821,14 +1709,43 @@ impl HomeView {
                     .child(format!("CONTENTS · {}", preview.contents.len())),
             )
             .child(
-                div().id("hub-preview-contents").flex_1().min_h_0().overflow_y_scroll().child(
-                    div()
-                        .relative()
-                        .w_full()
-                        .child(div().absolute().top_0().bottom_0().left(px(outline::SPINE - 0.5)).w(px(1.)).bg(theme::color(palette.divider)))
-                        .children(rows),
-                ),
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(list(preview.contents_list.clone(), cx.processor(|this, row, _, cx| this.render_contents_row(row, cx))).size_full()),
             )
+            .into_any_element()
+    }
+
+    fn render_contents_row(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Some(preview) = self.preview.as_ref() else {
+            return div().into_any_element();
+        };
+        let Some(item) = preview.contents.get(index) else {
+            return div().into_any_element();
+        };
+        let pages = &preview.contents_pages;
+        // The entry of the page shown is the last one that starts on it or before.
+        let here = pages.iter().rposition(|page| page.is_some_and(|page| page <= preview.page));
+        let chapter = here.and_then(|here| preview.contents[..=here].iter().rposition(|item| item.depth == 0));
+        let place = outline::Place { in_trail: chapter == Some(index), here: here == Some(index) };
+        let page = pages.get(index).copied().flatten();
+        let palette = theme::palette();
+        let number = page.map(|page| {
+            div()
+                .font_family(theme::MONO_FONT)
+                .text_size(px(11.))
+                .text_color(theme::color(palette.ui_muted))
+                .child((page + 1).to_string())
+                .into_any_element()
+        });
+        outline::row(("hub-preview-chapter", index), item, place, number, |pill| pill)
+            .when_some(page, |row, page| {
+                row.cursor_pointer().hover(|style| style.bg(theme::color(palette.divider).opacity(0.35))).on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.go_to_page(page, cx);
+                }))
+            })
             .into_any_element()
     }
 
@@ -2552,6 +2469,7 @@ mod tests {
             pages: HashMap::new(),
             contents: Vec::new(),
             contents_pages: Vec::new(),
+            contents_list: ListState::new(0, ListAlignment::Top, px(200.)),
             bookmarks: bookmarks.iter().map(|(title, page)| OutlineEntry { title: title.to_string(), level: 0, page: *page }).collect(),
             scroll: 0.,
             _task: Task::ready(()),

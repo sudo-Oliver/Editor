@@ -186,6 +186,7 @@ impl GitPanel {
         self.read_error = None;
         self.reset_history();
         self.refresh(cx);
+        cx.notify();
     }
 
     pub fn is_visible(&self) -> bool {
@@ -196,6 +197,7 @@ impl GitPanel {
         if self.visible != visible {
             self.visible = visible;
             self.refresh(cx);
+            cx.notify();
         }
     }
 
