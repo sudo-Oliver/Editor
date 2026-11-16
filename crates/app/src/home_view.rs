@@ -2,17 +2,20 @@
 //! from, and the dialogs to make both.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
-    time::SystemTime,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use gpui::{
-    AnyElement, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Keystroke, ObjectFit, PathPromptOptions, PromptLevel,
-    RenderImage, SharedString, Subscription, Task, Window, div, img, prelude::*, px, svg,
+    Anchor, AnyElement, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Keystroke, ObjectFit, PathPromptOptions,
+    PromptLevel, RenderImage, ScrollEvent, SharedString, Subscription, Task, Window, anchored, canvas, deferred, div, img, prelude::*, px, svg,
 };
-use pdf::{PageRequest, PdfEvent, PdfWorker};
+use editor_core::{Language, word_count};
+use pdf::{OutlineEntry, PageRequest, PdfEvent, PdfWorker};
+
+use crate::outline::{self, OutlineItem};
 
 use crate::{
     editor_view::EditorView,
@@ -32,11 +35,27 @@ const SIDEBAR_WIDTH: f32 = 220.0;
 const CONTENT_PADDING: f32 = 32.0;
 const ROW_HEIGHT: f32 = 40.0;
 const FIELD_HEIGHT: f32 = 28.0;
-const CARD_WIDTH: f32 = 248.0;
-const CARD_GAP: f32 = 16.0;
-const THUMBNAIL_HEIGHT: f32 = 150.0;
-/// Rendered wider than shown, so that the page stays sharp on Retina screens.
-const THUMBNAIL_PIXELS: u32 = 2 * CARD_WIDTH as u32;
+const CARD_WIDTH: f32 = 232.0;
+const CARD_HEIGHT: f32 = 300.0;
+const CARD_GAP: f32 = 20.0;
+/// How far the sheets behind a folder stick out to the right and below.
+const SHEET_OFFSET: f32 = 10.0;
+/// Resting this long on a folder opens its preview; passing over it does not.
+const PREVIEW_DELAY: Duration = Duration::from_millis(400);
+/// The pointer may take this long from the folder to its preview.
+const PREVIEW_GRACE: Duration = Duration::from_millis(200);
+const PREVIEW_PAGE_WIDTH: f32 = 300.0;
+const PREVIEW_PAGE_HEIGHT: f32 = PREVIEW_PAGE_WIDTH * 1.414;
+const PREVIEW_SHEET_WIDTH: f32 = 320.0;
+/// The whole preview: padding, page, gap and sheet.
+const PREVIEW_WIDTH: f32 = 2. * 20. + PREVIEW_PAGE_WIDTH + 24. + PREVIEW_SHEET_WIDTH;
+/// Rendered pages kept on either side of the one shown, so that paging back is instant.
+const PREVIEW_KEPT_PAGES: usize = 3;
+/// How far ahead in the bookmarks a heading of the sources is looked for, as a
+/// bookmark can be missing, such as for a starred section.
+const BOOKMARK_LOOKAHEAD: usize = 8;
+/// Scrolled pixels that turn one page.
+const PAGE_TURN_SCROLL: f32 = 60.0;
 
 pub enum HomeEvent {
     Open(PathBuf),
@@ -63,11 +82,91 @@ enum HubPage {
     Help,
 }
 
-/// The first page of a project's PDF, as of the PDF's last change.
-enum Thumbnail {
-    Loading,
-    Ready(Arc<RenderImage>, SystemTime),
-    None,
+/// A closer look at a project beside its folder: pages to leaf through and what
+/// tells versions of a document apart, all without opening the project.
+struct Preview {
+    project: PathBuf,
+    /// False during the short wait, so that passing over folders shows nothing.
+    shown: bool,
+    over_card: bool,
+    over_preview: bool,
+    /// Opened with the keyboard, so it stays until the keyboard closes it.
+    pinned: bool,
+    sheet: Option<DataSheet>,
+    /// Lives as long as the preview, so that turning a page renders only that page.
+    worker: Option<PdfWorker>,
+    page: usize,
+    page_count: Option<usize>,
+    pages: HashMap<usize, Arc<RenderImage>>,
+    /// The contents, from the sources or else from the PDF's bookmarks.
+    contents: Vec<OutlineItem>,
+    /// The page of each entry of `contents`, where the PDF's bookmarks tell it.
+    contents_pages: Vec<Option<usize>>,
+    bookmarks: Vec<OutlineEntry>,
+    /// Scroll left over from the last page turn, so that a trackpad turns one page at a time.
+    scroll: f32,
+    _task: Task<()>,
+    _closing: Option<Task<()>>,
+}
+
+impl Preview {
+    /// Finds the page of each heading in the PDF's bookmarks, which name the same
+    /// headings in the same order. Without headings from the sources, the
+    /// bookmarks are the contents.
+    fn link_pages(&mut self) {
+        let sources = self.sheet.as_ref().map_or(&[][..], |sheet| &sheet.contents);
+        if sources.is_empty() {
+            self.contents = self
+                .bookmarks
+                .iter()
+                .map(|bookmark| OutlineItem {
+                    level: bookmark.level,
+                    title: bookmark.title.clone(),
+                    line: 0,
+                    depth: bookmark.level,
+                    has_children: false,
+                    collapsed: false,
+                    number: None,
+                    kind: editor_core::HeadingKind::Section,
+                })
+                .collect();
+            self.contents_pages = self.bookmarks.iter().map(|bookmark| Some(bookmark.page)).collect();
+            return;
+        }
+        self.contents = sources.to_vec();
+        let marks: Vec<String> = self.bookmarks.iter().map(|bookmark| plain(&bookmark.title)).collect();
+        let mut next = 0;
+        self.contents_pages = sources
+            .iter()
+            .map(|item| {
+                let title = plain(&item.title);
+                let end = (next + BOOKMARK_LOOKAHEAD).min(marks.len());
+                let found = (next..end).find(|&index| !title.is_empty() && (marks[index] == title || marks[index].ends_with(&title)))?;
+                next = found + 1;
+                Some(self.bookmarks[found].page)
+            })
+            .collect();
+    }
+}
+
+/// Letters and digits only, in lower case, so that a bookmark matches its heading
+/// whatever spacing, markup or number it has.
+fn plain(title: &str) -> String {
+    title.chars().filter(|ch| ch.is_alphanumeric()).flat_map(char::to_lowercase).collect()
+}
+
+/// What the preview tells about a project, read on a background thread.
+#[derive(Clone, Default)]
+struct DataSheet {
+    engine: Option<&'static str>,
+    words: Option<usize>,
+    /// The outline of the whole document as the editor shows it, included files too.
+    contents: Vec<OutlineItem>,
+    /// The newest change to the main file or a file it includes.
+    edited: Option<SystemTime>,
+    /// The newest PDF and when it was built.
+    pdf: Option<(PathBuf, SystemTime)>,
+    git: Option<git::HeadSummary>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -115,8 +214,14 @@ pub struct HomeView {
     columns: usize,
     /// The project whose "…" menu is open.
     card_menu: Option<PathBuf>,
-    thumbnails: HashMap<PathBuf, Thumbnail>,
-    thumbnail_task: Option<Task<()>>,
+    /// Projects whose folder is gone, found off the main thread on each visit.
+    missing: HashSet<PathBuf>,
+    folders_task: Option<Task<()>>,
+    preview: Option<Preview>,
+    /// Data sheets read during this visit of the hub.
+    sheets: HashMap<PathBuf, DataSheet>,
+    /// For rendering pages as sharp as the screen shows them.
+    scale: f32,
     toolchain: Entity<Toolchain>,
     _toolchain_observer: Subscription,
     search: Entity<EditorView>,
@@ -156,8 +261,11 @@ impl HomeView {
             cards: true,
             columns: 1,
             card_menu: None,
-            thumbnails: HashMap::new(),
-            thumbnail_task: None,
+            missing: HashSet::new(),
+            folders_task: None,
+            preview: None,
+            sheets: HashMap::new(),
+            scale: 2.,
             toolchain,
             _toolchain_observer,
             search,
@@ -171,7 +279,7 @@ impl HomeView {
             focus: cx.focus_handle(),
             _search_observer,
         };
-        view.find_languages();
+        view.check_folders(cx);
         view
     }
 
@@ -179,6 +287,7 @@ impl HomeView {
     pub fn touch(&mut self, path: &Path, cx: &mut Context<Self>) {
         self.registry.touch(path, projects::now());
         self.languages.insert(path.to_path_buf(), projects::detect_language(path));
+        self.missing.remove(path);
         self.save_registry();
         cx.notify();
     }
@@ -221,7 +330,9 @@ impl HomeView {
         self.rename = None;
         self.dialog = None;
         self.card_menu = None;
-        self.load_thumbnails(cx);
+        self.preview = None;
+        self.sheets.clear();
+        self.check_folders(cx);
         self.search.update(cx, |field, cx| {
             let end = field.state.buffer().len();
             field.edit_from_outside(0..end, "", cx);
@@ -239,12 +350,41 @@ impl HomeView {
         cx.notify();
     }
 
-    fn find_languages(&mut self) {
-        for entry in &self.registry.projects {
-            if !self.languages.contains_key(&entry.path) && entry.path.is_dir() {
-                self.languages.insert(entry.path.clone(), projects::detect_language(&entry.path));
-            }
-        }
+    /// Finds out which folders still exist and the language of each, on a
+    /// background thread, as a project on a slow disk would stall the hub.
+    fn check_folders(&mut self, cx: &mut Context<Self>) {
+        let paths: Vec<(PathBuf, bool)> =
+            self.registry.projects.iter().map(|entry| (entry.path.clone(), self.languages.contains_key(&entry.path))).collect();
+        self.folders_task = Some(cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_spawn(async move {
+                    paths
+                        .into_iter()
+                        .map(|(path, known)| {
+                            let exists = path.is_dir();
+                            let language = (exists && !known).then(|| projects::detect_language(&path));
+                            (path, exists, language)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.missing.clear();
+                for (path, exists, language) in found {
+                    if let Some(language) = language {
+                        this.languages.insert(path.clone(), language);
+                    }
+                    if !exists {
+                        this.missing.insert(path);
+                    }
+                }
+                if this.preview.as_ref().is_some_and(|preview| this.missing.contains(&preview.project)) {
+                    this.preview = None;
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     fn reload_templates(&mut self) {
@@ -338,8 +478,17 @@ impl HomeView {
                 self.activate_selected(window, cx);
                 return true;
             }
+            // A search does not start with a space, so the key is free while it is empty.
+            "space" if self.page == HubPage::Projects && (!search_focused || self.query(cx).is_empty()) => {
+                self.toggle_preview(cx);
+                return true;
+            }
+            "pagedown" | "pageup" if self.preview.is_some() => {
+                self.turn_page(key == "pagedown", cx);
+                return true;
+            }
             "escape" => {
-                if self.card_menu.take().is_some() {
+                if self.preview.take().is_some() || self.card_menu.take().is_some() {
                     cx.notify();
                 } else if self.has_project {
                     cx.emit(HomeEvent::Close);
@@ -360,6 +509,13 @@ impl HomeView {
         let count = self.row_count(cx);
         if count > 0 {
             self.selected = (self.selected as isize + step).clamp(0, count as isize - 1) as usize;
+            // An open preview follows the selection, so that versions can be paged through.
+            if self.preview.is_some()
+                && self.page == HubPage::Projects
+                && let Some(&index) = self.visible_projects(cx).get(self.selected)
+            {
+                self.show_preview(self.registry.projects[index].path.clone(), false, cx);
+            }
             cx.notify();
         }
         true
@@ -370,6 +526,7 @@ impl HomeView {
         self.selected = 0;
         self.rename = None;
         self.card_menu = None;
+        self.preview = None;
         self.focus(window, cx);
     }
 
@@ -391,6 +548,7 @@ impl HomeView {
     }
 
     fn open_project(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.preview = None;
         if path.is_dir() {
             cx.emit(HomeEvent::Open(path));
         } else {
@@ -706,70 +864,203 @@ impl HomeView {
         .detach();
     }
 
-    // Thumbnails
+    // Previews
 
-    /// Renders the first page of each project's PDF, one project after the other,
-    /// on a PDFium thread of its own. A PDF that did not change is not redone.
-    fn load_thumbnails(&mut self, cx: &mut Context<Self>) {
-        let wanted: Vec<(PathBuf, PathBuf, SystemTime)> = self
-            .registry
-            .projects
-            .iter()
-            .filter_map(|entry| {
-                let (pdf, modified) = projects::newest_pdf(&entry.path)?;
-                let current = matches!(self.thumbnails.get(&entry.path), Some(Thumbnail::Ready(_, seen)) if *seen == modified);
-                (!current).then(|| (entry.path.clone(), pdf, modified))
-            })
-            .collect();
-        for entry in &self.registry.projects {
-            if projects::newest_pdf(&entry.path).is_none() {
-                self.thumbnails.insert(entry.path.clone(), Thumbnail::None);
-            }
-        }
-        if wanted.is_empty() {
+    /// Opens the preview of `project`, after a short wait when the pointer brought
+    /// it. The data sheet comes first, then the PDF opens and stays open for paging.
+    fn show_preview(&mut self, project: PathBuf, wait: bool, cx: &mut Context<Self>) {
+        if let Some(preview) = self.preview.as_mut().filter(|preview| preview.project == project) {
+            preview.over_card |= wait;
             return;
         }
-        for (project, _, _) in &wanted {
-            self.thumbnails.entry(project.clone()).or_insert(Thumbnail::Loading);
-        }
-        let recolor = None;
-        self.thumbnail_task = Some(cx.spawn(async move |this, cx| {
-            let library = crate::pdf_view::library_directory();
-            let Ok((worker, mut events)) = cx.background_spawn(async move { PdfWorker::spawn(&library) }).await else {
-                return;
-            };
-            for (generation, (project, pdf, modified)) in wanted.into_iter().enumerate() {
-                let generation = generation as u64;
-                let Ok(bytes) = std::fs::read(&pdf) else {
-                    continue;
-                };
-                worker.load(generation, bytes);
-                let request = PageRequest { page: 0, width_px: THUMBNAIL_PIXELS, recolor };
-                worker.render(generation, vec![request]);
-                let image = loop {
-                    match events.recv().await {
-                        Some(PdfEvent::Rendered { generation: done, request, height_px, bgra }) if done == generation => {
-                            break image::RgbaImage::from_raw(request.width_px, height_px, bgra)
-                                .map(|buffer| Arc::new(RenderImage::new([image::Frame::new(buffer)])));
-                        }
-                        Some(PdfEvent::Failed { generation: done, .. }) if done == generation => break None,
-                        Some(_) => {}
-                        None => return,
+        let cached = self.sheets.get(&project).cloned();
+        let task = cx.spawn({
+            let project = project.clone();
+            async move |this, cx| {
+                if wait {
+                    cx.background_executor().timer(PREVIEW_DELAY).await;
+                }
+                let shown = this.update(cx, |this, cx| {
+                    if let Some(preview) = this.preview.as_mut() {
+                        preview.shown = true;
                     }
-                };
-                let result = this.update(cx, |this, cx| {
-                    let thumbnail = match image {
-                        Some(image) => Thumbnail::Ready(image, modified),
-                        None => Thumbnail::None,
-                    };
-                    this.thumbnails.insert(project, thumbnail);
                     cx.notify();
                 });
-                if result.is_err() {
+                if shown.is_err() {
                     return;
                 }
+                let sheet = match cached {
+                    Some(sheet) => sheet,
+                    None => {
+                        let project = project.clone();
+                        cx.background_spawn(async move { data_sheet(&project) }).await
+                    }
+                };
+                let pdf = sheet.pdf.clone().map(|(pdf, _)| pdf);
+                let updated = this.update(cx, |this, cx| {
+                    this.sheets.insert(project.clone(), sheet.clone());
+                    if let Some(preview) = this.preview.as_mut() {
+                        preview.sheet = Some(sheet);
+                        preview.link_pages();
+                    }
+                    cx.notify();
+                });
+                let (Ok(()), Some(pdf)) = (updated, pdf) else {
+                    return;
+                };
+                let Ok((worker, mut events)) = cx.background_spawn(async move { PdfWorker::spawn(&crate::pdf_view::library_directory()) }).await
+                else {
+                    return;
+                };
+                worker.open(0, pdf);
+                worker.outline(0);
+                let started = this.update(cx, |this, _| {
+                    if let Some(preview) = this.preview.as_mut() {
+                        preview.worker = Some(worker);
+                    }
+                    this.request_pages();
+                });
+                if started.is_err() {
+                    return;
+                }
+                while let Some(event) = events.recv().await {
+                    let result = this.update(cx, |this, cx| {
+                        let Some(preview) = this.preview.as_mut() else {
+                            return;
+                        };
+                        match event {
+                            PdfEvent::Loaded { pages, .. } => preview.page_count = Some(pages.len()),
+                            PdfEvent::Rendered { request, height_px, bgra, .. } => {
+                                if let Some(buffer) = image::RgbaImage::from_raw(request.width_px, height_px, bgra) {
+                                    preview.pages.insert(request.page, Arc::new(RenderImage::new([image::Frame::new(buffer)])));
+                                }
+                            }
+                            PdfEvent::Outline { entries, .. } => {
+                                preview.bookmarks = entries;
+                                preview.link_pages();
+                            }
+                            PdfEvent::PageContent { .. } | PdfEvent::Failed { .. } => {}
+                        }
+                        cx.notify();
+                    });
+                    if result.is_err() {
+                        return;
+                    }
+                }
             }
+        });
+        self.preview = Some(Preview {
+            project,
+            shown: false,
+            over_card: wait,
+            over_preview: false,
+            pinned: !wait,
+            sheet: None,
+            worker: None,
+            page: 0,
+            page_count: None,
+            pages: HashMap::new(),
+            contents: Vec::new(),
+            contents_pages: Vec::new(),
+            bookmarks: Vec::new(),
+            scroll: 0.,
+            _task: task,
+            _closing: None,
+        });
+    }
+
+    /// Renders the page shown and the next one, unless they are there already, and
+    /// lets go of pages far from it.
+    fn request_pages(&mut self) {
+        let width = (PREVIEW_PAGE_WIDTH * self.scale).round() as u32;
+        let Some(preview) = self.preview.as_mut() else {
+            return;
+        };
+        let current = preview.page;
+        preview.pages.retain(|page, _| page.abs_diff(current) <= PREVIEW_KEPT_PAGES);
+        let last = preview.page_count.map_or(current + 1, |count| count.saturating_sub(1));
+        let wanted: Vec<PageRequest> = [current, current + 1]
+            .into_iter()
+            .filter(|page| *page <= last && !preview.pages.contains_key(page))
+            .map(|page| PageRequest { page, width_px: width, recolor: None })
+            .collect();
+        if let (Some(worker), false) = (&preview.worker, wanted.is_empty()) {
+            worker.render(0, wanted);
+        }
+    }
+
+    fn go_to_page(&mut self, page: usize, cx: &mut Context<Self>) {
+        let Some(preview) = self.preview.as_mut() else {
+            return;
+        };
+        let last = preview.page_count.unwrap_or(1).saturating_sub(1);
+        let page = page.min(last);
+        if page != preview.page {
+            preview.page = page;
+            self.request_pages();
+            cx.notify();
+        }
+    }
+
+    fn turn_page(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if let Some(page) = self.preview.as_ref().map(|preview| preview.page) {
+            self.go_to_page(if forward { page + 1 } else { page.saturating_sub(1) }, cx);
+        }
+    }
+
+    /// The pointer left the folder or the preview. The preview stays a moment, so
+    /// that the pointer can cross the gap between the two.
+    fn leave_preview(&mut self, cx: &mut Context<Self>) {
+        let Some(preview) = self.preview.as_mut() else {
+            return;
+        };
+        if preview.over_card || preview.over_preview || preview.pinned {
+            return;
+        }
+        preview._closing = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(PREVIEW_GRACE).await;
+            this.update(cx, |this, cx| {
+                if this.preview.as_ref().is_some_and(|preview| !preview.over_card && !preview.over_preview) {
+                    this.preview = None;
+                    cx.notify();
+                }
+            })
+            .ok();
         }));
+    }
+
+    fn hover_card(&mut self, project: &Path, hovered: bool, cx: &mut Context<Self>) {
+        if hovered {
+            // A folder that is gone has nothing to show.
+            if self.card_menu.is_none() && self.rename.is_none() && !self.missing.contains(project) {
+                self.show_preview(project.to_path_buf(), true, cx);
+            }
+        } else if let Some(preview) = self.preview.as_mut().filter(|preview| preview.project == project) {
+            preview.over_card = false;
+            self.leave_preview(cx);
+        }
+    }
+
+    /// Space shows the selected project as a resting pointer would, and hides it again.
+    fn toggle_preview(&mut self, cx: &mut Context<Self>) {
+        let Some(&index) = self.visible_projects(cx).get(self.selected) else {
+            return;
+        };
+        let project = self.registry.projects[index].path.clone();
+        match self.preview.as_mut() {
+            // Open for the selected project, maybe by the pointer: Space closes it.
+            Some(preview) if preview.project == project && preview.shown => self.preview = None,
+            // The pointer's preview, or one still waiting: the keyboard takes it over.
+            Some(preview) if preview.project == project => {
+                preview.pinned = true;
+                preview.shown = true;
+            }
+            _ => {
+                self.preview = None;
+                self.show_preview(project, false, cx);
+            }
+        }
+        cx.notify();
     }
 
     // Rendering
@@ -1019,114 +1310,493 @@ impl HomeView {
         elements
     }
 
+    /// Each project as a closed folder with a paper clip and the sheets of the
+    /// build behind it. Resting on one opens its preview.
     fn render_project_cards(&self, visible: &[usize], cx: &mut Context<Self>) -> AnyElement {
         let palette = theme::palette();
+        let paper = theme::look().paper;
+        let sheet_color = if theme::is_light(palette.bg) { 0xfbfaf6 } else { palette.divider };
         let now = projects::now();
         let cards = visible.iter().enumerate().map(|(position, &index)| {
             let entry = &self.registry.projects[index];
             let path = entry.path.clone();
-            let exists = path.is_dir();
+            let exists = !self.missing.contains(&path);
             let selected = position == self.selected;
             let language = self.languages.get(&path).copied().filter(|_| exists);
+            let group: SharedString = format!("hub-folder-{index}").into();
             let renaming = self.rename.as_ref().filter(|rename| rename.target == RenameTarget::Project(path.clone()));
             let title: AnyElement = match renaming {
                 Some(rename) => field_box(&rename.field).into_any_element(),
-                None => div().truncate().font_weight(FontWeight::SEMIBOLD).child(entry.title.clone()).into_any_element(),
+                None => div()
+                    .text_size(px(15.))
+                    .line_height(px(19.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .line_clamp(3)
+                    .child(entry.title.to_uppercase())
+                    .into_any_element(),
             };
-            let preview: AnyElement = match self.thumbnails.get(&path) {
-                Some(Thumbnail::Ready(image, _)) => img(image.clone()).size_full().object_fit(ObjectFit::Cover).into_any_element(),
-                _ => {
-                    let icon = match language {
-                        Some(TemplateLanguage::Typst) => "file-typ",
-                        Some(TemplateLanguage::Latex) => "file-tex",
-                        _ => "folder",
-                    };
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .size_full()
-                        .child(svg().path(format!("icons/{icon}.svg")).size(px(40.)).text_color(theme::color(palette.ui_muted)))
-                        .into_any_element()
-                }
+            let icon = match language {
+                Some(TemplateLanguage::Typst) => "file-typ",
+                Some(TemplateLanguage::Latex) => "file-tex",
+                _ => "folder",
             };
+            let kind = language.map_or("Project", |language| language.label()).to_uppercase();
+            let footer = if exists { format!("Opened {}", projects::ago(now, entry.last_opened)) } else { "Folder not found".to_string() };
             let menu_open = self.card_menu.as_ref() == Some(&path);
-            let (open_path, menu_path) = (path.clone(), path.clone());
+            let (open_path, menu_path, hover_path) = (path.clone(), path.clone(), path.clone());
             let menu = menu_open.then(|| self.render_card_menu(index, &path, &entry.title, exists, cx));
-            div()
-                .id(("hub-card", index))
-                .relative()
+            let preview = self
+                .preview
+                .as_ref()
+                .filter(|preview| preview.shown && preview.project == path)
+                .map(|preview| self.render_preview(preview, entry, position % self.columns.max(1), cx));
+            let sheet = |inset: f32| {
+                div()
+                    .absolute()
+                    .top(px(inset))
+                    .left(px(inset))
+                    .right(px(SHEET_OFFSET - inset))
+                    .bottom(px(SHEET_OFFSET - inset))
+                    .rounded(px(theme::RADIUS_SM))
+                    .bg(theme::color(sheet_color))
+                    .border_1()
+                    .border_color(theme::color(palette.divider))
+            };
+            let folder = div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right(px(SHEET_OFFSET))
+                .bottom(px(SHEET_OFFSET))
                 .flex()
                 .flex_col()
+                .pt(px(64.))
+                .pb(px(16.))
+                .pl(px(22.))
+                .pr(px(18.))
+                .overflow_hidden()
+                .rounded(px(theme::RADIUS_MD))
+                .bg(theme::color(palette.panel))
+                .border_color(theme::color(if selected { palette.accent } else { palette.divider }))
+                .when(selected, |style| style.border_2())
+                .when(!selected, |style| style.border_1().group_hover(group.clone(), |style| style.border_color(theme::color(palette.ui_muted))))
+                .shadow_sm()
+                .group_hover(group.clone(), |style| style.top(px(-2.)).shadow_md())
+                // The fold of the folder along its spine.
+                .child(div().absolute().top_0().bottom_0().left(px(7.)).w(px(1.)).bg(theme::color(palette.divider)))
+                .child(svg().path(format!("icons/{icon}.svg")).size(px(16.)).mb(px(10.)).text_color(theme::color(palette.ui_text)))
+                .child(title)
+                .child(
+                    div()
+                        .mt(px(4.))
+                        .truncate()
+                        .font_family(theme::MONO_FONT)
+                        .text_size(px(11.))
+                        .text_color(theme::color(palette.ui_muted))
+                        .child(projects::tilde(&path)),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .font_family(theme::MONO_FONT)
+                        .text_size(px(10.))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme::color(if exists { palette.ui_muted } else { palette.error }))
+                        .child(format!("{kind} - PROJECT FILE"))
+                        .child(div().font_weight(FontWeight::NORMAL).child(footer.to_uppercase())),
+                )
+                .when(paper, |element| {
+                    element.child(
+                        canvas(|_, _, _| {}, |bounds, _, window, _| crate::paper::paint(bounds, window)).absolute().top_0().left_0().size_full(),
+                    )
+                });
+            div()
+                .id(("hub-card", index))
+                .group(group.clone())
+                .relative()
                 .flex_none()
                 .w(px(CARD_WIDTH))
-                .rounded(px(theme::RADIUS_LG))
+                .h(px(CARD_HEIGHT))
                 .cursor_pointer()
-                .bg(theme::color(palette.panel))
-                .border_2()
-                .border_color(theme::color(if selected { palette.accent } else { palette.divider }))
-                .when(!selected, |style| style.hover(|style| style.border_color(theme::color(palette.ui_muted))))
+                .when(!exists, |style| style.opacity(0.4))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if this.rename.is_none() {
                         this.open_project(open_path.clone(), cx);
                     }
                 }))
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| this.hover_card(&hover_path, *hovered, cx)))
+                .child(sheet(SHEET_OFFSET))
+                .child(sheet(SHEET_OFFSET / 2.))
+                .child(folder)
                 .child(
-                    div()
-                        .h(px(THUMBNAIL_HEIGHT))
-                        .w_full()
-                        .overflow_hidden()
-                        .rounded_t(px(theme::RADIUS_LG - 2.))
-                        .bg(theme::color(if self.thumbnails.contains_key(&path) && matches!(self.thumbnails.get(&path), Some(Thumbnail::Ready(..))) {
-                            0xffffffff
-                        } else {
-                            palette.bg
-                        }))
-                        .when(!exists, |style| style.opacity(0.4))
-                        .child(preview),
+                    svg()
+                        .path("icons/paperclip.svg")
+                        .absolute()
+                        .top(px(-10.))
+                        .left(px(28.))
+                        .w(px(14.))
+                        .h(px(42.))
+                        .text_color(theme::color(palette.ui_muted)),
+                )
+                .child(
+                    svg()
+                        .path("icons/binder-clip.svg")
+                        .absolute()
+                        .top(px(118.))
+                        .left(px(CARD_WIDTH - SHEET_OFFSET - 33.))
+                        .w(px(44.))
+                        .h(px(32.))
+                        .text_color(theme::color(palette.ui_muted)),
                 )
                 .child(
                     div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(6.))
-                        .p(px(12.))
-                        .border_t_1()
-                        .border_color(theme::color(palette.divider))
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(6.))
-                                .child(div().flex_1().min_w_0().child(title))
-                                .child(
-                                    div()
-                                        .id(("hub-card-menu", index))
-                                        .flex_none()
-                                        .p(px(2.))
-                                        .rounded(px(theme::RADIUS_SM))
-                                        .hover(|style| style.bg(theme::color(palette.divider)))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.card_menu = if this.card_menu.as_ref() == Some(&menu_path) { None } else { Some(menu_path.clone()) };
-                                            cx.notify();
-                                        }))
-                                        .child(svg().path("icons/dots.svg").size(px(16.)).text_color(theme::color(palette.ui_muted))),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(8.))
-                                .text_color(theme::color(palette.ui_muted))
-                                .children(language.map(badge))
-                                .child(if exists { projects::ago(now, entry.last_opened) } else { "Folder not found".to_string() }),
-                        ),
+                        .id(("hub-card-menu", index))
+                        .absolute()
+                        .top(px(12.))
+                        .right(px(SHEET_OFFSET + 8.))
+                        .p(px(2.))
+                        .rounded(px(theme::RADIUS_SM))
+                        .hover(|style| style.bg(theme::color(palette.divider)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.preview = None;
+                            this.card_menu = if this.card_menu.as_ref() == Some(&menu_path) { None } else { Some(menu_path.clone()) };
+                            cx.notify();
+                        }))
+                        .child(svg().path("icons/dots.svg").size(px(16.)).text_color(theme::color(palette.ui_muted))),
                 )
                 .children(menu)
+                .children(preview)
         });
-        div().flex().flex_wrap().gap(px(CARD_GAP)).children(cards).into_any_element()
+        div().flex().flex_wrap().gap(px(CARD_GAP)).pt(px(6.)).children(cards).into_any_element()
+    }
+
+    /// The preview beside a folder: the pages to leaf through, the facts that tell
+    /// one version from another and the contents to jump to. It opens on the side
+    /// with room, the right for the left half of a row.
+    fn render_preview(&self, preview: &Preview, entry: &projects::ProjectEntry, column: usize, cx: &mut Context<Self>) -> AnyElement {
+        let palette = theme::palette();
+        let now = projects::now();
+        // The side with more room, so that the preview covers as few folders as it can.
+        let step = CARD_WIDTH + CARD_GAP;
+        let right_room = (self.columns.max(1) - 1 - column.min(self.columns.max(1) - 1)) as f32 * step;
+        let left_room = column as f32 * step + SIDEBAR_WIDTH + CONTENT_PADDING;
+        let left = right_room < PREVIEW_WIDTH && left_room > right_room;
+        let language = self.languages.get(&entry.path).copied().filter(|language| *language != TemplateLanguage::Other);
+        let has_pdf = preview.sheet.as_ref().is_some_and(|sheet| sheet.pdf.is_some());
+        let page: AnyElement = match preview.pages.get(&preview.page) {
+            Some(image) => img(image.clone()).size_full().object_fit(ObjectFit::Contain).into_any_element(),
+            None => div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .font_family(theme::MONO_FONT)
+                .text_color(theme::color(palette.ui_muted))
+                .child(match &preview.sheet {
+                    Some(sheet) if sheet.pdf.is_none() => "NOT BUILT YET",
+                    _ => "",
+                })
+                .into_any_element(),
+        };
+        let count = preview.page_count;
+        let pager = div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap(px(14.))
+            .h(px(28.))
+            .font_family(theme::MONO_FONT)
+            .text_color(theme::color(palette.ui_muted))
+            .when(has_pdf, |element| {
+                element
+                    .child(page_button("hub-preview-back", "chevron-left", preview.page > 0, cx, |this, cx| this.turn_page(false, cx)))
+                    .child(div().min_w(px(80.)).flex().justify_center().child(match count {
+                        Some(count) => format!("{} / {count}", preview.page + 1),
+                        None => String::new(),
+                    }))
+                    .child(page_button(
+                        "hub-preview-forward",
+                        "chevron-right",
+                        count.is_some_and(|count| preview.page + 1 < count),
+                        cx,
+                        |this, cx| this.turn_page(true, cx),
+                    ))
+            });
+        let pages = div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .gap(px(8.))
+            .child(
+                div()
+                    .id("hub-preview-page")
+                    .w(px(PREVIEW_PAGE_WIDTH))
+                    .h(px(PREVIEW_PAGE_HEIGHT))
+                    .bg(theme::color(if has_pdf { 0xffffff } else { palette.bg }))
+                    .border_1()
+                    .border_color(theme::color(palette.divider))
+                    .when(!has_pdf, |style| style.border_dashed())
+                    .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
+                        let delta = event.delta.pixel_delta(px(20.)).y.to_f64() as f32;
+                        let Some(preview) = this.preview.as_mut() else {
+                            return;
+                        };
+                        preview.scroll += delta;
+                        if preview.scroll.abs() >= PAGE_TURN_SCROLL {
+                            let forward = preview.scroll < 0.;
+                            preview.scroll = 0.;
+                            this.turn_page(forward, cx);
+                        }
+                    }))
+                    .child(page),
+            )
+            .child(pager);
+        let line = |key: &'static str, value: String| {
+            div()
+                .flex()
+                .gap(px(10.))
+                .child(div().flex_none().w(px(64.)).text_color(theme::color(palette.ui_muted)).child(key))
+                .child(div().flex_1().min_w_0().child(value))
+        };
+        let mut facts = div().flex().flex_col().gap(px(3.)).font_family(theme::MONO_FONT).text_size(px(12.)).line_height(px(17.));
+        if let Some(sheet) = &preview.sheet {
+            let kind = match (language, sheet.engine) {
+                (Some(language), Some(engine)) if language.label() != engine => format!("{} · {engine}", language.label()),
+                (Some(language), _) => language.label().to_string(),
+                (None, Some(engine)) => engine.to_string(),
+                (None, None) => String::new(),
+            };
+            let seconds = |time: &SystemTime| time.duration_since(UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_secs());
+            facts = facts
+                .when(!kind.is_empty(), |element| element.child(line("TYPE", kind)))
+                .children(count.map(|count| line("PAGES", count.to_string())))
+                .children(sheet.words.map(|words| line("WORDS", group_digits(words))))
+                .children(sheet.edited.as_ref().map(|edited| line("EDITED", projects::ago(now, seconds(edited)))));
+            if let Some((_, built)) = &sheet.pdf {
+                let behind = sheet.edited.is_some_and(|edited| edited > *built);
+                facts = facts.child(line("BUILT", format!("{}{}", projects::ago(now, seconds(built)), if behind { ", before the last edit" } else { "" })));
+            }
+            if let Some(head) = &sheet.git {
+                let version = match &head.branch {
+                    Some(branch) => format!("{branch} · {}", head.subject),
+                    None => head.subject.clone(),
+                };
+                facts = facts.child(line("VERSION", version));
+            }
+        }
+        let contents = (!preview.contents.is_empty()).then(|| self.render_contents(preview, cx));
+        let card = div()
+            .id("hub-preview")
+            .flex()
+            .gap(px(24.))
+            .p(px(20.))
+            .rounded(px(theme::RADIUS_LG))
+            .bg(theme::color(palette.panel))
+            .border_1()
+            .border_color(theme::color(palette.divider))
+            .shadow_lg()
+            .occlude()
+            .cursor_default()
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if let Some(preview) = this.preview.as_mut() {
+                    preview.over_preview = *hovered;
+                }
+                if !*hovered {
+                    this.leave_preview(cx);
+                }
+            }))
+            // A click on the preview must not reach the folder below.
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .child(pages)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(16.))
+                    .w(px(PREVIEW_SHEET_WIDTH))
+                    .h(px(PREVIEW_PAGE_HEIGHT + 36.))
+                    .text_color(theme::color(palette.ui_text))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(div().text_size(px(17.)).line_height(px(22.)).font_weight(FontWeight::SEMIBOLD).line_clamp(2).child(entry.title.clone()))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .font_family(theme::MONO_FONT)
+                                    .text_size(px(11.))
+                                    .text_color(theme::color(palette.ui_muted))
+                                    .child(projects::tilde(&entry.path)),
+                            ),
+                    )
+                    .child(facts)
+                    .map(|column| match contents {
+                        Some(contents) => column.child(contents),
+                        None => column.child(div().flex_1()),
+                    })
+                    .child(button("hub-preview-open", "Open project", true, cx, {
+                        let path = entry.path.clone();
+                        move |this, _, cx| this.open_project(path.clone(), cx)
+                    })),
+            );
+        // Padding and not margin keeps the gap, as the window's edge counts it.
+        let placed = div().when(left, |style| style.pr(px(12.))).when(!left, |style| style.pl(px(CARD_WIDTH + 12.))).child(card);
+        deferred(anchored().anchor(if left { Anchor::TopRight } else { Anchor::TopLeft }).snap_to_window_with_margin(px(8.)).child(placed))
+            .with_priority(1)
+            .into_any_element()
+    }
+
+    /// The contents of the previewed document, drawn like the outline beside the
+    /// editor: chapters as numbered pills on a line, sections as dots. An entry
+    /// whose page the PDF tells turns the preview to it.
+    fn render_contents(&self, preview: &Preview, cx: &mut Context<Self>) -> AnyElement {
+        let palette = theme::palette();
+        let pages = &preview.contents_pages;
+        // The entry of the page shown is the last one that starts on it or before.
+        let here = pages.iter().rposition(|page| page.is_some_and(|page| page <= preview.page));
+        let chapter = here.and_then(|here| preview.contents[..=here].iter().rposition(|item| item.depth == 0));
+        let rows = preview.contents.iter().enumerate().map(|(index, item)| {
+            let page = pages.get(index).copied().flatten();
+            let label = outline::marker_element(item, theme::color(palette.ui_muted));
+            let row = div()
+                .id(("hub-preview-chapter", index))
+                .relative()
+                .w_full()
+                .flex()
+                .when_some(page, |row, page| {
+                    row.cursor_pointer().hover(|style| style.bg(theme::color(palette.divider).opacity(0.35))).on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.go_to_page(page, cx);
+                        },
+                    ))
+                });
+            let page_number = div()
+                .flex_none()
+                .pl(px(8.))
+                .font_family(theme::MONO_FONT)
+                .text_size(px(11.))
+                .text_color(theme::color(palette.ui_muted))
+                .children(page.map(|page| (page + 1).to_string()));
+            if item.depth == 0 {
+                let ink = theme::color(palette.accent).opacity(if chapter == Some(index) { 1. } else { 0.6 });
+                return row
+                    .h(px(40.))
+                    .items_center()
+                    .pl(px(outline::SPINE - outline::PILL / 2.))
+                    .child(div().absolute().left_0().right_0().top(px(20.)).h(px(1.)).bg(theme::color(palette.divider)))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .w(px(outline::PILL))
+                            .h(px(20.))
+                            .rounded_full()
+                            .bg(ink)
+                            .text_size(px(11.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::color(palette.on_accent))
+                            .child(outline::marker_element(item, theme::color(palette.on_accent))),
+                    )
+                    .child(
+                        div()
+                            .relative()
+                            .min_w_0()
+                            .ml(px(6.))
+                            .px(px(6.))
+                            .bg(theme::color(palette.panel))
+                            .font_weight(FontWeight::MEDIUM)
+                            .truncate()
+                            .child(item.title.clone()),
+                    )
+                    .child(div().flex_1())
+                    .child(page_number.relative().bg(theme::color(palette.panel)))
+                    .into_any_element();
+            }
+            let dot_top = 5. + outline::LINE / 2.;
+            let dot = if here == Some(index) {
+                div()
+                    .absolute()
+                    .left(px(outline::SPINE - 4.5))
+                    .top(px(dot_top - 4.5))
+                    .size(px(9.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .border_1()
+                    .border_color(theme::color(palette.ui_text))
+                    .bg(theme::color(palette.panel))
+                    .child(div().size(px(3.)).rounded_full().bg(theme::color(palette.ui_text)))
+            } else {
+                div()
+                    .absolute()
+                    .left(px(outline::SPINE - 2.5))
+                    .top(px(dot_top - 2.5))
+                    .size(px(5.))
+                    .rounded_full()
+                    .map(|dot| {
+                        if item.depth == 1 {
+                            dot.bg(theme::color(palette.ui_text))
+                        } else {
+                            dot.border_1().border_color(theme::color(palette.ui_text)).bg(theme::color(palette.panel))
+                        }
+                    })
+            };
+            row.items_start()
+                .py(px(5.))
+                .pl(px(outline::SPINE + 12.))
+                .line_height(px(outline::LINE))
+                .child(dot)
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(34.))
+                        .font_family(theme::code_font())
+                        .text_size(px(11.))
+                        .text_color(theme::color(palette.ui_muted))
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .line_clamp(2)
+                        .text_ellipsis()
+                        .when(here == Some(index), |title| title.font_weight(FontWeight::MEDIUM))
+                        .child(item.title.clone()),
+                )
+                .child(page_number)
+                .into_any_element()
+        });
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .gap(px(6.))
+            .child(
+                div()
+                    .font_family(theme::MONO_FONT)
+                    .text_size(px(10.))
+                    .text_color(theme::color(palette.ui_muted))
+                    .child(format!("CONTENTS · {}", preview.contents.len())),
+            )
+            .child(
+                div().id("hub-preview-contents").flex_1().min_h_0().overflow_y_scroll().child(
+                    div()
+                        .relative()
+                        .w_full()
+                        .child(div().absolute().top_0().bottom_0().left(px(outline::SPINE - 0.5)).w(px(1.)).bg(theme::color(palette.divider)))
+                        .children(rows),
+                ),
+            )
+            .into_any_element()
     }
 
     fn render_card_menu(&self, index: usize, path: &Path, title: &str, exists: bool, cx: &mut Context<Self>) -> AnyElement {
@@ -1188,7 +1858,7 @@ impl HomeView {
         let rows = visible.iter().enumerate().map(|(position, &index)| {
             let entry = &self.registry.projects[index];
             let path = entry.path.clone();
-            let exists = path.is_dir();
+            let exists = !self.missing.contains(&path);
             let selected = position == self.selected;
             let renaming = self.rename.as_ref().filter(|rename| rename.target == RenameTarget::Project(path.clone()));
             let title: AnyElement = match renaming {
@@ -1196,10 +1866,18 @@ impl HomeView {
                 None => div().truncate().font_weight(FontWeight::MEDIUM).child(entry.title.clone()).into_any_element(),
             };
             let language = self.languages.get(&path).copied();
-            let (open_path, rename_path, template_path, remove_path) = (path.clone(), path.clone(), path.clone(), path.clone());
+            let (open_path, rename_path, template_path, remove_path, hover_path) = (path.clone(), path.clone(), path.clone(), path.clone(), path.clone());
             let current_title = entry.title.clone();
+            // Beside the title column, so that the row stays readable.
+            let preview = self
+                .preview
+                .as_ref()
+                .filter(|preview| preview.shown && preview.project == path)
+                .map(|preview| self.render_preview(preview, entry, 0, cx));
             div()
                 .id(("hub-project", index))
+                .relative()
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| this.hover_card(&hover_path, *hovered, cx)))
                 .flex()
                 .flex_none()
                 .items_center()
@@ -1246,6 +1924,7 @@ impl HomeView {
                             this.remove_project(remove_path.clone(), window, cx);
                         })),
                 )
+                .children(preview)
         });
         div().flex().flex_col().child(header).children(rows).into_any_element()
     }
@@ -1541,6 +2220,7 @@ impl HomeView {
 
 impl Render for HomeView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.scale = window.scale_factor();
         let available = (window.viewport_size().width.to_f64() as f32 - SIDEBAR_WIDTH - 2. * CONTENT_PADDING).min(CONTENT_WIDTH);
         self.columns = (((available + CARD_GAP) / (CARD_WIDTH + CARD_GAP)).floor() as usize).max(1);
         let content = match self.page {
@@ -1735,4 +2415,138 @@ fn link(
             handler(this, window, cx);
         }))
         .child(text.into())
+}
+
+/// Reads what the preview tells about a project. Blocks on the disk, and on git
+/// for a project in a repository.
+fn data_sheet(project: &Path) -> DataSheet {
+    let config = build::Config::load(project).unwrap_or_default();
+    let main = config
+        .main
+        .clone()
+        .or_else(|| ["main.typ", "main.tex"].into_iter().map(PathBuf::from).find(|name| project.join(name).is_file()))
+        .map(|main| project.join(main));
+    let engine = config.engine.or_else(|| main.as_deref().and_then(build::Engine::for_path)).map(build::Engine::label);
+    let mut edited: Option<SystemTime> = None;
+    let counted = main.as_ref().and_then(|main| {
+        let mut read = |path: &Path| {
+            let modified = std::fs::metadata(path).and_then(|metadata| metadata.modified()).ok();
+            edited = edited.max(modified);
+            std::fs::read_to_string(path).ok()
+        };
+        let text = read(main)?;
+        // LaTeX runs in the main file's folder, and Typst resolves `/` from the project.
+        let base = if Language::from_path(main) == Language::Typst { project } else { main.parent().unwrap_or(project) };
+        Some(word_count::count_words(main, &text, base, &mut read))
+    });
+    let words = counted.as_ref().map(word_count::WordCount::total);
+    let language = main.as_deref().map_or(Language::Latex, Language::from_path);
+    let contents = counted.map_or_else(Vec::new, |counted| outline::outline(&counted.outline, language));
+    // Only a project in a repository starts git.
+    let git = project
+        .ancestors()
+        .any(|folder| folder.join(".git").exists())
+        .then(crate::git_panel::program)
+        .flatten()
+        .and_then(|program| program.discover(project).ok().flatten())
+        .and_then(|repository| repository.head_summary());
+    DataSheet { engine, words, contents, edited, pdf: projects::newest_pdf(project), git }
+}
+
+/// 84210 as 84,210.
+fn group_digits(value: usize) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::new();
+    for (position, digit) in digits.chars().enumerate() {
+        if position > 0 && (digits.len() - position).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
+fn page_button(
+    id: &'static str,
+    icon: &'static str,
+    enabled: bool,
+    cx: &mut Context<HomeView>,
+    handler: impl Fn(&mut HomeView, &mut Context<HomeView>) + 'static,
+) -> impl IntoElement {
+    let palette = theme::palette();
+    div()
+        .id(id)
+        .p(px(4.))
+        .rounded(px(theme::RADIUS_SM))
+        .when(enabled, |style| {
+            style.cursor_pointer().hover(|style| style.bg(theme::color(palette.divider))).on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                handler(this, cx);
+            }))
+        })
+        .when(!enabled, |style| style.opacity(0.3))
+        .child(svg().path(format!("icons/{icon}.svg")).size(px(16.)).text_color(theme::color(palette.ui_text)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn heading(title: &str, depth: usize) -> OutlineItem {
+        OutlineItem {
+            level: depth,
+            title: title.to_string(),
+            line: 0,
+            depth,
+            has_children: false,
+            collapsed: false,
+            number: None,
+            kind: editor_core::HeadingKind::Section,
+        }
+    }
+
+    fn preview(contents: Vec<OutlineItem>, bookmarks: &[(&str, usize)]) -> Preview {
+        Preview {
+            project: PathBuf::new(),
+            shown: true,
+            over_card: false,
+            over_preview: false,
+            pinned: false,
+            sheet: Some(DataSheet { contents, ..DataSheet::default() }),
+            worker: None,
+            page: 0,
+            page_count: None,
+            pages: HashMap::new(),
+            contents: Vec::new(),
+            contents_pages: Vec::new(),
+            bookmarks: bookmarks.iter().map(|(title, page)| OutlineEntry { title: title.to_string(), level: 0, page: *page }).collect(),
+            scroll: 0.,
+            _task: Task::ready(()),
+            _closing: None,
+        }
+    }
+
+    #[test]
+    fn headings_find_their_pages_in_the_bookmarks() {
+        let contents = vec![heading("Introduction", 0), heading("Notes", 1), heading("The \\LaTeX{} way", 1), heading("End", 0)];
+        let mut preview = preview(contents, &[("1 Introduction", 0), ("1.1 The LaTeX way", 2), ("2 End", 5)]);
+        preview.link_pages();
+        assert_eq!(preview.contents_pages, [Some(0), None, Some(2), Some(5)]);
+    }
+
+    #[test]
+    fn without_sources_the_bookmarks_are_the_contents() {
+        let mut preview = preview(Vec::new(), &[("Start", 0), ("More", 3)]);
+        preview.link_pages();
+        assert_eq!(preview.contents.iter().map(|item| item.title.as_str()).collect::<Vec<_>>(), ["Start", "More"]);
+        assert_eq!(preview.contents_pages, [Some(0), Some(3)]);
+    }
+
+    #[test]
+    fn digits_come_in_groups_of_three() {
+        assert_eq!(group_digits(7), "7");
+        assert_eq!(group_digits(1000), "1,000");
+        assert_eq!(group_digits(84210), "84,210");
+        assert_eq!(group_digits(1234567), "1,234,567");
+    }
 }
