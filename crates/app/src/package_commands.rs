@@ -11,6 +11,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::projects::now;
+
 /// Files read per check, so that a package that loads half of TeX Live does
 /// not stall the next one.
 const MAX_FILES_PER_CHECK: usize = 20;
@@ -125,10 +127,6 @@ fn is_stale(entry: &CacheEntry) -> bool {
     modified(&entry.path) != Some(entry.modified)
 }
 
-fn now() -> u64 {
-    std::time::SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |time| time.as_secs())
-}
-
 fn sty(name: &str) -> String {
     format!("{name}.sty")
 }
@@ -155,10 +153,7 @@ fn find_installed(files: &[&str]) -> Vec<PathBuf> {
 }
 
 fn cache_path() -> Option<PathBuf> {
-    let cache = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
-    Some(cache.join("editor").join("packages.json"))
+    Some(crate::settings::cache_dir()?.join("packages.json"))
 }
 
 fn load_cache(path: &Path) -> Cache {

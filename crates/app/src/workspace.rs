@@ -844,7 +844,7 @@ impl Workspace {
         let (root, file) = if path.is_dir() {
             (path, None)
         } else {
-            let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from);
+            let home = projects::home();
             (projects::project_root_for(&path, self.root.as_deref(), &home), Some(path))
         };
         if self.root.as_deref() != Some(root.as_path()) {

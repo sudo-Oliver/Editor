@@ -1376,11 +1376,7 @@ impl HomeView {
                     .child(entry.title.to_uppercase())
                     .into_any_element(),
             };
-            let icon = match language {
-                Some(TemplateLanguage::Typst) => "file-typ",
-                Some(TemplateLanguage::Latex) => "file-tex",
-                _ => "folder",
-            };
+            let icon = language.unwrap_or(TemplateLanguage::Other).icon();
             let kind = language.map_or("Project", |language| language.label()).to_uppercase();
             let footer = if exists { format!("Opened {}", projects::ago(now, entry.last_opened)) } else { "Folder not found".to_string() };
             let menu_open = self.card_menu.as_ref() == Some(&path);
@@ -1425,7 +1421,7 @@ impl HomeView {
                 .group_hover(group.clone(), |style| style.top(px(-2.)).shadow_md())
                 // The fold of the folder along its spine.
                 .child(div().absolute().top_0().bottom_0().left(px(7.)).w(px(1.)).bg(theme::color(palette.divider)))
-                .child(svg().path(format!("icons/{icon}.svg")).size(px(16.)).mb(px(10.)).text_color(theme::color(palette.ui_text)))
+                .child(svg().path(icon).size(px(16.)).mb(px(10.)).text_color(theme::color(palette.ui_text)))
                 .child(title)
                 .child(
                     div()
@@ -1913,11 +1909,7 @@ impl HomeView {
                 None => div().truncate().font_weight(FontWeight::SEMIBOLD).child(template.name.clone()).into_any_element(),
             };
             let description = if template.description.is_empty() { "No description." } else { template.description.as_str() };
-            let icon = match template.language {
-                TemplateLanguage::Latex => "file-tex",
-                TemplateLanguage::Typst => "file-typ",
-                TemplateLanguage::Other => "folder",
-            };
+            let icon = template.language.icon();
             let current_name = template.name.clone();
             div()
                 .id(("hub-template", index))
@@ -1943,7 +1935,7 @@ impl HomeView {
                         .flex()
                         .items_center()
                         .justify_between()
-                        .child(svg().path(format!("icons/{icon}.svg")).size(px(24.)).text_color(theme::color(palette.accent)))
+                        .child(svg().path(icon).size(px(24.)).text_color(theme::color(palette.accent)))
                         .child(badge(template.language)),
                 )
                 .child(name)

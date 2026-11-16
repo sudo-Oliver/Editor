@@ -302,10 +302,6 @@ impl EditorState {
         self.read_only = read_only;
     }
 
-    pub fn is_read_only(&self) -> bool {
-        self.read_only
-    }
-
     /// Puts back text that a tracked deletion took out, since the session
     /// keeps it, struck through. The deletion leaves the undo history as if
     /// it never happened, so that undo cannot bring the text back twice.

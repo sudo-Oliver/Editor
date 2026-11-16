@@ -10,7 +10,7 @@ use tree_sitter::{Node, Parser};
 pub struct LoadedPackage {
     pub name: String,
     pub name_range: Range<usize>,
-    pub statement: Range<usize>,
+    statement: Range<usize>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

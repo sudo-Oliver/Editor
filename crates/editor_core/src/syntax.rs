@@ -637,10 +637,6 @@ impl Syntax {
         false
     }
 
-    pub fn has_tree(&self) -> bool {
-        self.tree.is_some()
-    }
-
     /// Headings of the last finished parse, so they can lag behind the latest edit.
     pub fn headings(&self) -> &[Heading] {
         &self.headings

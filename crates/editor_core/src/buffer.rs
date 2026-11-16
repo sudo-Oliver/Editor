@@ -81,7 +81,7 @@ impl Buffer {
         self.rope.byte_slice(range).to_string()
     }
 
-    pub fn byte_at(&self, offset: usize) -> u8 {
+    fn byte_at(&self, offset: usize) -> u8 {
         self.rope.byte(offset)
     }
 

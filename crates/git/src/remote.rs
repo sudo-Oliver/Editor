@@ -56,7 +56,7 @@ const AUTH_FAILURES: &[&str] = &[
 ];
 
 /// The host of an HTTPS remote URL.
-pub(crate) fn https_host(url: &str) -> Option<String> {
+fn https_host(url: &str) -> Option<String> {
     let rest = url.strip_prefix("https://")?;
     let authority = rest.split('/').next()?;
     let host = authority.rsplit('@').next()?;
@@ -76,7 +76,7 @@ impl Repository {
     }
 
     /// The URL of the upstream's remote, or of the only or `origin` remote.
-    pub fn remote_url(&self) -> Option<String> {
+    fn remote_url(&self) -> Option<String> {
         let remote = self
             .run(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"])
             .ok()
@@ -125,7 +125,7 @@ impl Repository {
         self.run(["rev-parse", "-q", "--verify", "MERGE_HEAD"]).is_ok()
     }
 
-    pub fn conflicted_files(&self) -> Vec<String> {
+    fn conflicted_files(&self) -> Vec<String> {
         self.run(["diff", "--name-only", "--diff-filter=U", "-z"])
             .map(|text| text.split('\0').filter(|path| !path.is_empty()).map(str::to_string).collect())
             .unwrap_or_default()

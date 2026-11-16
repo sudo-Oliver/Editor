@@ -11,10 +11,10 @@ macro_rules! icons {
 }
 
 icons!(
-    "addon", "arrow-left", "arrow-right", "book", "chevron-down", "chevron-left", "chevron-right",
+    "addon", "arrow-right", "book", "chevron-down", "chevron-left", "chevron-right",
     "chevron-up", "close", "contrast", "dots", "download", "file", "file-bib", "file-default",
     "file-markdown", "file-md", "file-plus", "file-tex", "file-toml", "file-txt", "file-typ", "folder",
-    "folder-plus", "git-branch", "help", "home", "image", "layout", "link", "log", "logo", "math", "minus",
+    "folder-plus", "git-branch", "help", "home", "image", "link", "log", "logo", "math", "minus",
     "notepad", "outline", "people", "plus", "position", "puzzle", "quote", "redo", "refresh", "settings", "sigma", "table", "undo", "upload", "vim",
     "check-circle", "clipboard", "grid", "list", "play", "wrench", "paperclip", "binder-clip",
 );

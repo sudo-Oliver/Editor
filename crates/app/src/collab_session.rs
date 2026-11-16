@@ -22,7 +22,7 @@ use gpui::{
 use serde::{Deserialize, Serialize};
 
 use super::{Dialog, LeftPanel, Menu, MenuEntry, Workspace, entry, menu_separator};
-use crate::{editor_view::EditorView, theme};
+use crate::{editor_view::EditorView, projects::now, theme};
 
 /// Files above this size stay out of a session, so that joining stays quick.
 const MAX_BLOB_BYTES: usize = 8 * 1024 * 1024;
@@ -241,10 +241,6 @@ fn fresh_folder(parent: &Path, name: &str) -> PathBuf {
         number += 1;
     }
     folder
-}
-
-fn now() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |duration| duration.as_secs())
 }
 
 fn project_name(root: &Path) -> String {
@@ -1042,7 +1038,7 @@ impl Workspace {
 
     /// Writes a review file where the user wants it.
     fn save_review_file(&mut self, bytes: Vec<u8>, name: String, done: String, cx: &mut Context<Self>) {
-        let directory = dirs_home();
+        let directory = crate::projects::home();
         let answer = cx.prompt_for_new_path(&directory, Some(&name));
         cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(target))) = answer.await else {
@@ -1999,10 +1995,6 @@ fn decorations_for(state: &CollabState, path: &str) -> Vec<Decoration> {
         });
     }
     decorations
-}
-
-fn dirs_home() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
 }
 
 #[cfg(test)]

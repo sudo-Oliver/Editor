@@ -34,6 +34,14 @@ impl TemplateLanguage {
             Self::Other => "Other",
         }
     }
+
+    pub fn icon(self) -> &'static str {
+        match self {
+            Self::Latex => "icons/file-tex.svg",
+            Self::Typst => "icons/file-typ.svg",
+            Self::Other => "icons/folder.svg",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -131,7 +139,7 @@ pub fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |time| time.as_secs())
 }
 
-fn home() -> PathBuf {
+pub fn home() -> PathBuf {
     std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from)
 }
 
@@ -139,7 +147,6 @@ fn folder_name(path: &Path) -> String {
     path.file_name().map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned())
 }
 
-/// The path with the home folder as `~`.
 /// The project that a file opened from Finder or the terminal belongs to: the
 /// open project if it holds the file, else the nearest folder above it with
 /// `.editor.toml` or `.git` below the home folder, else the file's own folder.
@@ -156,6 +163,7 @@ pub fn project_root_for(file: &Path, current: Option<&Path>, home: &Path) -> Pat
         .to_path_buf()
 }
 
+/// The path with the home folder as `~`.
 pub fn tilde(path: &Path) -> String {
     match path.strip_prefix(home()) {
         Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
