@@ -16,7 +16,7 @@ icons!(
     "file-markdown", "file-md", "file-plus", "file-tex", "file-toml", "file-txt", "file-typ", "folder",
     "folder-plus", "git-branch", "help", "home", "image", "layout", "link", "log", "logo", "math", "minus",
     "notepad", "outline", "people", "plus", "position", "puzzle", "quote", "redo", "refresh", "settings", "sigma", "table", "undo", "upload", "vim",
-    "check-circle", "clipboard", "grid", "list", "play", "wrench", "paperclip", "binder-clip",
+    "check-circle", "clipboard", "code", "grid", "list", "play", "wrench", "paperclip", "binder-clip",
 );
 
 /// iA Writer Quattro for paper mode, under the SIL Open Font License, see `assets/fonts/LICENSE.md`.
