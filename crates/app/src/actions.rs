@@ -1,4 +1,4 @@
-use gpui::{App, KeyBinding, actions};
+use gpui::{Action, App, KeyBinding, KeyBindingContextPredicate, actions};
 
 actions!(
     editor,
@@ -95,10 +95,17 @@ actions!(
     ]
 );
 
+/// A binding that may name `secondary`, which gpui resolves to `cmd` on macOS
+/// and to `ctrl` elsewhere only when it knows the platform.
+fn key<A: Action>(keystrokes: &str, action: A, context: Option<&str>, cx: &App) -> KeyBinding {
+    let predicate = context.map(|context| KeyBindingContextPredicate::parse(context).unwrap().into());
+    KeyBinding::load(keystrokes, Box::new(action), predicate, false, None, cx).unwrap()
+}
+
 pub fn bind_keys(cx: &mut App) {
     let editor = Some("Editor");
     let pdf = Some("PdfView");
-    cx.bind_keys([
+    let bindings = [
         // The backdrop of an open menu holds the focus, so this does not reach the editor.
         KeyBinding::new("escape", CloseMenu, None),
         KeyBinding::new("backspace", Backspace, editor),
@@ -124,10 +131,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("alt-right", MoveWordRight, editor),
         KeyBinding::new("alt-shift-left", SelectWordLeft, editor),
         KeyBinding::new("alt-shift-right", SelectWordRight, editor),
-        KeyBinding::new("secondary-a", SelectAll, editor),
-        KeyBinding::new("secondary-d", SelectNextOccurrence, editor),
-        KeyBinding::new("secondary-alt-up", AddCursorAbove, editor),
-        KeyBinding::new("secondary-alt-down", AddCursorBelow, editor),
+        key("secondary-a", SelectAll, editor, cx),
+        key("secondary-d", SelectNextOccurrence, editor, cx),
+        key("secondary-alt-up", AddCursorAbove, editor, cx),
+        key("secondary-alt-down", AddCursorBelow, editor, cx),
         KeyBinding::new("escape", CollapseSelections, editor),
         KeyBinding::new("enter", Newline, editor),
         KeyBinding::new("tab", Indent, editor),
@@ -139,42 +146,43 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("up", PreviousCompletion, Some("Completion")),
         KeyBinding::new("ctrl-p", PreviousCompletion, Some("Completion")),
         KeyBinding::new("escape", CloseCompletion, Some("Completion")),
-        KeyBinding::new("secondary-z", Undo, editor),
-        KeyBinding::new("secondary-shift-z", Redo, editor),
-        KeyBinding::new("secondary-y", Redo, editor),
-        KeyBinding::new("secondary-c", Copy, editor),
-        KeyBinding::new("secondary-x", Cut, editor),
-        KeyBinding::new("secondary-v", Paste, editor),
-        KeyBinding::new("secondary-b", Bold, editor),
-        KeyBinding::new("secondary-i", Italic, editor),
-        KeyBinding::new("secondary-c", Copy, pdf),
-        KeyBinding::new("secondary-[", PdfBack, pdf),
-        KeyBinding::new("secondary-]", PdfForward, pdf),
+        key("secondary-z", Undo, editor, cx),
+        key("secondary-shift-z", Redo, editor, cx),
+        key("secondary-y", Redo, editor, cx),
+        key("secondary-c", Copy, editor, cx),
+        key("secondary-x", Cut, editor, cx),
+        key("secondary-v", Paste, editor, cx),
+        key("secondary-b", Bold, editor, cx),
+        key("secondary-i", Italic, editor, cx),
+        key("secondary-c", Copy, pdf, cx),
+        key("secondary-[", PdfBack, pdf, cx),
+        key("secondary-]", PdfForward, pdf, cx),
         KeyBinding::new("alt-left", PdfBack, pdf),
         KeyBinding::new("alt-right", PdfForward, pdf),
-        KeyBinding::new("secondary-s", Save, None),
-        KeyBinding::new("secondary-shift-c", InsertCitation, None),
-        KeyBinding::new("secondary-shift-d", LookupDoi, None),
-        KeyBinding::new("secondary-.", QuickFix, None),
-        KeyBinding::new("secondary-enter", Recompile, None),
-        KeyBinding::new("secondary-n", NewFile, None),
-        KeyBinding::new("secondary-o", OpenFolder, None),
-        KeyBinding::new("secondary-w", CloseTab, None),
-        KeyBinding::new("secondary-1", GoToTab1, None),
-        KeyBinding::new("secondary-2", GoToTab2, None),
-        KeyBinding::new("secondary-3", GoToTab3, None),
-        KeyBinding::new("secondary-4", GoToTab4, None),
-        KeyBinding::new("secondary-5", GoToTab5, None),
-        KeyBinding::new("secondary-6", GoToTab6, None),
-        KeyBinding::new("secondary-7", GoToTab7, None),
-        KeyBinding::new("secondary-8", GoToTab8, None),
-        KeyBinding::new("secondary-9", GoToTab9, None),
-        KeyBinding::new("secondary-q", Quit, None),
-        KeyBinding::new("secondary-,", OpenSettings, None),
-        KeyBinding::new("secondary-shift-m", ToggleFocusMode, None),
-        KeyBinding::new("secondary-shift-p", ToggleHub, None),
-        KeyBinding::new("secondary-shift-g", OpenGitPanel, None),
-    ]);
+        key("secondary-s", Save, None, cx),
+        key("secondary-shift-c", InsertCitation, None, cx),
+        key("secondary-shift-d", LookupDoi, None, cx),
+        key("secondary-.", QuickFix, None, cx),
+        key("secondary-enter", Recompile, None, cx),
+        key("secondary-n", NewFile, None, cx),
+        key("secondary-o", OpenFolder, None, cx),
+        key("secondary-w", CloseTab, None, cx),
+        key("secondary-1", GoToTab1, None, cx),
+        key("secondary-2", GoToTab2, None, cx),
+        key("secondary-3", GoToTab3, None, cx),
+        key("secondary-4", GoToTab4, None, cx),
+        key("secondary-5", GoToTab5, None, cx),
+        key("secondary-6", GoToTab6, None, cx),
+        key("secondary-7", GoToTab7, None, cx),
+        key("secondary-8", GoToTab8, None, cx),
+        key("secondary-9", GoToTab9, None, cx),
+        key("secondary-q", Quit, None, cx),
+        key("secondary-,", OpenSettings, None, cx),
+        key("secondary-shift-m", ToggleFocusMode, None, cx),
+        key("secondary-shift-p", ToggleHub, None, cx),
+        key("secondary-shift-g", OpenGitPanel, None, cx),
+    ];
+    cx.bind_keys(bindings);
     // The slides of a talk turn with every key a clicker or a hand reaches first.
     let presentation = Some("Presentation");
     cx.bind_keys([
