@@ -1,4 +1,5 @@
 pub mod vim;
+pub mod vim_map;
 pub mod buffer;
 pub mod conflicts;
 pub mod line_diff;

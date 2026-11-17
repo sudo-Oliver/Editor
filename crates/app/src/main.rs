@@ -12,6 +12,7 @@ mod git_login;
 mod git_panel;
 mod home_view;
 mod image_view;
+mod keymap;
 mod marketplace;
 mod nvim_themes;
 mod outline;
@@ -64,7 +65,6 @@ fn main() {
             cx.text_system()
                 .add_fonts(assets::FONTS.iter().map(|font| std::borrow::Cow::Borrowed(*font)).collect())
                 .expect("the bundled fonts load");
-            actions::bind_keys(cx);
             cx.on_action(|_: &actions::Quit, cx| cx.quit());
             cx.set_menus([Menu::new("Editor").items([MenuItem::action("Quit", actions::Quit)])]);
 
