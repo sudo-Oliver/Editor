@@ -476,6 +476,11 @@ fn luminance(color: u32) -> f32 {
 }
 
 /// A tone above the panel for the chosen row, like a sheet lifted off the desk.
+/// Text drawn on the block cursor, so the character under it stays readable.
+pub fn on_caret(palette: &Palette) -> u32 {
+    readable(palette.bg, palette.caret, TEXT_CONTRAST)
+}
+
 pub fn raised(palette: &Palette) -> u32 {
     if is_light(palette.panel) { mix(palette.panel, 0xffffff, 0.7) } else { mix(palette.panel, palette.ui_text, 0.12) }
 }
@@ -748,6 +753,14 @@ pub(crate) mod tests {
     fn text_reads_on_the_raised_row() {
         for (name, palette) in BUILT_IN {
             assert!(contrast(palette.ui_text, raised(&palette)) >= TEXT_CONTRAST, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_character_under_the_block_cursor_reads() {
+        let paper = [("paper-ink", Palette::PAPER_INK), ("paper-ink-dark", Palette::PAPER_INK_DARK)];
+        for (name, palette) in BUILT_IN.into_iter().chain(paper) {
+            assert!(contrast(on_caret(&palette), palette.caret) >= TEXT_CONTRAST, "{name}");
         }
     }
 
