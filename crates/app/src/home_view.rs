@@ -186,8 +186,6 @@ enum HubDialog {
         name: Entity<EditorView>,
         location: PathBuf,
         template: usize,
-        /// Text from the clipboard that becomes the main file, in place of a template.
-        pasted: Option<(TemplateLanguage, String)>,
         error: Option<String>,
         busy: bool,
     },
@@ -596,35 +594,13 @@ impl HomeView {
         self.dialog_observers = vec![cx.observe(&name, |_, _, cx| cx.notify())];
         window.focus(&name.read(cx).focus_handle(cx), cx);
         let template = template.min(self.templates.len().saturating_sub(1));
-        self.dialog = Some(HubDialog::NewProject { name, location: self.registry.location(), template, pasted: None, error: None, busy: false });
+        self.dialog = Some(HubDialog::NewProject { name, location: self.registry.location(), template, error: None, busy: false });
         cx.notify();
     }
 
     /// The template named `name`, such as "Empty LaTeX", for the cards on top.
     fn template_named(&self, name: &str) -> usize {
         self.templates.iter().position(|template| template.name == name).unwrap_or(0)
-    }
-
-    /// A new project from what Claude or anyone else wrote, taken from the clipboard.
-    fn paste_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let text = cx.read_from_clipboard().and_then(|item| item.text()).unwrap_or_default();
-        if text.trim().is_empty() {
-            self.message = Some("The clipboard is empty. Copy the LaTeX or Typst from Claude first, then click Paste from Claude again.".to_string());
-            return cx.notify();
-        }
-        let language = projects::guess_language(&text);
-        let name = plain_field("", cx);
-        self.dialog_observers = vec![cx.observe(&name, |_, _, cx| cx.notify())];
-        window.focus(&name.read(cx).focus_handle(cx), cx);
-        self.dialog = Some(HubDialog::NewProject {
-            name,
-            location: self.registry.location(),
-            template: 0,
-            pasted: Some((language, text)),
-            error: None,
-            busy: false,
-        });
-        cx.notify();
     }
 
     fn close_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -664,7 +640,7 @@ impl HomeView {
 
     fn confirm_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match &mut self.dialog {
-            Some(HubDialog::NewProject { name, location, template, pasted, error, busy }) => {
+            Some(HubDialog::NewProject { name, location, template, error, busy }) => {
                 if *busy {
                     return;
                 }
@@ -682,16 +658,10 @@ impl HomeView {
                 };
                 *busy = true;
                 let location = location.clone();
-                let pasted = pasted.clone();
                 cx.spawn_in(window, async move |this, cx| {
                     let target = dir.clone();
                     let created = cx
-                        .background_spawn(async move {
-                            match pasted {
-                                Some((language, text)) => projects::create_from_text(&target, language, &text),
-                                None => projects::create_project(&template, &target),
-                            }
-                        })
+                        .background_spawn(async move { projects::create_project(&template, &target) })
                         .await;
                     this.update_in(cx, |this, window, cx| match created {
                         Ok(()) => {
@@ -1274,9 +1244,6 @@ impl HomeView {
                     }))
                     .child(self.action_card("hub-start-typst", "file-typ", "Blank Typst", "A short document in the newer Typst language.", cx, move |this, window, cx| {
                         this.open_new_project(typst, window, cx)
-                    }))
-                    .child(self.action_card("hub-start-paste", "clipboard", "Paste from Claude", "Copied LaTeX or Typst becomes a new project.", cx, |this, window, cx| {
-                        this.paste_project(window, cx)
                     }))
                     .child(self.action_card("hub-start-open", "folder", "Open folder", "A project you already have on this Mac.", cx, |this, _, cx| {
                         this.prompt_open_folder(cx)
@@ -2070,7 +2037,7 @@ impl HomeView {
 
     fn render_dialog(&self, dialog: &HubDialog, cx: &mut Context<Self>) -> impl IntoElement {
         let (title, body, error, busy, confirm): (&str, AnyElement, Option<&String>, bool, &str) = match dialog {
-            HubDialog::NewProject { name, location, template, pasted, error, busy } => {
+            HubDialog::NewProject { name, location, template, error, busy } => {
                 let entries: Vec<(TemplateLanguage, String, String)> =
                     self.templates.iter().map(|entry| (entry.language, entry.name.clone(), entry.description.clone())).collect();
                 let templates: Vec<AnyElement> = entries.into_iter().enumerate().map(|(index, (language, name, description))| {
@@ -2112,41 +2079,10 @@ impl HomeView {
                             .child(div().flex_1().min_w_0().truncate().child(projects::tilde(&location.join(field_text(name, cx).trim()))))
                             .child(button("hub-browse", "Browse…", false, cx, |this, _, cx| this.browse_location(cx))),
                     )
-                    .when(pasted.is_none(), |element| {
-                        element
-                            .child(label("Template"))
-                            .child(div().id("hub-dialog-templates").flex().flex_col().max_h(px(260.)).overflow_y_scroll().children(templates))
-                    })
-                    .when_some(pasted.as_ref(), |element, (language, text)| {
-                        let lines = text.lines().count();
-                        let preview: String = text.lines().take(8).collect::<Vec<_>>().join("\n");
-                        element
-                            .child(label("From the clipboard"))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(8.))
-                                    .text_color(theme::color(theme::palette().ui_muted))
-                                    .child(badge(*language))
-                                    .child(format!("{lines} lines become {}", if *language == TemplateLanguage::Typst { "main.typ" } else { "main.tex" })),
-                            )
-                            .child(
-                                div()
-                                    .max_h(px(150.))
-                                    .overflow_hidden()
-                                    .p(px(8.))
-                                    .rounded(px(theme::RADIUS_SM))
-                                    .bg(theme::color(theme::palette().bg))
-                                    .font_family(theme::code_font())
-                                    .text_size(px(theme::code_font_size()))
-                                    .text_color(theme::color(theme::palette().ui_muted))
-                                    .child(preview),
-                            )
-                    })
+                    .child(label("Template"))
+                    .child(div().id("hub-dialog-templates").flex().flex_col().max_h(px(260.)).overflow_y_scroll().children(templates))
                     .into_any_element();
-                let title = if pasted.is_some() { "New project from the clipboard" } else { "New project" };
-                (title, body, error.as_ref(), *busy, "Create")
+                ("New project", body, error.as_ref(), *busy, "Create")
             }
             HubDialog::SaveTemplate { from, language, name, description, error, busy } => {
                 let body = div()
