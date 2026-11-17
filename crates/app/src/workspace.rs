@@ -5097,7 +5097,7 @@ impl Workspace {
                 let row_bg = if inked {
                     palette.accent
                 } else if selected {
-                    theme::raised(&palette)
+                    theme::selected_row(&palette)
                 } else {
                     palette.panel
                 };
@@ -5114,7 +5114,7 @@ impl Workspace {
                     .pr(px(12.))
                     .cursor_pointer()
                     .when(!selected && !inked, |style| {
-                        style.when(tree_cursor == Some(index), |style| style.bg(shade)).hover(|style| style.bg(shade))
+                        style.hover(|style| style.bg(shade))
                     })
                     .on_mouse_down(
                         MouseButton::Right,
@@ -5158,6 +5158,21 @@ impl Workspace {
                                 .right_0()
                                 .rounded_full()
                                 .bg(theme::color(row_bg)),
+                        )
+                    })
+                    // The row that Enter opens while the tree has the keys, ringed in
+                    // the color of its text so it shows on the open file too.
+                    .when(tree_cursor == Some(index), |element| {
+                        element.child(
+                            div()
+                                .absolute()
+                                .top(px(2.))
+                                .bottom(px(2.))
+                                .left(px(indent - 10.))
+                                .right_0()
+                                .rounded_full()
+                                .border(px(1.5))
+                                .border_color(theme::color(text)),
                         )
                     })
                     .child(

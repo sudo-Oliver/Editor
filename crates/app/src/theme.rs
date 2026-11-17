@@ -481,6 +481,12 @@ pub fn on_caret(palette: &Palette) -> u32 {
     readable(palette.bg, palette.caret, TEXT_CONTRAST)
 }
 
+/// The open file in the file tree. On a dark panel the raised shade is too
+/// faint to find, so the row takes more of the text color.
+pub fn selected_row(palette: &Palette) -> u32 {
+    if is_light(palette.panel) { raised(palette) } else { mix(palette.panel, palette.ui_text, 0.24) }
+}
+
 pub fn raised(palette: &Palette) -> u32 {
     if is_light(palette.panel) { mix(palette.panel, 0xffffff, 0.7) } else { mix(palette.panel, palette.ui_text, 0.12) }
 }
@@ -753,6 +759,16 @@ pub(crate) mod tests {
     fn text_reads_on_the_raised_row() {
         for (name, palette) in BUILT_IN {
             assert!(contrast(palette.ui_text, raised(&palette)) >= TEXT_CONTRAST, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_open_file_stands_out_on_a_dark_panel() {
+        let paper = [("paper-ink-dark", Palette::PAPER_INK_DARK)];
+        for (name, palette) in BUILT_IN.into_iter().chain(paper).filter(|(_, palette)| !is_light(palette.panel)) {
+            let row = selected_row(&palette);
+            assert!(contrast(row, palette.panel) >= 1.6, "{name}");
+            assert!(contrast(palette.ui_text, row) >= TEXT_CONTRAST, "{name}");
         }
     }
 
