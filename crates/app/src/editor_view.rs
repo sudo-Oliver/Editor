@@ -1130,6 +1130,23 @@ impl EditorView {
             .text_system()
             .shape_line(display, px(theme::code_font_size()), &runs, None)
     }
+
+    /// One character in the font of its highlight, colored to read on the block cursor.
+    fn shape_on_caret(&self, glyph: &str, kind: Option<HighlightKind>, window: &mut Window) -> ShapedLine {
+        let (_, italic, weight) = theme::highlight_style(kind);
+        let style = if italic { FontStyle::Italic } else { FontStyle::Normal };
+        let run = TextRun {
+            len: glyph.len(),
+            font: Self::font(style, weight),
+            color: theme::color(theme::on_caret(&theme::palette())),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        window
+            .text_system()
+            .shape_line(glyph.to_string().into(), px(theme::code_font_size()), &[run], None)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1450,6 +1467,8 @@ struct EditorPrepaint {
     selections: Vec<PaintQuad>,
     cursors: Vec<PaintQuad>,
     block: Option<PaintQuad>,
+    /// The character under the block, again in a color that reads on the caret.
+    cursor_glyph: Option<(Point<Pixels>, ShapedLine)>,
     trail: Option<Vec<Point<Pixels>>>,
     squiggles: Vec<(Point<Pixels>, Pixels, u32)>,
     marked: Vec<(Point<Pixels>, Pixels)>,
@@ -1601,6 +1620,11 @@ impl Element for EditorElement {
                     )
                     .ok();
             }
+            if focus_handle.is_focused(window)
+                && let Some((origin, glyph)) = &prepaint.cursor_glyph
+            {
+                glyph.paint(*origin, line_height, TextAlign::Left, None, window, cx).ok();
+            }
             for (origin, width, color) in &prepaint.squiggles {
                 window.paint_underline(
                     *origin,
@@ -1707,6 +1731,7 @@ impl EditorView {
         let cursor_line = vim_cursor.map(|(offset, _)| buffer.offset_to_line(offset));
         let shows_block = vim_cursor.is_some_and(|(_, mode)| mode != Mode::Insert);
         let mut cursor_cell: Option<(Pixels, f32, Pixels)> = None;
+        let mut cursor_glyph = None;
         let mut search_hits = Vec::new();
         let mut hits_in_line: Vec<Range<usize>> = Vec::new();
 
@@ -1801,6 +1826,11 @@ impl EditorView {
                     left + px(FALLBACK_CHAR_WIDTH)
                 };
                 cursor_cell = Some((left, row as f32 * theme::code_line_height(), (right - left).max(px(1.))));
+                let glyph = &text[offset - line_start..next.max(offset) - line_start];
+                if shows_block && !glyph.trim().is_empty() {
+                    let shaped = self.shape_on_caret(glyph, kinds.get(offset - line_start).copied().flatten(), window);
+                    cursor_glyph = Some((point(text_left + left, y), shaped));
+                }
             }
 
             for selection in &selections {
@@ -1986,6 +2016,7 @@ impl EditorView {
             selections: selection_quads,
             cursors,
             block,
+            cursor_glyph,
             trail,
             squiggles,
             marked,
