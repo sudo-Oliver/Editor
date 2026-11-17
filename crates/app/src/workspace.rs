@@ -25,7 +25,7 @@ use editor_core::{
 use gpui::{
     AnyElement, Anchor, App, AsyncWindowContext, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Entity, FocusHandle, Focusable, FontWeight, Keystroke,
     KeystrokeEvent, MouseButton, MouseDownEvent, MouseMoveEvent, PathPromptOptions, Pixels, Point, Render, ScrollHandle, ScrollStrategy, SharedString, UniformListScrollHandle,
-    EntityId, PromptLevel, Subscription, Task, WeakEntity, Window, anchored, black, canvas, deferred, div, fill, point, prelude::*, px, size, uniform_list, svg,
+    EntityId, PromptLevel, Subscription, Task, WeakEntity, Window, anchored, black, canvas, deferred, div, fill, img, point, prelude::*, px, size, uniform_list, svg,
 };
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use synctex::SyncTex;
@@ -37,6 +37,7 @@ use crate::{
     bib,
     completion::Extra,
     marketplace::{self, CatalogEntry},
+    material_icons,
     editor_view::{EditorEvent, EditorView, FormatKind, is_save_conflict},
     export::{self, DraftFormat, PdfState},
     file_tree::{self, TreeEntry},
@@ -5030,15 +5031,15 @@ impl Workspace {
             )
     }
 
-    fn file_icon(entry: &TreeEntry) -> &'static str {
-        if entry.is_dir {
-            return "folder";
-        }
-        match entry.path.extension().and_then(|extension| extension.to_str()) {
-            Some("png" | "jpg" | "jpeg" | "gif" | "svg" | "pdf" | "eps") => "image",
-            Some("bib") => "book",
-            _ => "file",
-        }
+    /// The Material icon of a row, in two tones of ink on paper.
+    fn tree_icon(&self, entry: &TreeEntry, collapsed: bool, ink: u32, row_bg: u32) -> impl IntoElement + use<> {
+        let path = if entry.is_dir {
+            material_icons::folder(&entry.name, !collapsed)
+        } else {
+            material_icons::file(&entry.name)
+        };
+        let path = if self.settings.paper_mode { material_icons::inked(&path, ink, row_bg) } else { path };
+        img(path).size(px(TREE_ICON)).flex_none()
     }
 
     /// Only the rows in view exist, because a project can hold many thousand files.
@@ -5093,11 +5094,14 @@ impl Workspace {
                 let indent = TREE_INSET + entry.depth as f32 * TREE_INDENT;
                 let field = renaming.as_ref().filter(|(path, _)| *path == entry.path).map(|(_, view)| view.clone());
                 let menu_path = entry.path.clone();
-                let (text, icon_color) = if inked {
-                    (palette.on_accent, palette.on_accent)
+                let row_bg = if inked {
+                    palette.accent
+                } else if selected {
+                    theme::raised(&palette)
                 } else {
-                    (palette.ui_text, if is_dir { palette.folder } else { palette.ui_text })
+                    palette.panel
                 };
+                let text = if inked { palette.on_accent } else { palette.ui_text };
                 div()
                     .id(index)
                     .relative()
@@ -5153,14 +5157,14 @@ impl Workspace {
                                 .left(px(indent - 10.))
                                 .right_0()
                                 .rounded_full()
-                                .bg(theme::color(if inked { palette.accent } else { theme::raised(&palette) })),
+                                .bg(theme::color(row_bg)),
                         )
                     })
                     .child(
                         div()
                             .relative()
                             .flex_none()
-                            .child(Self::icon(Self::file_icon(entry), TREE_ICON, icon_color))
+                            .child(self.tree_icon(entry, collapsed, text, row_bg))
                             .children(git_mark.map(|(_, color)| {
                                 div().absolute().top(px(-1.)).right(px(-2.)).size(px(6.)).rounded_full().bg(theme::color(color))
                             })),

@@ -2,6 +2,8 @@ use std::borrow::Cow;
 
 use gpui::{AssetSource, Result, SharedString};
 
+use crate::material_icons;
+
 macro_rules! icons {
     ($($name:literal),* $(,)?) => {
         const ICONS: &[(&str, &[u8])] = &[
@@ -35,8 +37,12 @@ impl AssetSource for Assets {
         if path.starts_with('/') {
             return Ok(std::fs::read(path).ok().map(Cow::Owned));
         }
+        if path.starts_with(material_icons::INK_PREFIX) {
+            return Ok(material_icons::load_inked(path).map(Cow::Owned));
+        }
         Ok(ICONS
             .iter()
+            .chain(material_icons::ICONS)
             .find(|(name, _)| *name == path)
             .map(|(_, bytes)| Cow::Borrowed(*bytes)))
     }
@@ -44,6 +50,7 @@ impl AssetSource for Assets {
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         Ok(ICONS
             .iter()
+            .chain(material_icons::ICONS)
             .filter(|(name, _)| name.starts_with(path))
             .map(|(name, _)| SharedString::from(*name))
             .collect())
