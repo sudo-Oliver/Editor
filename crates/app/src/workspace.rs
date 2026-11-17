@@ -5073,9 +5073,11 @@ impl Workspace {
     fn render_tree_rows(&self, range: Range<usize>, window: &Window, cx: &mut Context<Self>) -> Vec<impl IntoElement + use<>> {
         let palette = theme::palette();
         let tree_cursor = self.tree_focus.is_focused(window).then_some(self.tree_cursor);
-        let active_path = self
-            .active_view()
-            .and_then(|view| view.read(cx).path.clone());
+        // A shown image tab covers the document, so its file is the one marked.
+        let active_path = match self.image_preview() {
+            Some(image) => Some(image.view.read(cx).path().to_path_buf()),
+            None => self.active_view().and_then(|view| view.read(cx).path.clone()),
+        };
         let active_folder = active_path.as_deref().and_then(Path::parent).map(Path::to_path_buf);
         let shade = theme::color(palette.divider).opacity(0.35);
         let renaming = self.tree_input.as_ref().and_then(|input| input.renaming.clone().map(|path| (path, input.view.clone())));
