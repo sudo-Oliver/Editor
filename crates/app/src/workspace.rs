@@ -149,6 +149,7 @@ enum Menu {
     Compile,
     Symbols,
     Table,
+    Code,
     /// The right-click menu of a row in the file tree.
     Tree,
 }
@@ -2321,13 +2322,7 @@ impl Workspace {
         let Some(path) = path.map(Path::to_path_buf).or_else(|| self.last_main.clone()) else {
             return;
         };
-        if !self.documents.iter().any(|document| document.view.read(cx).path.as_deref() == Some(path.as_path())) {
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                return self.set_status(format!("Cannot read {}.", path.display()), cx);
-            };
-            self.add_document(path.clone(), &text, cx);
-        }
-        let Some(view) = self.documents.iter().map(|document| document.view.clone()).find(|view| view.read(cx).path.as_deref() == Some(path.as_path())) else {
+        let Some(view) = self.document_view(&path, cx) else {
             return;
         };
         let text = view.read(cx).state.buffer().to_string();
@@ -2346,6 +2341,39 @@ impl Workspace {
             Fix::InstallTool(_) => return,
         };
         self.set_status(done, cx);
+    }
+
+    /// The view of the file at `path`, opened in the background when needed.
+    fn document_view(&mut self, path: &Path, cx: &mut Context<Self>) -> Option<Entity<EditorView>> {
+        if !self.documents.iter().any(|document| document.view.read(cx).path.as_deref() == Some(path)) {
+            let Ok(text) = std::fs::read_to_string(path) else {
+                self.set_status(format!("Cannot read {}.", path.display()), cx);
+                return None;
+            };
+            self.add_document(path.to_path_buf(), &text, cx);
+        }
+        self.documents.iter().map(|document| document.view.clone()).find(|view| view.read(cx).path.as_deref() == Some(path))
+    }
+
+    /// Loads `listings` and `xcolor` and colors code blocks, in the preamble of
+    /// the shown file or else of the main file.
+    fn set_up_listings(&mut self, cx: &mut Context<Self>) {
+        let Some(active) = self.active_view() else {
+            return;
+        };
+        let text = active.read(cx).state.buffer().to_string();
+        let view = if text.contains("\\documentclass") {
+            Some(active)
+        } else {
+            self.last_main.clone().and_then(|main| self.document_view(&main, cx))
+        };
+        let Some(view) = view else {
+            return;
+        };
+        let text = view.read(cx).state.buffer().to_string();
+        if let Some((range, new_text)) = package_check::listings_setup(&text) {
+            view.update(cx, |view, cx| view.edit_from_outside(range, &new_text, cx));
+        }
     }
 
     /// The package hint on the line of the cursor.
@@ -4621,7 +4649,7 @@ impl Workspace {
                 }),
             ],
             Menu::Tree => self.tree_menu_entries(),
-            Menu::Symbols | Menu::Table => Vec::new(),
+            Menu::Symbols | Menu::Table | Menu::Code => Vec::new(),
             Menu::Help => vec![
                 entry("Editor tour", "", |this, window, cx| this.start_tour(window, cx)),
                 entry("Keyboard shortcuts", "", |this, window, cx| {
@@ -5808,6 +5836,29 @@ impl Workspace {
         )
     }
 
+    /// The languages a code block can be highlighted in.
+    fn render_code_languages(&self, language: Language, cx: &mut Context<Self>) -> AnyElement {
+        let rows = snippets::CODE_LANGUAGES.iter().enumerate().map(|(index, code)| {
+            div()
+                .id(("code-language", index))
+                .px(px(8.))
+                .py(px(3.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .hover(|style| style.bg(theme::color(theme::palette().divider)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.close_menu(window, cx);
+                    // The preamble first, so that the cursor moves with it.
+                    if language == Language::Latex {
+                        this.set_up_listings(cx);
+                    }
+                    this.insert_snippet(&snippets::code_block(language, code), false, cx);
+                }))
+                .child(code.label)
+        });
+        self.render_popup("code-languages", div().flex().flex_col().min_w(px(140.)).children(rows))
+    }
+
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let separator = || div().w(px(1.)).h(px(14.)).mx(px(6.)).bg(theme::color(theme::palette().divider));
         let palette = theme::palette();
@@ -5877,6 +5928,9 @@ impl Workspace {
                     }))
                     .child(self.popup_button("table", "table", Menu::Table, cx, move |this, cx| {
                         this.render_table_grid(language, cx)
+                    }))
+                    .child(self.popup_button("code", "code", Menu::Code, cx, move |this, cx| {
+                        this.render_code_languages(language, cx)
                     }))
                     .child(self.tool_button("figure", "image", cx, |this, window, cx| {
                         this.open_picker(PickerKind::Figures, window, cx);

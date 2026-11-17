@@ -95,6 +95,43 @@ pub fn edit_for(fix: &Fix, text: &str) -> Option<(Range<usize>, String)> {
     }
 }
 
+/// Colors for `lstlisting`, close to what code editors show; plain `listings`
+/// only sets keywords in bold.
+const LISTINGS_STYLE: &str = "\\lstset{
+  basicstyle=\\ttfamily\\small\\color[HTML]{1F3A68},
+  keywordstyle=\\color[HTML]{871094}\\bfseries,
+  commentstyle=\\color[HTML]{8C8C8C}\\itshape,
+  stringstyle=\\color[HTML]{067D17},
+  numberstyle=\\tiny\\color[HTML]{999999},
+  numbers=left,
+  frame=single,
+  rulecolor=\\color[HTML]{DDDDDD},
+  backgroundcolor=\\color[HTML]{F7F7F7},
+  breaklines=true,
+  showstringspaces=false,
+  tabsize=4,
+  columns=fullflexible,
+  keepspaces=true,
+}";
+
+/// The edit that loads `listings` and `xcolor` and styles code blocks, or
+/// `None` when the file has no preamble or styles them already.
+pub fn listings_setup(text: &str) -> Option<(Range<usize>, String)> {
+    let usage = latex_usage(text);
+    let (offset, _) = usage.package_insertion(text, "listings")?;
+    let mut lines = String::new();
+    for package in ["listings", "xcolor"] {
+        if !usage.packages.iter().any(|loaded| loaded.name == package) {
+            lines.push_str(&format!("\n\\usepackage{{{package}}}"));
+        }
+    }
+    if !text.contains("\\lstset") && !text.contains("\\lstdefinestyle") {
+        lines.push('\n');
+        lines.push_str(LISTINGS_STYLE);
+    }
+    (!lines.is_empty()).then_some((offset..offset, lines))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,6 +179,34 @@ mod tests {
         let text = include_str!("../../../examples/overleaf-sample/main.tex");
         let sources = files(&[("main.tex", text)]);
         assert_eq!(hints(Path::new("main.tex"), &sources, false).hints, []);
+    }
+
+    #[test]
+    fn listings_get_set_up_once() {
+        let (range, lines) = listings_setup(MAIN).unwrap();
+        assert!(lines.starts_with("\n\\usepackage{listings}\n\\usepackage{xcolor}\n\\lstset{"));
+        let mut text = MAIN.to_string();
+        text.replace_range(range, &lines);
+        assert_eq!(listings_setup(&text), None);
+        assert_eq!(listings_setup("\\section{Part}\n"), None);
+    }
+
+    /// Needs `pdflatex`: `cargo test -p app -- --ignored`.
+    #[test]
+    #[ignore]
+    fn the_listings_style_compiles() {
+        let directory = tempfile::tempdir().unwrap();
+        let main = "\\documentclass{article}\n\\begin{document}\n\\begin{lstlisting}[language=Python]\nprint(\"Hello\") # hi\n\\end{lstlisting}\n\\end{document}\n";
+        let (range, lines) = listings_setup(main).unwrap();
+        let mut text = main.to_string();
+        text.replace_range(range, &lines);
+        std::fs::write(directory.path().join("main.tex"), text).unwrap();
+        let output = std::process::Command::new("pdflatex")
+            .args(["-interaction=nonstopmode", "-halt-on-error", "main.tex"])
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
     }
 
     #[test]

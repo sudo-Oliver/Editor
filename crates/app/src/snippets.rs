@@ -161,6 +161,63 @@ pub fn table(language: Language, rows: usize, columns: usize) -> String {
     }
 }
 
+pub struct CodeLanguage {
+    /// What the popup shows.
+    pub label: &'static str,
+    /// The name Typst's raw blocks know, empty for none.
+    pub typst: &'static str,
+    /// The options `lstlisting` gets: a language `listings` knows, or the rules
+    /// of one it does not, so that the code is still highlighted.
+    pub listings: &'static str,
+}
+
+const fn code(label: &'static str, typst: &'static str, listings: &'static str) -> CodeLanguage {
+    CodeLanguage { label, typst, listings }
+}
+
+pub const CODE_LANGUAGES: &[CodeLanguage] = &[
+    code("Python", "python", "language=Python"),
+    code("C", "c", "language=C"),
+    code("C++", "cpp", "language=C++"),
+    code("Java", "java", "language=Java"),
+    code(
+        "Rust",
+        "rust",
+        "morekeywords={as,async,await,break,const,continue,crate,dyn,else,enum,extern,false,fn,for,if,impl,in,let,loop,match,mod,move,mut,pub,ref,return,self,Self,static,struct,super,trait,true,type,unsafe,use,where,while}, sensitive=true, morecomment={[l]{//}}, morecomment={[s]{/*}{*/}}, morestring={[b]\"}",
+    ),
+    code(
+        "JavaScript",
+        "js",
+        "morekeywords={async,await,break,case,catch,class,const,continue,default,delete,do,else,export,extends,false,finally,for,function,if,import,in,instanceof,let,new,null,of,return,super,switch,this,throw,true,try,typeof,undefined,var,void,while,yield}, sensitive=true, morecomment={[l]{//}}, morecomment={[s]{/*}{*/}}, morestring={[b]\"}, morestring={[b]'}",
+    ),
+    code(
+        "TypeScript",
+        "ts",
+        "morekeywords={abstract,any,as,async,await,boolean,break,case,catch,class,const,continue,default,do,else,enum,export,extends,false,finally,for,function,if,implements,import,in,interface,let,new,null,number,private,protected,public,readonly,return,string,super,switch,this,throw,true,try,type,typeof,undefined,var,void,while}, sensitive=true, morecomment={[l]{//}}, morecomment={[s]{/*}{*/}}, morestring={[b]\"}, morestring={[b]'}",
+    ),
+    code(
+        "Go",
+        "go",
+        "morekeywords={break,case,chan,const,continue,default,defer,else,fallthrough,false,for,func,go,goto,if,import,interface,map,nil,package,range,return,select,struct,switch,true,type,var}, sensitive=true, morecomment={[l]{//}}, morecomment={[s]{/*}{*/}}, morestring={[b]\"}",
+    ),
+    code("Bash", "bash", "language=bash"),
+    code("SQL", "sql", "language=SQL"),
+    code("HTML", "html", "language=HTML"),
+    code("Haskell", "haskell", "language=Haskell"),
+    code("Plain text", "", ""),
+];
+
+/// A code block with syntax highlighting. LaTeX takes `listings`, which needs
+/// no `-shell-escape`, unlike `minted`.
+pub fn code_block(language: Language, code: &CodeLanguage) -> String {
+    if language == Language::Typst {
+        format!("```{}\n${{}}\n```\n", code.typst)
+    } else {
+        let options = if code.listings.is_empty() { String::new() } else { format!("[{}]", code.listings) };
+        format!("\\begin{{lstlisting}}{}\n${{}}\n\\end{{lstlisting}}\n", options.replace('$', "$$"))
+    }
+}
+
 /// `relative` is seen from where the compiler looks for the file.
 pub fn figure(language: Language, relative: &str) -> String {
     if language == Language::Typst {
@@ -251,6 +308,19 @@ mod tests {
     }
 
     #[test]
+    fn code_blocks_take_the_selection() {
+        let rust = CODE_LANGUAGES.iter().find(|code| code.label == "Rust").unwrap();
+        let mut typst = Snippet::parse(&code_block(Language::Typst, rust), "");
+        assert_eq!(typst.slots.len(), 1);
+        typst.fill_first("fn main() {}");
+        assert_eq!(typst.text, "```rust\nfn main() {}\n```\n");
+        let latex = Snippet::parse(&code_block(Language::Latex, &CODE_LANGUAGES[0]), "");
+        assert_eq!(latex.text, "\\begin{lstlisting}[language=Python]\n\n\\end{lstlisting}\n");
+        let plain = Snippet::parse(&code_block(Language::Latex, CODE_LANGUAGES.last().unwrap()), "");
+        assert_eq!(plain.text, "\\begin{lstlisting}\n\n\\end{lstlisting}\n");
+    }
+
+    #[test]
     fn citations_follow_the_language() {
         assert_eq!(citation(Language::Latex, "a"), "\\cite{a}");
         assert_eq!(citation_key("a", true), "a}");
@@ -279,6 +349,14 @@ mod tests {
             .join("\n\n")
     }
 
+    fn code_blocks(language: Language) -> String {
+        CODE_LANGUAGES
+            .iter()
+            .map(|code| Snippet::parse(&code_block(language, code).replace("${}", "if x then \"y\" // z"), "").text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Needs `typst` and `pdflatex`: `cargo test -p app -- --ignored`.
     #[test]
     #[ignore]
@@ -286,16 +364,16 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let typst = directory.path().join("all.typ");
         // The figure stays out, because it needs an image file.
-        let body = format!("{}\n\n{}", all(Language::Typst), filled(&table(Language::Typst, 2, 2)));
+        let body = format!("{}\n\n{}\n\n{}", all(Language::Typst), filled(&table(Language::Typst, 2, 2)), code_blocks(Language::Typst));
         std::fs::write(&typst, body).unwrap();
         let output = Command::new("typst").arg("compile").arg(&typst).output().unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 
         let latex = directory.path().join("all.tex");
-        let body = format!("{}\n\n{}", all(Language::Latex), filled(&table(Language::Latex, 2, 2)));
+        let body = format!("{}\n\n{}\n\n{}", all(Language::Latex), filled(&table(Language::Latex, 2, 2)), code_blocks(Language::Latex));
         std::fs::write(
             &latex,
-            format!("\\documentclass{{article}}\n\\usepackage{{amsmath,amssymb}}\n\\begin{{document}}\n{body}\n\\end{{document}}\n"),
+            format!("\\documentclass{{article}}\n\\usepackage{{amsmath,amssymb,listings}}\n\\begin{{document}}\n{body}\n\\end{{document}}\n"),
         )
         .unwrap();
         let output = Command::new("pdflatex")
