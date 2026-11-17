@@ -240,7 +240,6 @@ Change this sentence, and the PDF follows after a moment.
 \\section{Text from Claude}
 
 Ask Claude for LaTeX, copy what it writes and paste it here.
-To start a whole new document from it, use Paste from Claude in the project hub.
 
 \\section{A formula}
 
@@ -270,7 +269,6 @@ Change this sentence, and the PDF follows after a moment.
 = Text from Claude
 
 Ask Claude for Typst, copy what it writes and paste it here.
-To start a whole new document from it, use Paste from Claude in the project hub.
 
 = A formula
 
@@ -307,26 +305,6 @@ pub fn newest_pdf(project: &Path) -> Option<(PathBuf, std::time::SystemTime)> {
         .filter_map(|path| Some((fs::metadata(&path).ok()?.modified().ok()?, path)))
         .max()
         .map(|(modified, path)| (path, modified))
-}
-
-/// Which language pasted text is in. LaTeX wins a tie, as most people paste it.
-pub fn guess_language(text: &str) -> TemplateLanguage {
-    let latex = ["\\documentclass", "\\begin{", "\\section", "\\usepackage", "\\end{"].iter().filter(|word| text.contains(*word)).count();
-    let typst = ["#set ", "#import ", "#let ", "#show ", "\n= ", "#figure("].iter().filter(|word| text.contains(*word)).count()
-        + usize::from(text.starts_with("= "));
-    if typst > latex { TemplateLanguage::Typst } else { TemplateLanguage::Latex }
-}
-
-/// A new project whose main file holds `text`.
-pub fn create_from_text(dir: &Path, language: TemplateLanguage, text: &str) -> io::Result<()> {
-    fs::create_dir_all(dir)?;
-    let name = if language == TemplateLanguage::Typst { "main.typ" } else { "main.tex" };
-    let mut text = text.to_string();
-    if !text.ends_with('\n') {
-        text.push('\n');
-    }
-    fs::write(dir.join(name), text)?;
-    ensure_gitignore(dir)
 }
 
 fn builtins() -> Vec<Template> {
@@ -550,22 +528,6 @@ mod tests {
 
     fn entry(path: &str, title: &str, last_opened: u64) -> ProjectEntry {
         ProjectEntry { path: PathBuf::from(path), title: title.to_string(), last_opened }
-    }
-
-    #[test]
-    fn pasted_text_names_its_language() {
-        assert_eq!(guess_language("\\documentclass{article}\n\\begin{document}\nHi\n\\end{document}"), TemplateLanguage::Latex);
-        assert_eq!(guess_language("#set page(paper: \"a4\")\n= Intro\nText"), TemplateLanguage::Typst);
-        assert_eq!(guess_language("Just words"), TemplateLanguage::Latex);
-    }
-
-    #[test]
-    fn a_pasted_project_gets_its_main_file() {
-        let directory = tempfile::tempdir().unwrap();
-        let dir = directory.path().join("p");
-        create_from_text(&dir, TemplateLanguage::Typst, "= Hi").unwrap();
-        assert_eq!(fs::read_to_string(dir.join("main.typ")).unwrap(), "= Hi\n");
-        assert!(dir.join(".gitignore").is_file());
     }
 
     #[test]
