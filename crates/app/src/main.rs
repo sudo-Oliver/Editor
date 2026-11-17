@@ -14,6 +14,7 @@ mod home_view;
 mod image_view;
 mod keymap;
 mod marketplace;
+mod material_icons;
 mod nvim_themes;
 mod outline;
 mod paper;

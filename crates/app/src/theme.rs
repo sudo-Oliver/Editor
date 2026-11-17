@@ -19,7 +19,6 @@ pub struct Palette {
     // Interface text.
     pub ui_text: u32,
     pub ui_muted: u32,
-    pub folder: u32,
     // Accent: primary buttons, switches, the selected row and focus marks.
     pub accent: u32,
     pub on_accent: u32,
@@ -86,7 +85,6 @@ impl Palette {
         tab_inactive: 0x1f2530,
         ui_text: 0xf4f5f6,
         ui_muted: 0xa8abae,
-        folder: 0xf4f5f6,
         accent: 0x3b8549,
         on_accent: 0xffffff,
         accent_soft: 0x2c5739,
@@ -135,7 +133,6 @@ impl Palette {
         tab_inactive: 0xdbdfe6,
         ui_text: 0x1b222c,
         ui_muted: 0x5d6879,
-        folder: 0x1b222c,
         accent: 0x098842,
         on_accent: 0xffffff,
         accent_soft: 0xb5e0c4,
@@ -185,7 +182,6 @@ impl Palette {
         tab_inactive: 0xd8d4cb,
         ui_text: 0x2c2b2a,
         ui_muted: 0x6f6a61,
-        folder: 0x2c2b2a,
         accent: 0x1a1918,
         on_accent: 0xf4f3f0,
         accent_soft: 0xcfcabf,
@@ -235,7 +231,6 @@ impl Palette {
         tab_inactive: 0xccc5b8,
         ui_text: 0x333333,
         ui_muted: 0x6e6e6e,
-        folder: 0x333333,
         accent: 0x111111,
         on_accent: 0xf6f4ee,
         accent_soft: 0xc9c2b4,
@@ -284,7 +279,6 @@ impl Palette {
         tab_inactive: 0x3a3732,
         ui_text: 0xd6d1c6,
         ui_muted: 0x8e8980,
-        folder: 0xd6d1c6,
         accent: 0xece8df,
         on_accent: 0x141312,
         accent_soft: 0x34312c,
@@ -358,7 +352,6 @@ impl Palette {
             tab_inactive: apart(bg(&["TabLine", "TabLineFill"]), 0.04),
             ui_text: text,
             ui_muted: fg(&["NonText", "LineNr"]).filter(|muted| contrast(*muted, back) >= MARK_CONTRAST).unwrap_or_else(|| tint(0.6)),
-            folder: fg(&["Directory"]).unwrap_or(text),
             accent,
             on_accent: text,
             accent_soft: bg(&["PmenuSel"]).filter(fits).or(bg(&["Visual"]).filter(fits)).unwrap_or_else(|| mix(back, accent, 0.3)),
@@ -425,7 +418,6 @@ impl Palette {
         }
         self.tab_inactive = settle(self.tab_inactive, self.ui_muted, self.bg, MARK_CONTRAST);
         self.ui_muted = readable(self.ui_muted, self.panel, MARK_CONTRAST);
-        self.folder = readable(self.folder, self.panel, TEXT_CONTRAST);
         for mark in [&mut self.accent, &mut self.focus, &mut self.caret, &mut self.error, &mut self.warning, &mut self.line_number] {
             *mark = readable(*mark, self.bg, MARK_CONTRAST);
         }
