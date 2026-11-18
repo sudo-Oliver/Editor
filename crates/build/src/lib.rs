@@ -2,6 +2,7 @@
 
 mod config;
 mod explain;
+mod fontmap;
 mod packages;
 mod parse;
 mod preamble;
@@ -13,4 +14,4 @@ pub use explain::{Explanation, explain};
 pub use packages::{Fix, Loaded, PackageFinding, ProjectUsage, check, loaded};
 pub use parse::{Diagnostic, Severity, parse_latex_log, parse_pandoc, parse_tectonic, parse_typst};
 pub use runner::{BuildEvent, BuildManager, BuildOutcome, BuildRequest};
-pub use tools::{add_directory, child_path, find_tool, remove_directory};
+pub use tools::{add_directory, child_path, find_tool, pretend_fresh, remove_directory};

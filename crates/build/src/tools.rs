@@ -13,6 +13,11 @@ static ADDED_DIRECTORIES: RwLock<Vec<PathBuf>> = RwLock::new(Vec::new());
 /// Directories to search. Apps started from Finder miss the shell's `PATH`, so
 /// the usual install locations are added.
 fn search_path() -> Vec<PathBuf> {
+    if pretend_fresh() {
+        let mut directories: Vec<PathBuf> = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"].into_iter().map(PathBuf::from).collect();
+        directories.extend(ADDED_DIRECTORIES.read().map(|added| added.clone()).unwrap_or_default());
+        return directories;
+    }
     let mut directories: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).collect())
         .unwrap_or_default();
@@ -22,6 +27,12 @@ fn search_path() -> Vec<PathBuf> {
     }
     directories.extend(ADDED_DIRECTORIES.read().map(|added| added.clone()).unwrap_or_default());
     directories
+}
+
+/// Debug builds only: `EDITOR_PRETEND_FRESH=1` hides the tools of this Mac,
+/// to try the setup as on a new one.
+pub fn pretend_fresh() -> bool {
+    cfg!(debug_assertions) && std::env::var_os("EDITOR_PRETEND_FRESH").is_some()
 }
 
 /// Searches `directory` too, after everything else.
