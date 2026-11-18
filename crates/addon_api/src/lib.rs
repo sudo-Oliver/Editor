@@ -14,7 +14,7 @@ pub const OLDEST_API_VERSION: u32 = 1;
 /// What this editor can do beyond `API_VERSION`, sent with `HostMessage::Init`.
 /// Add-ons check these rather than the version, so that they work on an
 /// editor that lacks one by doing without it.
-pub const FEATURES: &[&str] = &["markdown", "tree_edits", "notify"];
+pub const FEATURES: &[&str] = &["markdown", "tree_edits", "notify", "events", "pdf", "bib", "insert", "files"];
 
 /// What an add-on may ask the editor for. Add-ons are not sandboxed, so this
 /// limits the requests below and not the program itself.
@@ -311,6 +311,9 @@ pub enum AddonMessage {
         #[serde(default)]
         tone: Tone,
     },
+    /// Which events the add-on wants, replacing an earlier choice. The editor
+    /// does the work for an event only while someone wants it.
+    Subscribe { events: Vec<EventKind> },
     /// The editor answers with `HostMessage::Reply` and the same `id`.
     Request { id: u64, request: Request },
     /// Replaces what this add-on offers in the citation picker.
@@ -319,6 +322,19 @@ pub enum AddonMessage {
     /// enabled primary button and `Esc` closes it, which `HostMessage::DialogClosed`
     /// reports. Needs `Permission::LookupDoi`.
     SetDialog { view: Option<Node> },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventKind {
+    /// `HostMessage::ActiveFileChanged`.
+    ActiveFile,
+    /// `HostMessage::SelectionChanged`, a quarter second after the cursor stops.
+    Selection,
+    /// `HostMessage::Saved`, for any activation.
+    Saved,
+    /// `HostMessage::BuildFinished`.
+    Build,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -356,17 +372,72 @@ pub enum Request {
     /// Writes a citation of this key at the cursor, in the form of the document.
     /// Elsewhere the key goes to the clipboard. The reply says which, as text.
     InsertCitation { key: String },
+    /// Opens the file and puts the cursor there. Lines and columns start at 1.
+    Reveal {
+        path: String,
+        #[serde(default)]
+        line: Option<usize>,
+        #[serde(default)]
+        column: Option<usize>,
+    },
+    /// The root, the main file and its language, and whether its compiler is there.
+    ProjectInfo,
+    /// The end of the last build's output.
+    BuildLog {
+        #[serde(default)]
+        max_bytes: Option<usize>,
+    },
+    /// The pages of the PDF and the one in view.
+    PdfInfo,
+    /// The text of a page of the PDF, the one in view by default. Pages start at 1.
+    PdfText {
+        #[serde(default)]
+        page: Option<usize>,
+    },
+    /// A page of the PDF as a PNG file, which the reply names. It lies in a
+    /// folder only this user can read and goes when the editor quits.
+    PdfPage {
+        #[serde(default)]
+        page: Option<usize>,
+        #[serde(default)]
+        width: Option<u32>,
+    },
+    /// The entries of the project's bibliography files.
+    BibEntries,
+    /// Puts text at the cursor of the open document, in place of the selection.
+    InsertText { text: String },
+    /// Puts text at a place in a file, which opens if it is not. Lines and
+    /// columns start at 1, and a column past the end means the end of the line.
+    InsertAt { path: String, line: usize, column: usize, text: String },
+    /// Copies a file from anywhere, such as a picture the user dropped, into the
+    /// project. `dest` is relative to it; an existing file gets a number. The
+    /// reply is the path it got, as text.
+    CopyIntoProject { source: String, dest: String },
 }
 
 impl Request {
     pub fn permission(&self) -> Permission {
         match self {
-            Self::ListFiles | Self::ReadFile { .. } | Self::Search { .. } | Self::Diagnostics | Self::ActiveFile => {
-                Permission::ReadProject
-            }
-            Self::EditFile { .. } | Self::CreateFile { .. } | Self::WriteFile { .. } | Self::BeginEdits | Self::DiscardEdits => {
-                Permission::EditDocuments
-            }
+            Self::ListFiles
+            | Self::ReadFile { .. }
+            | Self::Search { .. }
+            | Self::Diagnostics
+            | Self::ActiveFile
+            | Self::Reveal { .. }
+            | Self::ProjectInfo
+            | Self::BuildLog { .. }
+            | Self::PdfInfo
+            | Self::PdfText { .. }
+            | Self::PdfPage { .. }
+            | Self::BibEntries => Permission::ReadProject,
+            Self::EditFile { .. }
+            | Self::CreateFile { .. }
+            | Self::WriteFile { .. }
+            | Self::BeginEdits
+            | Self::DiscardEdits
+            | Self::InsertText { .. }
+            | Self::InsertAt { .. }
+            | Self::CopyIntoProject { .. } => Permission::EditDocuments,
             Self::Compile => Permission::Compile,
             Self::GetSecret { .. } | Self::SetSecret { .. } => Permission::Secrets,
             Self::InsertCitation { .. } => Permission::Citations,
@@ -399,6 +470,29 @@ pub struct ActiveFile {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ProjectInfo {
+    pub root: String,
+    /// Relative to the root.
+    pub main: Option<String>,
+    /// `latex`, `typst` or `markdown`.
+    pub language: Option<String>,
+    /// The program that compiles it, such as `pdflatex` or `typst`.
+    pub compiler: Option<String>,
+    pub compiler_ready: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct BibInfo {
+    pub key: String,
+    pub authors: String,
+    pub year: String,
+    pub title: String,
+    pub venue: String,
+    /// The file it is in, relative to the project.
+    pub file: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "reply", rename_all = "snake_case")]
 pub enum Reply {
     Done,
@@ -409,6 +503,11 @@ pub enum Reply {
     Active { file: Option<ActiveFile> },
     Compiled { success: bool, diagnostics: Vec<DiagnosticInfo> },
     Secret { value: Option<String> },
+    Project { project: ProjectInfo },
+    /// `page` is the one in view, from 1.
+    Pdf { pages: usize, page: usize },
+    File { path: String },
+    Bib { entries: Vec<BibInfo> },
 }
 
 /// Lines to the add-on.
@@ -440,6 +539,15 @@ pub enum HostMessage {
     LookupDoi { suggestion: String },
     /// The user closed the dialog.
     DialogClosed,
+    /// Another document became active, or none.
+    ActiveFileChanged { path: Option<String> },
+    /// Where the cursor rests. Lines and columns start at 1.
+    SelectionChanged { path: String, line: usize, column: usize, selected_chars: usize },
+    BuildFinished { success: bool, errors: usize, warnings: usize },
+    /// Files dropped on the panel. Absolute paths.
+    FilesDropped { paths: Vec<String> },
+    /// A picture pasted into an input of the panel, saved as a PNG file.
+    ImagePasted { path: String },
 }
 
 #[cfg(test)]

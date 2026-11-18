@@ -68,6 +68,8 @@ use crate::{
 mod collab_session;
 #[path = "git_sync.rs"]
 mod git_sync;
+#[path = "addon_host.rs"]
+mod addon_host;
 
 const RECOVERY_DELAY: Duration = Duration::from_secs(3);
 const TOP_BAR_HEIGHT: f32 = 40.0;
@@ -446,6 +448,12 @@ pub struct Workspace {
     tracked_edits: HashMap<String, TrackedEdits>,
     /// Add-on requests that wait for the running build to end.
     compile_waiters: Vec<(Entity<AddonPanel>, u64)>,
+    /// Where the cursor rests, as last told to add-ons, and what waits to be told.
+    addon_context_sent: addon_host::AddonContext,
+    addon_context_pending: Option<addon_host::AddonContext>,
+    addon_context_task: Option<Task<()>>,
+    /// Focuses the active document at the next frame, for actions without a window.
+    focus_requested: bool,
     layout: PaneLayout,
     /// The PDF tab is the one on screen.
     pdf_tab_shown: bool,
@@ -587,6 +595,7 @@ impl Workspace {
             for addon in &this.addon_panels {
                 addon.panel.update(cx, |panel, _| panel.shut_down());
             }
+            addons::remove_private_directory();
             async {}
         });
         let workspace_handle = cx.entity().downgrade();
@@ -695,6 +704,10 @@ impl Workspace {
             installing: None,
             tracked_edits: HashMap::new(),
             compile_waiters: Vec::new(),
+            addon_context_sent: addon_host::AddonContext::default(),
+            addon_context_pending: None,
+            addon_context_task: None,
+            focus_requested: false,
             layout: PaneLayout::Split,
             pdf_tab_shown: false,
             focus_mode: false,
@@ -1867,6 +1880,16 @@ impl Workspace {
                 self.tracked_edits.insert(add_on, TrackedEdits::default());
                 Ok(Reply::Done)
             }
+            Request::Reveal { path, line, column } => self.addon_reveal(&path, line, column, cx),
+            Request::ProjectInfo => self.addon_project_info(cx),
+            Request::BuildLog { max_bytes } => Ok(self.addon_build_log(max_bytes)),
+            Request::PdfInfo => self.addon_pdf_info(cx),
+            Request::PdfText { page } => return self.answer_from_pdf(panel, id, page, None, cx),
+            Request::PdfPage { page, width } => return self.answer_from_pdf(panel, id, page, Some(addon_host::pdf_page_width(width)), cx),
+            Request::BibEntries => return self.answer_bib_entries(panel, id, cx),
+            Request::InsertText { text } => self.addon_insert_text(&text, cx),
+            Request::InsertAt { path, line, column, text } => self.addon_insert_at(&path, line, column, &text, cx),
+            Request::CopyIntoProject { source, dest } => return self.answer_copy_into_project(panel, id, source, dest, cx),
             Request::DiscardEdits => {
                 self.discard_addon_edits(&add_on, cx);
                 Ok(Reply::Done)
@@ -2203,6 +2226,7 @@ impl Workspace {
         self.check_packages(cx);
         let (success, diagnostics) = (outcome.success, self.diagnostic_infos());
         self.reply_to_compile_waiters(|| Ok(Reply::Compiled { success, diagnostics: diagnostics.clone() }), cx);
+        self.addon_build_finished(success, cx);
         let same_document = self.pdf_main == self.last_main;
         self.preview_state = match (outcome.pdf, outcome.last_good_pdf) {
             (Some(pdf), _) => {
@@ -2524,6 +2548,7 @@ impl Workspace {
     /// Runs whenever the document notifies, which covers every way of moving the
     /// cursor, so it has to stay cheap until the line changes.
     fn cursor_changed(&mut self, view: &Entity<EditorView>, cx: &mut Context<Self>) {
+        self.addon_context_changed(cx);
         if !self.settings.auto_scroll_pdf || self.active_view().as_ref() != Some(view) {
             return;
         }
@@ -8053,6 +8078,11 @@ impl Render for Workspace {
         if std::mem::take(&mut self.setup_requested) && self.setup.is_none() {
             self.run_setup(window, cx);
         }
+        if std::mem::take(&mut self.focus_requested) {
+            self.focus_active(window, cx);
+        }
+        // Another document may have become active.
+        self.addon_context_changed(cx);
         if let Some(format) = self.export_after_pandoc.filter(|_| !self.toolchain.read(cx).installing(Tool::Pandoc)) {
             self.export_after_pandoc = None;
             match self.toolchain.read(cx).errors.get(&Tool::Pandoc).cloned() {

@@ -45,6 +45,35 @@ impl Installed {
     }
 }
 
+/// A folder for files the editor hands to add-ons, such as pasted pictures and
+/// PDF pages. Only this user can open it, and it goes when the editor quits.
+pub fn private_directory() -> Result<PathBuf, String> {
+    static DIRECTORY: std::sync::OnceLock<Result<PathBuf, String>> = std::sync::OnceLock::new();
+    DIRECTORY
+        .get_or_init(|| {
+            use std::os::unix::fs::DirBuilderExt;
+            let path = std::env::temp_dir().join(format!("editor-addons-{}", std::process::id()));
+            match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => Ok(path),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(path),
+                Err(error) => Err(format!("Cannot make a folder for add-on files: {error}")),
+            }
+        })
+        .clone()
+}
+
+/// Removes that folder, at quit.
+pub fn remove_private_directory() {
+    std::fs::remove_dir_all(std::env::temp_dir().join(format!("editor-addons-{}", std::process::id()))).ok();
+}
+
+/// A new name in the private folder, such as `pasted-3.png`.
+pub fn private_file(stem: &str, extension: &str) -> Result<PathBuf, String> {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let number = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(private_directory()?.join(format!("{stem}-{number}.{extension}")))
+}
+
 pub fn default_directory() -> Option<PathBuf> {
     Some(crate::settings::default_path()?.parent()?.join("addons"))
 }

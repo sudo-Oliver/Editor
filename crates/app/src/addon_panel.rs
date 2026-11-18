@@ -2,20 +2,24 @@
 //! The program starts when the panel first shows, or with the project if the
 //! manifest asks for that.
 
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
 use addon_api::{
-    API_VERSION, Activation, AddonMessage, CitationEntry, DropdownOption, FEATURES, HostMessage, Node, Permission, Reply, Request, Role, Tone,
+    API_VERSION, Activation, AddonMessage, CitationEntry, DropdownOption, EventKind, FEATURES, HostMessage, Node, Permission, Reply, Request, Role,
+    Tone,
 };
 use gpui::{
-    Anchor, AnyElement, App, ClipboardItem, Context, ElementId, Entity, EventEmitter, FocusHandle, Focusable, FontStyle, FontWeight, HighlightStyle,
+    Anchor, AnyElement, App, ClipboardEntry, ClipboardItem, Context, ExternalPaths, ImageFormat, ElementId, Entity, EventEmitter, FocusHandle, Focusable, FontStyle, FontWeight, HighlightStyle,
     InteractiveText, KeyDownEvent, MouseButton, ObjectFit, Pixels, Render, ScrollHandle, SharedString, Size, StyledText, Task, Window, anchored,
     deferred, div, img, point, prelude::*, px, size,
 };
 
 use crate::{
-    actions::{CloseMenu, Newline, Recompile},
-    addons::{AddonProcess, Installed, ProcessEvent},
+    actions::{CloseMenu, Newline, Paste, Recompile},
+    addons::{self, AddonProcess, Installed, ProcessEvent},
     editor_view::EditorView,
     markdown::{self, Block, Inline},
     theme,
@@ -81,6 +85,8 @@ pub struct AddonPanel {
     toggled: HashMap<String, bool>,
     /// A message added content, so following scrolls go to the end after the batch.
     scroll_pending: bool,
+    /// The events the add-on asked for.
+    subscriptions: HashSet<EventKind>,
 }
 
 impl EventEmitter<AddonPanelEvent> for AddonPanel {}
@@ -107,6 +113,7 @@ impl AddonPanel {
             documents: HashMap::new(),
             toggled: HashMap::new(),
             scroll_pending: false,
+            subscriptions: HashSet::new(),
         }
     }
 
@@ -125,11 +132,51 @@ impl AddonPanel {
         &self.citations
     }
 
-    /// Tells the add-on about a saved file, if it runs with the project.
+    /// Tells the add-on about a saved file, if it runs with the project or asked.
     pub fn notify_saved(&self, path: &str) {
-        if self.add_on.manifest.activation == Activation::Project {
+        if self.add_on.manifest.activation == Activation::Project || self.wants(EventKind::Saved) {
             self.send(HostMessage::Saved { path: path.to_string() });
         }
+    }
+
+    /// Whether the add-on runs and asked for these events.
+    pub fn wants(&self, kind: EventKind) -> bool {
+        self.process.is_some() && self.subscriptions.contains(&kind)
+    }
+
+    pub fn send_event(&self, message: HostMessage) {
+        self.send(message);
+    }
+
+    /// Whether the add-on speaks version 2, which has events and drops.
+    fn speaks_two(&self) -> bool {
+        self.add_on.manifest.api >= 2
+    }
+
+    /// A picture on the clipboard goes to the add-on as a file instead of
+    /// text. Anything else pastes as usual.
+    fn paste_image(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(image) = cx.read_from_clipboard().and_then(|item| {
+            item.entries().iter().find_map(|entry| match entry {
+                ClipboardEntry::Image(image) => Some(image.clone()),
+                _ => None,
+            })
+        }) else {
+            return false;
+        };
+        let extension = match image.format {
+            ImageFormat::Png => "png",
+            ImageFormat::Jpeg => "jpg",
+            ImageFormat::Webp => "webp",
+            ImageFormat::Gif => "gif",
+            ImageFormat::Svg => "svg",
+            _ => "png",
+        };
+        match addons::private_file("pasted", extension).and_then(|path| std::fs::write(&path, &image.bytes).map(|()| path).map_err(|error| error.to_string())) {
+            Ok(path) => self.send(HostMessage::ImagePasted { path: path.display().to_string() }),
+            Err(error) => self.invalid = Some(format!("The picture could not be passed on: {error}")),
+        }
+        true
     }
 
     pub fn notify_citation_picked(&self, key: &str) {
@@ -219,6 +266,7 @@ impl AddonPanel {
     fn stop(&mut self) {
         self.task = None;
         self.process = None;
+        self.subscriptions.clear();
     }
 
     fn start(&mut self, cx: &mut Context<Self>) {
@@ -310,6 +358,11 @@ impl AddonPanel {
                 }
             }
             ProcessEvent::Message(AddonMessage::Notify { text, .. }) => cx.emit(AddonPanelEvent::Notify(text)),
+            ProcessEvent::Message(AddonMessage::Subscribe { events }) => {
+                if self.speaks_two() {
+                    self.subscriptions = events.into_iter().collect();
+                }
+            }
             ProcessEvent::Message(AddonMessage::Request { id, request }) => {
                 let permission = request.permission();
                 if self.add_on.manifest.permissions.contains(&permission) {
@@ -340,6 +393,7 @@ impl AddonPanel {
                     cx.emit(AddonPanelEvent::LookupFailed(format!("{} stopped: {reason}", self.add_on.manifest.name)));
                 }
                 self.process = None;
+                self.subscriptions.clear();
                 self.citations.clear();
                 self.dialog = None;
                 cx.emit(AddonPanelEvent::DialogChanged);
@@ -1139,6 +1193,19 @@ impl Render for AddonPanel {
             .gap(px(6.))
             .p(px(8.))
             .on_action(cx.listener(|this, _: &Recompile, window, cx| this.submit_focused(window, cx)))
+            .when(self.speaks_two(), |element| {
+                element
+                    .capture_action(cx.listener(|this, _: &Paste, _, cx| {
+                        if this.paste_image(cx) {
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(theme::color(theme::palette().panel)))
+                    .on_drop(cx.listener(|this, paths: &ExternalPaths, _, _| {
+                        let paths = paths.paths().iter().map(|path| path.display().to_string()).collect();
+                        this.send(HostMessage::FilesDropped { paths });
+                    }))
+            })
             .children(failure.map(banner))
             .children(invalid.map(banner))
             .when(restart, |element| {
