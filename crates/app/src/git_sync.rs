@@ -16,7 +16,7 @@ use git::{GitError, Repository, Status};
 use gpui::{AnyElement, Context, Entity, Focusable, FontWeight, SharedString, Task, Window, div, prelude::*, px};
 
 use super::{Dialog, LeftPanel, Workspace};
-use crate::{editor_view::EditorView, git_login, git_panel, theme};
+use crate::{editor_view::EditorView, git_login, git_panel, github, theme};
 
 /// How often the background sync looks for new commits.
 const SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -46,6 +46,16 @@ struct SignIn {
     user: Entity<EditorView>,
     token: Entity<EditorView>,
     error: Option<SharedString>,
+    /// The code to confirm at GitHub, while the browser sign-in waits.
+    code: Option<SharedString>,
+    /// Stops the browser sign-in when the dialog closes.
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for SignIn {
+    fn drop(&mut self) {
+        self.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// The letter of a changed file as the tree shows it: conflicts first, then
@@ -328,7 +338,7 @@ impl Workspace {
             })
         };
         let (user, token) = (field(cx), field(cx));
-        self.git.sign_in = Some(SignIn { host, user, token: token.clone(), error: None });
+        self.git.sign_in = Some(SignIn { host, user, token: token.clone(), error: None, code: None, cancel: Arc::default() });
         self.open_dialog(Dialog::GitSignIn, window, cx);
         window.focus(&token.read(cx).focus_handle(cx), cx);
     }
@@ -373,6 +383,79 @@ impl Workspace {
         .detach();
     }
 
+    /// GitHub's device flow: a code here, a confirmation in the browser, and
+    /// the token arrives by itself. Sets the git identity on the way, since
+    /// commits fail without one.
+    fn browser_sign_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(sign_in) = &mut self.git.sign_in else {
+            return;
+        };
+        if sign_in.code.is_some() {
+            return;
+        }
+        sign_in.error = None;
+        sign_in.code = Some("…".into());
+        let cancel = sign_in.cancel.clone();
+        let program = git_panel::program();
+        let handle = window.window_handle();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let fail = |this: &gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp, error: String| {
+                this.update(cx, |this, cx| {
+                    if let Some(sign_in) = &mut this.git.sign_in {
+                        sign_in.code = None;
+                        sign_in.error = Some(error.into());
+                    }
+                    cx.notify();
+                })
+                .ok();
+            };
+            let code = match cx.background_spawn(async move { github::request_code() }).await {
+                Ok(code) => code,
+                Err(error) => return fail(&this, cx, error),
+            };
+            this.update(cx, |this, cx| {
+                if let Some(sign_in) = &mut this.git.sign_in {
+                    sign_in.code = Some(code.user_code.clone().into());
+                }
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(code.user_code.clone()));
+                cx.open_url(&code.verification_uri);
+                cx.notify();
+            })
+            .ok();
+            let signed_in = cx
+                .background_spawn(async move {
+                    let token = github::wait_for_token(&code, &cancel)?;
+                    let user = github::user(&token)?;
+                    git_login::store(github::HOST, &user.login, &token)?;
+                    if let Some(program) = program {
+                        program.set_global_if_missing("user.name", user.name.as_deref().filter(|name| !name.trim().is_empty()).unwrap_or(&user.login))?;
+                        program.set_global_if_missing("user.email", &user.noreply_email())?;
+                    }
+                    Ok::<(), String>(())
+                })
+                .await;
+            match signed_in {
+                Err(error) if error == "Stopped." => {}
+                Err(error) => fail(&this, cx, error),
+                Ok(()) => {
+                    handle
+                        .update(cx, |_, window, cx| {
+                            this.update(cx, |this, cx| {
+                                this.git.sign_in = None;
+                                this.close_dialog(window, cx);
+                                let panel = this.git_panel.clone();
+                                cx.defer(move |cx| panel.update(cx, |panel, cx| panel.retry_network(cx)));
+                            })
+                            .ok();
+                        })
+                        .ok();
+                }
+            }
+        })
+        .detach();
+    }
+
     pub(super) fn render_sign_in(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let Some(sign_in) = &self.git.sign_in else {
             return Vec::new();
@@ -391,7 +474,27 @@ impl Workspace {
         };
         let muted = |text: String| div().flex_none().text_color(theme::color(theme::palette().ui_muted)).child(text).into_any_element();
         let heading = |text: &'static str| div().flex_none().pt(px(6.)).font_weight(FontWeight::SEMIBOLD).child(text).into_any_element();
-        let mut content = vec![
+        let mut content = Vec::new();
+        if sign_in.host == github::HOST && github::available() {
+            match &sign_in.code {
+                None => {
+                    content.push(muted("Sign in with your GitHub account in the browser. Nothing to copy or type.".to_string()));
+                    content.push(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .child(self.panel_button("git-sign-in-browser", "Sign in with GitHub", true, cx, |this, window, cx| this.browser_sign_in(window, cx)))
+                            .into_any_element(),
+                    );
+                }
+                Some(code) => {
+                    content.push(muted("GitHub opened in your browser. Enter this code there (it is already copied), then confirm. This dialog closes on its own.".to_string()));
+                    content.push(div().flex_none().py(px(6.)).text_size(px(24.)).font_weight(FontWeight::SEMIBOLD).font_family(theme::code_font()).child(code.clone()).into_any_element());
+                }
+            }
+            content.push(heading("Or with a token"));
+        }
+        content.extend([
             muted(format!(
                 "{} wants a login for this repository. Create a personal access token with access to repositories in your account settings there, and paste it here. It stays in the system keychain.",
                 sign_in.host
@@ -406,7 +509,7 @@ impl Workspace {
                 .pt(px(6.))
                 .child(self.panel_button("git-sign-in-save", "Save and try again", true, cx, |this, window, cx| this.save_sign_in(window, cx)))
                 .into_any_element(),
-        ];
+        ]);
         if let Some(error) = &sign_in.error {
             content.push(div().flex_none().text_color(theme::color(theme::palette().error)).child(error.clone()).into_any_element());
         }

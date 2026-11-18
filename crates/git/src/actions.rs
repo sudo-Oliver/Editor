@@ -18,6 +18,24 @@ impl Program {
         ignore_build_output(directory).map_err(|error| format!("Cannot write .gitignore: {error}"))?;
         self.discover(directory)?.ok_or_else(|| "git init did not create a repository.".to_string())
     }
+
+    /// A setting of the user's own git, such as `user.email`, if set.
+    pub fn global(&self, key: &str) -> Option<String> {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+        let output = self.command(&home).args(["config", "--global", "--get", key]).output().ok()?;
+        let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (output.status.success() && !value.is_empty()).then_some(value)
+    }
+
+    /// Sets a setting of the user's own git, unless the user already has one.
+    pub fn set_global_if_missing(&self, key: &str, value: &str) -> Result<(), String> {
+        if self.global(key).is_some() {
+            return Ok(());
+        }
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from).ok_or("Cannot find the home folder.")?;
+        let output = self.command(&home).args(["config", "--global", key, value]).output().map_err(|error| format!("Cannot start git: {error}"))?;
+        if output.status.success() { Ok(()) } else { Err(short_error(&output)) }
+    }
 }
 
 fn ignore_build_output(directory: &Path) -> std::io::Result<()> {
@@ -84,6 +102,15 @@ impl Repository {
     pub fn create_branch(&self, branch: &str) -> Result<(), String> {
         check_branch_name(branch)?;
         self.run(["switch", "-c", branch]).map(drop)
+    }
+
+    /// Adds `origin`, for a repository that has no remote yet.
+    pub fn add_origin(&self, url: &str) -> Result<(), String> {
+        self.run(["remote", "add", "origin", url]).map(drop)
+    }
+
+    pub fn has_remote(&self) -> bool {
+        self.run(["remote"]).is_ok_and(|remotes| !remotes.trim().is_empty())
     }
 
     /// Publishes the branch to the only remote or `origin` on the first push.

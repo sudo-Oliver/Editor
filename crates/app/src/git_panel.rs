@@ -53,6 +53,8 @@ pub enum NetworkAction {
     Pull,
     Push,
     CommitAndPush,
+    /// Creates a repository on GitHub and pushes to it.
+    Publish,
 }
 
 enum RepoState {
@@ -96,6 +98,11 @@ pub struct GitPanel {
     /// A commit message made from the changes, for an empty field.
     suggestion: Option<String>,
     last_network: Option<NetworkAction>,
+    /// The repository has a remote to push to.
+    has_remote: bool,
+    /// Apple's developer tools, which bring git, are being installed.
+    installing_git: bool,
+    git_looked: Option<std::time::Instant>,
 }
 
 impl EventEmitter<GitPanelEvent> for GitPanel {}
@@ -134,6 +141,9 @@ impl GitPanel {
             merging: false,
             suggestion: None,
             last_network: None,
+            has_remote: true,
+            installing_git: false,
+            git_looked: None,
         }
     }
 
@@ -172,6 +182,7 @@ impl GitPanel {
             Some(NetworkAction::Pull) => self.pull(cx),
             Some(NetworkAction::Push) => self.push(cx),
             Some(NetworkAction::CommitAndPush) => self.push(cx),
+            Some(NetworkAction::Publish) => self.publish(cx),
             None => {}
         }
     }
@@ -234,7 +245,10 @@ impl GitPanel {
             cx.notify();
             return;
         };
-        if self.program.is_none() {
+        // Looking for git may start xcode-select, so a missing git is looked
+        // for again only now and then, not on every change of a file.
+        if self.program.is_none() && self.git_looked.is_none_or(|looked| looked.elapsed() > std::time::Duration::from_secs(30)) {
+            self.git_looked = Some(std::time::Instant::now());
             self.program = program();
         }
         let Some(program) = self.program.clone() else {
@@ -267,6 +281,7 @@ impl GitPanel {
             Ok(Some(read)) => {
                 let branch_changed = self.status.branch != read.status.branch;
                 self.merging = read.merging;
+                self.has_remote = read.has_remote;
                 self.state = RepoState::Ready(read.repository);
                 self.status = read.status;
                 if self.history_refs.as_deref() != Some(&read.refs) {
@@ -456,6 +471,47 @@ impl GitPanel {
     fn push(&mut self, cx: &mut Context<Self>) {
         self.last_network = Some(NetworkAction::Push);
         self.run_networked(cx, Repository::push);
+    }
+
+    /// Puts the project into a new private repository on GitHub, after a
+    /// sign-in when there is none yet.
+    fn publish(&mut self, cx: &mut Context<Self>) {
+        self.last_network = Some(NetworkAction::Publish);
+        let folder = self.root.as_deref().and_then(Path::file_name).map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+        let has_commit = self.status.oid.is_some();
+        self.run_networked(cx, move |repository| {
+            let Some(token) = crate::git_login::token(crate::github::HOST) else {
+                return Err(GitError::Auth { host: crate::github::HOST.to_string() });
+            };
+            let url = crate::github::create_repository(&token, &crate::github::repository_name(&folder), true)?;
+            repository.add_origin(&url)?;
+            // A repository without a commit has nothing to push yet; the first
+            // commit and push send it.
+            if has_commit { repository.push() } else { Ok(()) }
+        });
+    }
+
+    /// Opens Apple's dialog for its developer tools, which bring git, and
+    /// reads the repository once they are there.
+    fn install_git(&mut self, cx: &mut Context<Self>) {
+        if self.installing_git {
+            return;
+        }
+        self.installing_git = true;
+        self.error = None;
+        cx.notify();
+        self.action_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx.background_spawn(async move { crate::toolchain::install_developer_tools(&std::sync::atomic::AtomicBool::new(false)) }).await;
+            this.update(cx, |this, cx| {
+                this.installing_git = false;
+                this.action_task = None;
+                this.error = result.err();
+                this.program = None;
+                this.git_looked = None;
+                this.refresh(cx);
+            })
+            .ok();
+        }));
     }
 
     /// Merges what others pushed. Conflicts stop the merge for the user to
@@ -937,6 +993,21 @@ impl GitPanel {
             })
     }
 
+    fn primary_button(&self, id: &'static str, cx: &mut Context<Self>, handler: fn(&mut Self, &mut Context<Self>)) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(id)
+            .flex_none()
+            .px(px(10.))
+            .py(px(5.))
+            .rounded(px(4.))
+            .text_center()
+            .cursor_pointer()
+            .bg(theme::color(theme::palette().accent))
+            .text_color(theme::color(theme::palette().on_accent))
+            .font_weight(FontWeight::SEMIBOLD)
+            .on_click(cx.listener(move |this, _, _, cx| handler(this, cx)))
+    }
+
     fn render_message(&self, message: &'static str, action: Option<(&'static str, gpui::Stateful<gpui::Div>)>) -> impl IntoElement {
         div()
             .flex()
@@ -953,6 +1024,7 @@ struct RepositoryRead {
     status: Status,
     refs: String,
     merging: bool,
+    has_remote: bool,
 }
 
 fn read_repository(program: &Program, root: &Path) -> Result<Option<RepositoryRead>, String> {
@@ -962,12 +1034,17 @@ fn read_repository(program: &Program, root: &Path) -> Result<Option<RepositoryRe
     let status = repository.status()?;
     let refs = repository.refs_fingerprint()?;
     let merging = repository.merge_in_progress();
-    Ok(Some(RepositoryRead { repository, status, refs, merging }))
+    let has_remote = repository.has_remote();
+    Ok(Some(RepositoryRead { repository, status, refs, merging, has_remote }))
 }
 
 /// How to start git, with the editor itself answering for logins.
 pub fn program() -> Option<Program> {
-    find_tool("git").map(|path| Program {
+    // On a fresh Mac, /usr/bin/git only asks macOS to install Apple's
+    // developer tools, in a dialog at a moment nobody expects. The panel
+    // offers that install itself instead.
+    let path = find_tool("git").filter(|path| path != Path::new("/usr/bin/git") || crate::toolchain::developer_tools())?;
+    Some(path).map(|path| Program {
         path,
         path_env: child_path(),
         askpass: std::env::current_exe().ok(),
@@ -1068,7 +1145,15 @@ impl Render for GitPanel {
                 .children(error)
                 .into_any_element(),
             RepoState::NoProject => panel.child(self.render_message("Open a folder to start.", None)).into_any_element(),
-            RepoState::GitMissing => panel.child(self.render_message("Git was not found.", None)).into_any_element(),
+            RepoState::GitMissing => {
+                let message = if self.installing_git {
+                    "Click Install in the dialog from Apple. Its developer tools bring git and take a few minutes. This panel continues on its own."
+                } else {
+                    "Git keeps the history of your project and puts it on GitHub. On a Mac it comes with Apple's developer tools (about 2 GB)."
+                };
+                let button = (!self.installing_git).then(|| ("Set up git", self.primary_button("git-install", cx, |this, cx| this.install_git(cx))));
+                panel.child(self.render_message(message, button)).children(error).into_any_element()
+            }
             RepoState::NoRepository => {
                 let button = div()
                     .id("git-init")
@@ -1092,6 +1177,10 @@ impl Render for GitPanel {
                 .on_action(cx.listener(|this, _: &Recompile, _, cx| this.commit(cx)))
                 .child(self.render_head(cx))
                 .children(error)
+                .when(!self.has_remote, |panel| {
+                    let button = self.primary_button("git-publish", cx, |this, cx| this.publish(cx));
+                    panel.child(self.render_message("This project is only on your Mac. Keep a private copy on GitHub, also to work on it with others.", Some(("Put it on GitHub", button))))
+                })
                 .child(self.render_changes(cx))
                 .child(self.render_commit_box(cx))
                 .child(self.render_history(cx))
