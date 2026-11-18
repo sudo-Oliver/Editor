@@ -1,4 +1,4 @@
-# Homebrew cask for Editor. The release workflow fills in the version and the
+# Homebrew cask for Editor. scripts/release.sh fills in the version and the
 # checksum and attaches the result to the release; copy it into the tap
 # repository (sudo-Oliver/homebrew-tap, Casks/editor.rb) to publish it. Then:
 #
@@ -16,6 +16,12 @@ cask "editor" do
 
   app "Editor.app"
   binary "#{appdir}/Editor.app/Contents/Resources/bin/editor"
+
+  # Editor is not registered with Apple, so the mark of the download would make
+  # macOS refuse the first start. The checksum above already checked the file.
+  postflight do
+    system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{appdir}/Editor.app"]
+  end
 
   zap trash: "~/.config/editor"
 

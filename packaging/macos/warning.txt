@@ -1,0 +1,18 @@
+Editor is free software and not registered with Apple, since that costs a
+yearly fee. So macOS warns before the first start that it cannot check the
+app. The warning is about the missing registration, not about anything found
+in Editor. To open it once:
+
+1. Drag Editor into Applications and double-click it there.
+2. Click "Done" on the warning.
+3. Open System Settings > Privacy & Security, scroll down and click
+   "Open Anyway" next to Editor. Confirm with your password.
+
+From then on, Editor opens like any other app.
+
+Without the warning: open Terminal (Cmd + Space, type Terminal, Return),
+paste this line and press Return. It installs the same release.
+
+  curl -fsSL https://raw.githubusercontent.com/sudo-Oliver/Editor/main/scripts/install.sh | sh
+
+The code, the script and the releases: https://github.com/sudo-Oliver/Editor

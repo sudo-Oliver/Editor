@@ -5,9 +5,18 @@ The editor, the compilers and the PDF preview all run on your machine.
 
 ## Install
 
-Download `Editor-<version>.dmg` from the [releases](https://github.com/sudo-Oliver/Editor/releases), open it and drag Editor into Applications.
+Open Terminal (Cmd + Space, type Terminal, Return), paste this line and press Return:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/sudo-Oliver/Editor/main/scripts/install.sh | sh
+```
+
+It downloads the latest [release](https://github.com/sudo-Oliver/Editor/releases), checks its checksum and signature, puts Editor into Applications and opens it. [The script](scripts/install.sh) is short enough to read first.
 It runs on Apple silicon and Intel Macs with macOS 11 or later.
-With Homebrew, `brew install --cask sudo-oliver/tap/editor` does the same and adds the `editor` command.
+
+Editor is not registered with Apple, which costs a yearly fee. A download in the browser therefore makes macOS warn before the first start; a download with curl does not.
+The dmg from the releases works too: drag Editor into Applications, double-click it, click Done on the warning, then System Settings > Privacy & Security > Open Anyway. The dmg has the same steps in "If macOS warns.txt".
+With Homebrew, `brew install --cask sudo-oliver/tap/editor` installs it and adds the `editor` command.
 
 Files open from Finder (Open With, or drag them onto the Dock icon), and from the terminal like VS Code's `code`:
 
@@ -37,9 +46,8 @@ Then a welcome document opens and a tour shows each part of the editor. Help, Ed
 
 ## Building a release
 
-`scripts/bundle-macos.sh` builds `target/bundle/Editor.app` for both architectures and packs it into a dmg.
-Without signing details it signs ad hoc, which is enough for your own Mac.
-A release needs an Apple Developer ID; the script header lists the environment variables, and `.github/workflows/release.yml` reads them from repository secrets when a `v*` tag is pushed.
+Raise the version in `Cargo.toml`, commit it, and run `scripts/release.sh`. It runs the tests, builds the app for Apple silicon and Intel (`scripts/bundle-macos.sh`), packs `Editor.zip` for the install command and a dmg for the browser, writes their checksums and the Homebrew cask, and publishes the release `v<version>` on GitHub with `gh`.
+There is no CI: releases are built and checked on your own Mac.
 
 ## Setup for development
 

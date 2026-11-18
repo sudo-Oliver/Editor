@@ -1,9 +1,12 @@
 #!/bin/sh
 # Builds Editor.app for Apple silicon and Intel in one, and packs it into a .dmg.
 #
-# Without signing details the app is signed ad hoc. It runs on this Mac, but on
-# others macOS warns that it comes from an unidentified developer. For a release,
-# set these in the environment (in CI they come from repository secrets):
+# Releases are signed ad hoc, since Editor is not registered with Apple. The
+# install command (scripts/install.sh) downloads with curl, which macOS does not
+# mark, so the app opens without a warning; the dmg carries a note on the
+# warning that a browser download gets. scripts/release.sh publishes both.
+#
+# With an Apple Developer ID, these in the environment sign and notarize instead:
 #
 #   EDITOR_SIGN_IDENTITY     "Developer ID Application: Name (TEAMID)", from the keychain
 #   EDITOR_NOTARY_PROFILE    a profile stored with `xcrun notarytool store-credentials`
@@ -85,6 +88,7 @@ staging="$work/dmg"
 mkdir -p "$staging"
 cp -R "$app" "$staging/"
 ln -s /Applications "$staging/Applications"
+cp packaging/macos/warning.txt "$staging/If macOS warns.txt"
 hdiutil create -volname "Editor" -srcfolder "$staging" -fs HFS+ -format UDZO -ov "$dmg" >/dev/null
 
 if [ "$identity" != "-" ]; then
