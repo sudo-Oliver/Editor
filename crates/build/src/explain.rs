@@ -87,6 +87,13 @@ fn explain_tool(message: &str) -> Option<Explanation> {
     let language = match tool {
         "tectonic" | "latexmk" | "pdflatex" | "lualatex" => "LaTeX",
         "typst" => "Typst",
+        "pandoc" => {
+            return Some(Explanation {
+                title: "Pandoc is not set up yet".to_string(),
+                hint: "Markdown becomes a PDF through Pandoc, a free converter. Install it here, then click Recompile.".to_string(),
+                fix: Some(Fix::InstallTool("Pandoc".to_string())),
+            });
+        }
         _ => {
             return found(
                 format!("{tool} is not installed"),
@@ -432,7 +439,7 @@ mod tests {
         let explained = |message: &str| explain(&Diagnostic { message: message.to_string(), ..Default::default() }).unwrap();
         assert_eq!(explained("tectonic is not installed.").fix, Some(Fix::InstallTool("LaTeX".to_string())));
         assert_eq!(explained("typst is not installed.").fix, Some(Fix::InstallTool("Typst".to_string())));
-        assert_eq!(explained("pandoc is not installed.").fix, None);
+        assert_eq!(explained("pandoc is not installed.").fix, Some(Fix::InstallTool("Pandoc".to_string())));
     }
 
     fn with_context(message: &str, context: &str) -> Diagnostic {

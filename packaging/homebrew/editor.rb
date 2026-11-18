@@ -21,6 +21,6 @@ cask "editor" do
 
   caveats <<~EOS
     The editor command opens files and folders: editor .
-    On the first start, Editor installs LaTeX or Typst with Homebrew if you like.
+    On the first start, Editor installs LaTeX (MacTeX or Tectonic) or Typst, with Homebrew if you like.
   EOS
 end

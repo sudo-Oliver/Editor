@@ -10,6 +10,7 @@ mod export;
 mod file_tree;
 mod git_login;
 mod git_panel;
+mod github;
 mod home_view;
 mod image_view;
 mod keymap;
