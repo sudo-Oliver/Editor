@@ -498,6 +498,16 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Puts the cursor at a zero-based line and column, without taking the focus.
+    pub fn place_cursor(&mut self, line: usize, column: usize, cx: &mut Context<Self>) {
+        let offset = self.state.buffer().point_to_offset(line, column);
+        self.state.set_selections(vec![Selection::cursor(offset)]);
+        self.vim_after_mouse();
+        self.autoscroll = true;
+        self.center_on_scroll = true;
+        cx.notify();
+    }
+
     pub fn go_to_line(&mut self, line: usize, column: usize, window: &mut Window, cx: &mut Context<Self>) {
         let offset = self.state.buffer().point_to_offset(line, column);
         self.state.set_selections(vec![Selection::cursor(offset)]);
