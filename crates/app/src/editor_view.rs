@@ -669,6 +669,15 @@ impl EditorView {
         self.changed(cx);
     }
 
+    /// Puts `text` in place of the selection, as pasting would.
+    pub fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        if let Some(vim) = &mut self.vim {
+            vim.enter_insert(&self.state);
+        }
+        self.state.paste(text);
+        self.changed(cx);
+    }
+
     /// Moves the cursor one character on, past a closing brace it stands before.
     pub fn step_forward(&mut self, cx: &mut Context<Self>) {
         let head = self.state.selections().primary().head;
