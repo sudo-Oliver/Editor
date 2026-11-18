@@ -17,7 +17,7 @@ use tokio::{
 
 use crate::{
     config::Engine,
-    explain,
+    explain, fontmap,
     parse::{self, Diagnostic, Severity},
     preamble::{self, Preamble, State},
     tools::{child_path, find_tool},
@@ -181,7 +181,7 @@ async fn build(
     .to_string_lossy()
     .into_owned();
 
-    let plain = invocation(request.engine, &input, &stem, None);
+    let plain = invocation(request.engine, &input, &stem, None, false, false);
     if find_tool(plain.tool).is_none() {
         return Some(failure(format!("{} is not installed.", plain.tool), started));
     }
@@ -192,7 +192,6 @@ async fn build(
 
     let is_latex = matches!(request.engine, Engine::PdfLatex | Engine::LuaLatex);
     let log_path = output_directory.join(format!("{stem}.log"));
-    let reruns_by_hand = plain.tool == "pdflatex" || plain.tool == "lualatex";
     let mut cleaned = request.clean;
     if request.clean {
         preamble::remove_formats(&output_directory, None);
@@ -208,18 +207,43 @@ async fn build(
             remove_latex_state(&output_directory);
         }
         let name = format.as_ref().map(Preamble::name);
-        let invocation = invocation(request.engine, &input, &stem, name.as_deref());
+        // LaTeX runs by itself, which spares latexmk's start and its checks on
+        // every edit. latexmk takes over only for what LaTeX cannot do alone,
+        // such as a bibliography or an index, and for a clean build.
+        let font_map = request.engine == Engine::PdfLatex && fontmap::current(&output_directory).is_some();
+        // The first build of a project goes to latexmk at once, since it may need
+        // a bibliography, which a run of LaTeX alone would only find out.
+        let first = !output_directory.join(format!("{stem}.aux")).is_file();
+        let direct = invocation(request.engine, &input, &stem, name.as_deref(), cleaned || first, font_map);
+        let reruns_by_hand = direct.tool == "pdflatex" || direct.tool == "lualatex";
         let mut runs = 0;
-        let run = loop {
+        let mut map_grown = false;
+        let mut run = loop {
             runs += 1;
-            let run = run_process(&invocation, &cwd, events, cancelled, group).await?;
-            let rerun = reruns_by_hand
-                && runs < MAX_LATEX_RUNS
-                && std::fs::read_to_string(&log_path).is_ok_and(|log| log.contains("Rerun to get"));
+            let run = run_process(&direct, &cwd, events, cancelled, group).await?;
+            let log = std::fs::read(&log_path).map(|log| String::from_utf8_lossy(&log).into_owned()).unwrap_or_default();
+            // A font outside the project's map came out as a bitmap: the map
+            // grows by its family, and LaTeX runs again once.
+            if font_map && !map_grown && fontmap::missed_a_font(&log) {
+                map_grown = true;
+                if fontmap::update(&output_directory, &stem) {
+                    continue;
+                }
+                fontmap::remove(&output_directory);
+            }
+            let rerun = reruns_by_hand && runs < MAX_LATEX_RUNS && log.contains("Rerun to get");
             if !rerun {
                 break run;
             }
         };
+        if reruns_by_hand && find_tool("latexmk").is_some() && needs_latexmk(&cwd, &output_directory, &stem) {
+            // The full font map, since latexmk's runs would make bitmaps for a missing font.
+            let full = invocation(request.engine, &input, &stem, name.as_deref(), true, false);
+            run = run_process(&full, &cwd, events, cancelled, group).await?;
+        }
+        if run.success && request.engine == Engine::PdfLatex && !font_map {
+            fontmap::update(&output_directory, &stem);
+        }
         let diagnostics = match request.engine {
             Engine::Typst => parse::parse_typst(&run.stderr, &cwd),
             Engine::Tectonic => parse::parse_tectonic(&run.stderr, &cwd),
@@ -291,6 +315,34 @@ async fn build(
     })
 }
 
+/// Whether the last LaTeX run left work that only latexmk does: BibTeX or
+/// Biber for the bibliography, or makeindex for an index.
+fn needs_latexmk(cwd: &Path, output_directory: &Path, stem: &str) -> bool {
+    let log = std::fs::read(output_directory.join(format!("{stem}.log"))).unwrap_or_default();
+    let log = String::from_utf8_lossy(&log);
+    let asks = ["Please (re)run Biber", "Please (re)run BibTeX", "Please rerun BibTeX", "Please rerun Biber"];
+    // A new \cite that BibTeX has not seen yet shows up as undefined.
+    let new_citation = log.contains("Citation `") && log.contains("undefined") && log.contains(&format!("{stem}.bbl"));
+    if asks.iter().any(|ask| log.contains(ask)) || log.contains(&format!("No file {stem}.bbl")) || new_citation {
+        return true;
+    }
+    if output_directory.join(format!("{stem}.idx")).is_file() || output_directory.join(format!("{stem}.glo")).is_file() {
+        return true;
+    }
+    // An edited .bib file changes the bibliography without LaTeX noticing.
+    let modified = |path: &Path| std::fs::metadata(path).and_then(|metadata| metadata.modified()).ok();
+    let Some(bbl) = modified(&output_directory.join(format!("{stem}.bbl"))) else {
+        return false;
+    };
+    std::fs::read_dir(cwd)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "bib"))
+        .any(|bib| modified(&bib).is_some_and(|bib| bib > bbl))
+}
+
 /// Picks the most useful line. latexmk prints a summary after its other output.
 fn failure_summary(stderr: &str) -> &str {
     let mut lines = stderr.lines();
@@ -322,7 +374,8 @@ fn failure(message: String, started: Instant) -> BuildOutcome {
     }
 }
 
-fn invocation(engine: Engine, input: &str, stem: &str, format: Option<&str>) -> Invocation {
+/// `latexmk` lets latexmk run LaTeX, when it is there, instead of LaTeX itself.
+fn invocation(engine: Engine, input: &str, stem: &str, format: Option<&str>, latexmk: bool, font_map: bool) -> Invocation {
     let strings = |args: &[&str]| args.iter().map(ToString::to_string).collect::<Vec<_>>();
     let pdf = format!("{OUTPUT_DIRECTORY}/{stem}.pdf");
     match engine {
@@ -341,7 +394,7 @@ fn invocation(engine: Engine, input: &str, stem: &str, format: Option<&str>) -> 
             args: strings(&[input, "-o", &pdf, "--pdf-engine=typst"]),
             env: Vec::new(),
         },
-        Engine::PdfLatex | Engine::LuaLatex => latex_invocation(engine, input, format),
+        Engine::PdfLatex | Engine::LuaLatex => latex_invocation(engine, input, format, latexmk, font_map),
     }
 }
 
@@ -397,7 +450,7 @@ async fn prepare_format(
     }
 }
 
-fn latex_invocation(engine: Engine, input: &str, format: Option<&str>) -> Invocation {
+fn latex_invocation(engine: Engine, input: &str, format: Option<&str>, latexmk: bool, font_map: bool) -> Invocation {
     // A long line limit keeps file names and messages in the log on one line.
     // The limit is set per program, because BibTeX aborts on a value this high.
     let mut env = vec![("max_print_line_pdflatex", "100000".to_string()), ("max_print_line_lualatex", "100000".to_string())];
@@ -405,8 +458,12 @@ fn latex_invocation(engine: Engine, input: &str, format: Option<&str>) -> Invoca
         // The trailing colon keeps the normal search path.
         env.push(("TEXFORMATS", format!("{OUTPUT_DIRECTORY}:")));
     }
+    let font_map = font_map && engine == Engine::PdfLatex;
+    if font_map {
+        env.push(("TEXFONTMAPS", format!("{OUTPUT_DIRECTORY}:")));
+    }
     let common = ["-interaction=nonstopmode", "-file-line-error", "-synctex=1", "-no-shell-escape"];
-    if find_tool("latexmk").is_some() {
+    if latexmk && find_tool("latexmk").is_some() {
         // -norc ignores latexmkrc files, which can run arbitrary commands from a project.
         let mode = if engine == Engine::LuaLatex { "-lualatex" } else { "-pdf" };
         let mut args = vec!["-norc".to_string(), mode.to_string()];
@@ -419,6 +476,13 @@ fn latex_invocation(engine: Engine, input: &str, format: Option<&str>) -> Invoca
         return Invocation { tool: "latexmk", args, env };
     }
     let mut args: Vec<String> = common.iter().map(ToString::to_string).collect();
+    // The list of files read, for the fonts of the project's own font map.
+    args.push("-recorder".to_string());
+    if font_map {
+        // A font the map lacks ends the run, which then repeats with a
+        // larger map, instead of becoming a slow and blurry bitmap.
+        args.push("-no-mktex=pk".to_string());
+    }
     args.push(format!("-output-directory={OUTPUT_DIRECTORY}"));
     if let Some(format) = format {
         args.push(format!("&{format}"));
@@ -870,5 +934,137 @@ mod tests {
         assert!(outcome.pdf.is_none());
         let last_good = outcome.last_good_pdf.expect("the old PDF stays");
         assert_eq!(std::fs::read(last_good).unwrap(), b"old");
+    }
+}
+
+#[cfg(test)]
+mod speed {
+    use super::*;
+
+    const DOCUMENT: &str = "\\documentclass{article}\n\\usepackage{amsmath}\n\\usepackage{hyperref}\n\\title{Welcome}\n\\author{You}\n\\begin{document}\n\\maketitle\n\\section{How}\\label{s}\nText, see \\ref{s}. EDIT\n\\begin{equation} e^{i\\pi} + 1 = 0 \\end{equation}\n\\end{document}\n";
+
+    /// Times a run of builds as when typing, for a look by hand:
+    /// cargo test -p build speed -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn typing_with_pdflatex() {
+        let directory = tempfile::tempdir().unwrap();
+        let main = directory.path().join("main.tex");
+        let manager = BuildManager::new();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        for edit in 0..8 {
+            std::fs::write(&main, DOCUMENT.replace("EDIT", &format!("edit {edit}"))).unwrap();
+            let request = BuildRequest { root: directory.path().to_path_buf(), main: main.clone(), engine: Engine::PdfLatex, clean: false };
+            let mut events = manager.start(request);
+            let outcome = runtime.block_on(async {
+                let mut outcome = None;
+                while let Some(event) = events.recv().await {
+                    if let BuildEvent::Finished(finished) = event {
+                        outcome = Some(finished);
+                    }
+                }
+                outcome.unwrap()
+            });
+            assert!(outcome.success, "{:?}", outcome.diagnostics);
+            println!("edit {edit}: {:?}", outcome.duration);
+        }
+    }
+}
+
+#[cfg(test)]
+mod direct_latex {
+    use super::*;
+
+    fn compile(manager: &BuildManager, main: &Path) -> BuildOutcome {
+        let request = BuildRequest { root: main.parent().unwrap().to_path_buf(), main: main.to_path_buf(), engine: Engine::PdfLatex, clean: false };
+        let mut events = manager.start(request);
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let mut outcome = None;
+            while let Some(event) = events.recv().await {
+                if let BuildEvent::Finished(finished) = event {
+                    outcome = Some(finished);
+                }
+            }
+            outcome.unwrap()
+        })
+    }
+
+    fn pdf_text(pdf: &Path) -> String {
+        let output = std::process::Command::new("pdftotext").arg(pdf).arg("-").output().unwrap();
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    fn bitmap_fonts(pdf: &Path) -> bool {
+        let output = std::process::Command::new("pdffonts").arg(pdf).output().unwrap();
+        String::from_utf8_lossy(&output.stdout).contains("Type 3")
+    }
+
+    /// Needs MacTeX and poppler: cargo test -p build direct_latex -- --ignored
+    #[test]
+    #[ignore]
+    fn a_new_font_family_while_typing_stays_a_real_font() {
+        let directory = tempfile::tempdir().unwrap();
+        let main = directory.path().join("main.tex");
+        let manager = BuildManager::new();
+        let body = |extra: &str| format!("\\documentclass{{article}}\n\\begin{{document}}\nText {extra}\n\\end{{document}}\n");
+        for edit in 0..3 {
+            std::fs::write(&main, body(&format!("edit {edit}"))).unwrap();
+            assert!(compile(&manager, &main).success);
+        }
+        assert!(directory.path().join(".build/pdftex.map").is_file());
+        // A family outside the map, without a change of the preamble.
+        std::fs::write(&main, body("{\\usefont{U}{msb}{m}{n}AB}")).unwrap();
+        let outcome = compile(&manager, &main);
+        assert!(outcome.success, "{:?}", outcome.diagnostics);
+        let pdf = outcome.pdf.unwrap();
+        assert!(!bitmap_fonts(&pdf));
+        assert!(std::fs::read_to_string(directory.path().join(".build/pdftex.map")).unwrap().contains("msbm10"));
+    }
+
+    #[test]
+    #[ignore]
+    fn citations_still_go_through_bibtex() {
+        let directory = tempfile::tempdir().unwrap();
+        let main = directory.path().join("main.tex");
+        let bib = directory.path().join("refs.bib");
+        std::fs::write(&bib, "@book{knuth, title={The TeXbook}, author={Knuth, Donald}, year={1984}}\n@book{lamport, title={LaTeX}, author={Lamport, Leslie}, year={1994}}\n").unwrap();
+        let manager = BuildManager::new();
+        let body = |cites: &str, text: &str| format!("\\documentclass{{article}}\n\\begin{{document}}\n{text} {cites}\n\\bibliographystyle{{plain}}\n\\bibliography{{refs}}\n\\end{{document}}\n");
+        std::fs::write(&main, body("\\cite{knuth}", "First")).unwrap();
+        let outcome = compile(&manager, &main);
+        assert!(outcome.success);
+        let text = pdf_text(outcome.pdf.as_ref().unwrap());
+        assert!(text.contains("[1]") && text.contains("TeXbook"), "{text}");
+        // Typing without a new citation keeps it.
+        for edit in 0..3 {
+            std::fs::write(&main, body("\\cite{knuth}", &format!("Edit {edit}"))).unwrap();
+            let outcome = compile(&manager, &main);
+            assert!(pdf_text(outcome.pdf.as_ref().unwrap()).contains("TeXbook"));
+        }
+        // A new citation runs BibTeX again.
+        std::fs::write(&main, body("\\cite{knuth} \\cite{lamport}", "More")).unwrap();
+        let text = pdf_text(compile(&manager, &main).pdf.as_ref().unwrap());
+        assert!(text.contains("Lamport") && !text.contains("[?]"), "{text}");
+        // So does an edited .bib file.
+        std::thread::sleep(Duration::from_millis(1100));
+        std::fs::write(&bib, "@book{knuth, title={The METAFONTbook}, author={Knuth, Donald}, year={1986}}\n@book{lamport, title={LaTeX}, author={Lamport, Leslie}, year={1994}}\n").unwrap();
+        let text = pdf_text(compile(&manager, &main).pdf.as_ref().unwrap());
+        assert!(text.contains("METAFONTbook"), "{text}");
+    }
+
+    #[test]
+    #[ignore]
+    fn biblatex_goes_through_biber() {
+        let directory = tempfile::tempdir().unwrap();
+        let main = directory.path().join("main.tex");
+        std::fs::write(directory.path().join("refs.bib"), "@book{knuth, title={The TeXbook}, author={Knuth, Donald}, year={1984}}\n@book{lamport, title={LaTeX}, author={Lamport, Leslie}, year={1994}}\n").unwrap();
+        let manager = BuildManager::new();
+        let body = |cites: &str| format!("\\documentclass{{article}}\n\\usepackage{{biblatex}}\n\\addbibresource{{refs.bib}}\n\\begin{{document}}\n{cites}\n\\printbibliography\n\\end{{document}}\n");
+        std::fs::write(&main, body("\\cite{knuth}")).unwrap();
+        assert!(pdf_text(compile(&manager, &main).pdf.as_ref().unwrap()).contains("TeXbook"));
+        std::fs::write(&main, body("\\cite{knuth} \\cite{lamport}")).unwrap();
+        let text = pdf_text(compile(&manager, &main).pdf.as_ref().unwrap());
+        assert!(text.contains("Lamport"), "{text}");
     }
 }

@@ -2,6 +2,7 @@
 
 mod config;
 mod explain;
+mod fontmap;
 mod packages;
 mod parse;
 mod preamble;
