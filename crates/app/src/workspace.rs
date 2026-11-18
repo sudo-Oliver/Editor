@@ -453,6 +453,10 @@ pub struct Workspace {
     home: Entity<HomeView>,
     /// The setup of the first start, shown in place of everything else.
     setup: Option<(Entity<SetupView>, Subscription)>,
+    /// Opens the setup at the next frame, for actions without a window.
+    setup_requested: bool,
+    /// The draft export that waits for Pandoc to be installed.
+    export_after_pandoc: Option<DraftFormat>,
     tour: Option<Tour>,
     /// A file or folder from Finder or the terminal that arrived during the setup.
     pending_open: Option<PathBuf>,
@@ -696,6 +700,8 @@ impl Workspace {
             focus_mode: false,
             home,
             setup: None,
+            setup_requested: false,
+            export_after_pandoc: None,
             tour: None,
             pending_open: None,
             tour_anchors: Rc::default(),
@@ -2063,6 +2069,17 @@ impl Workspace {
             self.set_status(format!("No compiler for {}.", main.display()), cx);
             return;
         };
+        let compiler = match engine {
+            Engine::Typst => Tool::Typst,
+            Engine::Pandoc => Tool::Pandoc,
+            Engine::Tectonic => Tool::Tectonic,
+            Engine::PdfLatex | Engine::LuaLatex => Tool::MacTex,
+        };
+        if let Some(pending) = self.toolchain.read(cx).pending(compiler) {
+            // `tool_installed` compiles once it is there.
+            self.last_build_succeeded = false;
+            return self.set_status(pending, cx);
+        }
         self.engine = Some(engine);
         self.last_main = Some(main.clone());
         self.build_queued = false;
@@ -2314,6 +2331,11 @@ impl Workspace {
     /// a removal to the file that loads the package.
     fn apply_fix(&mut self, fix: &Fix, path: Option<&Path>, cx: &mut Context<Self>) {
         if let Fix::InstallTool(language) = fix {
+            // LaTeX comes in two sizes, which the setup explains.
+            if language == "LaTeX" {
+                self.setup_requested = true;
+                return cx.notify();
+            }
             if let Some(tool) = Tool::for_language(language) {
                 self.toolchain.update(cx, |toolchain, cx| toolchain.start(tool, cx));
             }
@@ -2607,6 +2629,10 @@ impl Workspace {
     }
 
     fn open_dialog(&mut self, dialog: Dialog, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(dialog, Dialog::Settings(_)) {
+            // Tools may have come or gone outside the app since the last look.
+            self.toolchain.read(cx).forget_found();
+        }
         self.open_menu = None;
         self.dialog = Some(dialog);
         window.focus(&self.dialog_focus, cx);
@@ -3366,7 +3392,20 @@ impl Workspace {
             return;
         };
         let Some(pandoc) = build::find_tool("pandoc") else {
-            self.show_notice("Pandoc is not installed", "Word, HTML and Markdown drafts need Pandoc. The PDF and source downloads work without it.", window, cx);
+            // Installed on the first export only, since few people need it.
+            let size = toolchain::size(Tool::Pandoc.megabytes().unwrap_or(0));
+            let detail = format!("Word, HTML and Markdown drafts need Pandoc, a free converter ({size}). The export goes on by itself once it is installed. The PDF and source downloads work without it.");
+            let answer = window.prompt(PromptLevel::Info, "Install Pandoc for this export?", Some(&detail), &["Install and export", "Cancel"], cx);
+            cx.spawn_in(window, async move |this, cx| {
+                if answer.await == Ok(0) {
+                    this.update(cx, |this, cx| {
+                        this.export_after_pandoc = Some(format);
+                        this.toolchain.update(cx, |toolchain, cx| toolchain.start(Tool::Pandoc, cx));
+                    })
+                    .ok();
+                }
+            })
+            .detach();
             return;
         };
         self.start_export(window, cx, async move |this, cx| {
@@ -6246,7 +6285,7 @@ impl Workspace {
                     .min_w_0()
                     .truncate()
                     .text_color(theme::color(theme::palette().ui_muted))
-                    .child(self.status.clone().unwrap_or_default()),
+                    .child(self.status.clone().or_else(|| self.toolchain.read(cx).summary().map(Into::into)).unwrap_or_default()),
             )
             .child(
                 div()
@@ -7275,13 +7314,14 @@ impl Workspace {
                 .into_any_element(),
         ];
         elements.extend(toolchain::installer_choice(&self.toolchain, cx));
-        elements.extend(toolchain::tool_rows(&self.toolchain, &Tool::ALL, cx));
+        elements.extend(toolchain::tool_rows(&self.toolchain, &Tool::ALL, true, cx));
         elements.push(div().flex_none().pt(px(4.)).text_size(px(11.)).text_color(theme::color(theme::palette().ui_muted)).child(toolchain::promise(&self.toolchain, cx)).into_any_element());
         elements
     }
 
     fn run_setup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let setup = cx.new(|cx| SetupView::new(self.toolchain.clone(), cx));
+        let again = self.settings.first_run_done;
+        let setup = cx.new(|cx| SetupView::new(self.toolchain.clone(), again, cx));
         let subscription = cx.subscribe_in(&setup, window, |this, _, event, window, cx| match event {
             SetupEvent::Finished { example, guided } => this.finish_setup(*example, *guided, window, cx),
             SetupEvent::InstallCommand => this.install_shell_command(cx),
@@ -7334,7 +7374,7 @@ impl Workspace {
     /// Without a project, the tour opens the welcome example to have something to show.
     fn start_tour(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.root.is_none() {
-            let language = if toolchain::find(Tool::Tectonic) == toolchain::Found::Missing && toolchain::find(Tool::Typst) != toolchain::Found::Missing {
+            let language = if !toolchain::language_ready(Tool::Tectonic) && toolchain::language_ready(Tool::Typst) {
                 TemplateLanguage::Typst
             } else {
                 TemplateLanguage::Latex
@@ -8002,6 +8042,16 @@ impl Render for Workspace {
         self.refresh_outline(cx);
         self.sync_project_symbols(cx);
         self.settle_addon_dialog(window, cx);
+        if std::mem::take(&mut self.setup_requested) && self.setup.is_none() {
+            self.run_setup(window, cx);
+        }
+        if let Some(format) = self.export_after_pandoc.filter(|_| !self.toolchain.read(cx).installing(Tool::Pandoc)) {
+            self.export_after_pandoc = None;
+            match self.toolchain.read(cx).errors.get(&Tool::Pandoc).cloned() {
+                Some(error) => self.set_status(error, cx),
+                None => self.download_draft(format, window, cx),
+            }
+        }
         #[cfg(feature = "collab")]
         self.collab_frame(window, cx);
         let addon_dialog = self.dialog_panel(cx).map(|panel| self.render_addon_dialog(panel, cx));

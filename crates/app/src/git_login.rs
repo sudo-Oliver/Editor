@@ -31,6 +31,11 @@ pub fn answer(prompt: &str) -> Option<String> {
     }
 }
 
+/// The token kept for a host, if any. Blocks.
+pub fn token(host: &str) -> Option<String> {
+    secrets::get(SERVICE, host).ok().flatten()
+}
+
 /// Keeps a token for a host, and the user name if there is one. Blocks.
 pub fn store(host: &str, user: &str, token: &str) -> Result<(), String> {
     secrets::set(SERVICE, LABEL, host, token)?;
