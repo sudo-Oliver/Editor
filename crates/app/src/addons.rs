@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use addon_api::{API_VERSION, AddonMessage, HostMessage, Manifest};
+use addon_api::{API_VERSION, AddonMessage, HostMessage, Manifest, OLDEST_API_VERSION};
 use tokio::sync::mpsc;
 
 const MANIFEST: &str = "addon.toml";
@@ -54,8 +54,8 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
     if manifest.id.is_empty() || !manifest.id.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-') {
         return Err(format!("\"{}\" is not a valid add-on id. Use a-z, 0-9 and -.", manifest.id));
     }
-    if manifest.api != API_VERSION {
-        return Err(format!("{} needs add-on API {}, and this editor has {API_VERSION}.", manifest.name, manifest.api));
+    if !(OLDEST_API_VERSION..=API_VERSION).contains(&manifest.api) {
+        return Err(format!("{} needs add-on API {}, and this editor has {OLDEST_API_VERSION} to {API_VERSION}.", manifest.name, manifest.api));
     }
     if !stays_inside(Path::new(&manifest.program)) || manifest.icon.as_deref().is_some_and(|icon| !stays_inside(Path::new(icon))) {
         return Err(format!("{}: files must stay inside the add-on folder.", manifest.name));
@@ -461,7 +461,7 @@ echo 'not json'
 echo 'last words' >&2"#,
         );
         let (process, mut receiver) = AddonProcess::start(&add_on).unwrap();
-        process.send(HostMessage::Init { api: API_VERSION, project: None });
+        process.send(HostMessage::Init { api: API_VERSION, project: None, host_version: String::new(), features: Vec::new() });
         assert!(matches!(next(&mut receiver), ProcessEvent::Message(AddonMessage::Append { text, .. }) if text == "hello"));
         assert!(matches!(next(&mut receiver), ProcessEvent::Invalid(_)));
         assert!(matches!(next(&mut receiver), ProcessEvent::Exited(reason) if reason.contains("last words")));

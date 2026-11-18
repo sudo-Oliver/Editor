@@ -6,7 +6,15 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const API_VERSION: u32 = 1;
+pub const API_VERSION: u32 = 2;
+/// The oldest version the editor still runs. Messages that came later only go
+/// to add-ons that declare a version that has them.
+pub const OLDEST_API_VERSION: u32 = 1;
+
+/// What this editor can do beyond `API_VERSION`, sent with `HostMessage::Init`.
+/// Add-ons check these rather than the version, so that they work on an
+/// editor that lacks one by doing without it.
+pub const FEATURES: &[&str] = &["markdown", "tree_edits", "notify"];
 
 /// What an add-on may ask the editor for. Add-ons are not sandboxed, so this
 /// limits the requests below and not the program itself.
@@ -70,8 +78,17 @@ pub struct Manifest {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Node {
-    Column { children: Vec<Node> },
-    Row { children: Vec<Node> },
+    /// `id` lets `AddonMessage::Insert` add children later.
+    Column {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        children: Vec<Node>,
+    },
+    Row {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        children: Vec<Node>,
+    },
     /// A column that scrolls and fills the free height. New text keeps its end in view.
     Scroll {
         id: String,
@@ -111,6 +128,10 @@ pub enum Node {
         /// The text of a new input. An id that the editor knows keeps its text.
         #[serde(default)]
         value: String,
+        /// Grows with its text up to a few lines, and Enter sends it with the
+        /// button that submits it while Shift-Enter starts a new line.
+        #[serde(default, skip_serializing_if = "is_false")]
+        multiline: bool,
     },
     /// All options stay visible, as in the settings of the editor.
     Select {
@@ -137,15 +158,123 @@ pub enum Node {
     /// Text that must not be overlooked.
     Alert { text: String },
     Divider,
+    /// Markdown: headings, paragraphs, bold, italic, inline code, code blocks,
+    /// lists, quotes and links. `AddonMessage::Append` streams into it, and the
+    /// editor only parses again what changed.
+    Markdown {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        text: String,
+    },
+    /// One message of a conversation, drawn by who wrote it.
+    Message {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        role: Role,
+        children: Vec<Node>,
+    },
+    /// A title that shows or hides its children. The editor opens and closes it
+    /// by itself; `open` is how it starts.
+    Collapsible {
+        id: String,
+        title: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        open: bool,
+        children: Vec<Node>,
+    },
+    /// A framed group, such as a question that waits for an answer.
+    Card {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default)]
+        tone: Tone,
+        children: Vec<Node>,
+    },
+    /// Small labels in a row. Clicking the cross of a removable one sends
+    /// `HostMessage::Click` with its id.
+    Chips { id: String, items: Vec<Chip> },
+    /// A picture from a file, as wide as the panel at most.
+    Image {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_height: Option<u32>,
+    },
+    /// A node from a newer editor, which this one cannot draw and skips.
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    User,
+    Assistant,
+    Tool,
+    System,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tone {
+    #[default]
+    Info,
+    Success,
+    Warning,
+    Danger,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct Chip {
+    pub id: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub removable: bool,
 }
 
 fn enabled() -> bool {
     true
 }
 
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
 impl Default for Node {
     fn default() -> Self {
-        Self::Column { children: Vec::new() }
+        Self::Column { id: None, children: Vec::new() }
+    }
+}
+
+impl Node {
+    /// The id that messages address this node by, if it has one.
+    pub fn id(&self) -> Option<&str> {
+        match self {
+            Self::Column { id, .. } | Self::Row { id, .. } | Self::Text { id, .. } | Self::Code { id, .. } | Self::Markdown { id, .. } | Self::Message { id, .. } | Self::Card { id, .. } => {
+                id.as_deref()
+            }
+            Self::Scroll { id, .. } | Self::Button { id, .. } | Self::Input { id, .. } | Self::Select { id, .. } | Self::Dropdown { id, .. } | Self::Check { id, .. } | Self::Collapsible { id, .. } | Self::Chips { id, .. } => {
+                Some(id)
+            }
+            Self::Alert { .. } | Self::Divider | Self::Image { .. } | Self::Unknown => None,
+        }
+    }
+
+    pub fn children(&self) -> &[Node] {
+        match self {
+            Self::Column { children, .. } | Self::Row { children, .. } | Self::Scroll { children, .. } | Self::Message { children, .. } | Self::Collapsible { children, .. } | Self::Card { children, .. } => {
+                children
+            }
+            _ => &[],
+        }
+    }
+
+    pub fn children_mut(&mut self) -> Option<&mut Vec<Node>> {
+        match self {
+            Self::Column { children, .. } | Self::Row { children, .. } | Self::Scroll { children, .. } | Self::Message { children, .. } | Self::Collapsible { children, .. } | Self::Card { children, .. } => {
+                Some(children)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -163,8 +292,25 @@ pub struct DropdownOption {
 pub enum AddonMessage {
     /// Replaces the panel.
     SetView { view: Node },
-    /// Adds text to the `Text` or `Code` node with this id.
+    /// Adds text to the `Text`, `Code` or `Markdown` node with this id.
     Append { id: String, text: String },
+    /// Adds `node` to the children of the node `parent`, at `index` or at the end.
+    Insert {
+        parent: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        index: Option<usize>,
+        node: Node,
+    },
+    /// Replaces the node with this id.
+    Replace { id: String, node: Node },
+    /// Removes the node with this id.
+    Remove { id: String },
+    /// A short note in the editor's status line, such as "Saved figure".
+    Notify {
+        text: String,
+        #[serde(default)]
+        tone: Tone,
+    },
     /// The editor answers with `HostMessage::Reply` and the same `id`.
     Request { id: u64, request: Request },
     /// Replaces what this add-on offers in the citation picker.
@@ -270,7 +416,16 @@ pub enum Reply {
 #[serde(tag = "message", rename_all = "snake_case")]
 pub enum HostMessage {
     /// The first message. Without a project, requests about files fail.
-    Init { api: u32, project: Option<String> },
+    Init {
+        api: u32,
+        project: Option<String>,
+        /// The version of the editor, for messages to the user.
+        #[serde(default)]
+        host_version: String,
+        /// See `FEATURES`.
+        #[serde(default)]
+        features: Vec<String>,
+    },
     Reply { id: u64, result: Result<Reply, String> },
     Click { id: String },
     /// A button with `submits` was clicked.
@@ -300,7 +455,7 @@ mod tests {
             ]}}"#,
         )
         .unwrap();
-        let AddonMessage::SetView { view: Node::Column { children } } = message else {
+        let AddonMessage::SetView { view: Node::Column { children, .. } } = message else {
             panic!("not a column");
         };
         assert_eq!(children[0], Node::Text { id: None, text: "a".to_string(), muted: false });
@@ -330,6 +485,55 @@ mod tests {
         let line = serde_json::to_string(&message).unwrap();
         assert!(!line.contains('\n'));
         assert_eq!(serde_json::from_str::<HostMessage>(&line).unwrap(), message);
+    }
+
+    #[test]
+    fn a_node_from_a_newer_editor_is_skipped() {
+        let view: Node = serde_json::from_str(r#"{"type":"column","children":[{"type":"hologram","depth":3},{"type":"divider"}]}"#).unwrap();
+        assert_eq!(view.children(), [Node::Unknown, Node::Divider]);
+    }
+
+    /// The wire format of version 2, written out, so that a change to it shows
+    /// in review and add-ons in other repositories can rely on it.
+    #[test]
+    fn version_two_reads_as_written() {
+        let cases: &[(&str, AddonMessage)] = &[
+            (
+                r#"{"message":"insert","parent":"chat","node":{"type":"message","id":"m1","role":"assistant","children":[{"type":"markdown","id":"t1","text":"**Hi**"}]}}"#,
+                AddonMessage::Insert {
+                    parent: "chat".into(),
+                    index: None,
+                    node: Node::Message {
+                        id: Some("m1".into()),
+                        role: Role::Assistant,
+                        children: vec![Node::Markdown { id: Some("t1".into()), text: "**Hi**".into() }],
+                    },
+                },
+            ),
+            (r#"{"message":"replace","id":"m1","node":{"type":"divider"}}"#, AddonMessage::Replace { id: "m1".into(), node: Node::Divider }),
+            (r#"{"message":"remove","id":"m1"}"#, AddonMessage::Remove { id: "m1".into() }),
+            (r#"{"message":"notify","text":"Saved","tone":"success"}"#, AddonMessage::Notify { text: "Saved".into(), tone: Tone::Success }),
+            (
+                r#"{"message":"set_view","view":{"type":"card","tone":"warning","children":[{"type":"chips","id":"c","items":[{"id":"x","label":"main.tex","removable":true}]},{"type":"collapsible","id":"k","title":"Read main.tex","children":[]},{"type":"image","path":"/tmp/a.png","max_height":200}]}}"#,
+                AddonMessage::SetView {
+                    view: Node::Card {
+                        id: None,
+                        tone: Tone::Warning,
+                        children: vec![
+                            Node::Chips { id: "c".into(), items: vec![Chip { id: "x".into(), label: "main.tex".into(), removable: true }] },
+                            Node::Collapsible { id: "k".into(), title: "Read main.tex".into(), open: false, children: vec![] },
+                            Node::Image { path: "/tmp/a.png".into(), max_height: Some(200) },
+                        ],
+                    },
+                },
+            ),
+        ];
+        for (json, message) in cases {
+            assert_eq!(&serde_json::from_str::<AddonMessage>(json).unwrap(), message, "{json}");
+            assert_eq!(serde_json::to_string(message).unwrap(), *json);
+        }
+        let init: HostMessage = serde_json::from_str(r#"{"message":"init","api":1,"project":null}"#).unwrap();
+        assert_eq!(init, HostMessage::Init { api: 1, project: None, host_version: String::new(), features: Vec::new() });
     }
 
     #[test]

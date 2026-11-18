@@ -1690,6 +1690,14 @@ impl Workspace {
                     cx.notify();
                 }
                 AddonPanelEvent::LookupFailed(reason) => this.set_status(reason.clone(), cx),
+                AddonPanelEvent::Notify(text) => this.set_status(text.clone(), cx),
+                AddonPanelEvent::InsertText(text) => {
+                    if this.active_view().is_some() {
+                        this.with_active(cx, |view, cx| view.insert_text(text, cx));
+                    } else {
+                        this.set_status("Open a document to insert into.", cx);
+                    }
+                }
             }
         });
         panel.update(cx, |panel, cx| panel.activate(cx));

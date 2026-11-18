@@ -14,6 +14,7 @@ mod github;
 mod home_view;
 mod image_view;
 mod keymap;
+mod markdown;
 mod marketplace;
 mod material_icons;
 mod nvim_themes;
