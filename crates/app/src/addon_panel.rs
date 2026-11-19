@@ -144,6 +144,14 @@ impl AddonPanel {
         }
     }
 
+    /// Runs a command of the manifest: starts the program if needed and tells it.
+    pub fn run_command(&mut self, id: &str, context: Option<addon_api::ActiveFile>, cx: &mut Context<Self>) {
+        if self.process.is_none() {
+            self.start(cx);
+        }
+        self.send(HostMessage::Command { id: id.to_string(), context });
+    }
+
     /// Whether the add-on runs and asked for these events.
     pub fn wants(&self, kind: EventKind) -> bool {
         self.process.is_some() && self.subscriptions.contains(&kind)

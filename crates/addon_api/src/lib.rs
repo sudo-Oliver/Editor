@@ -14,7 +14,7 @@ pub const OLDEST_API_VERSION: u32 = 1;
 /// What this editor can do beyond `API_VERSION`, sent with `HostMessage::Init`.
 /// Add-ons check these rather than the version, so that they work on an
 /// editor that lacks one by doing without it.
-pub const FEATURES: &[&str] = &["markdown", "tree_edits", "notify", "events", "pdf", "bib", "insert", "files", "review", "outline", "status"];
+pub const FEATURES: &[&str] = &["markdown", "tree_edits", "notify", "events", "pdf", "bib", "insert", "files", "review", "outline", "status", "commands"];
 
 /// What an add-on may ask the editor for. Add-ons are not sandboxed, so this
 /// limits the requests below and not the program itself.
@@ -73,6 +73,32 @@ pub struct Manifest {
     pub icon: Option<String>,
     #[serde(default)]
     pub permissions: Vec<Permission>,
+    /// Actions the user can run with keys or from menus. They exist only while
+    /// the add-on is turned on, and running one starts it if needed.
+    #[serde(default)]
+    pub commands: Vec<AddonCommand>,
+}
+
+/// `[[commands]]` in `addon.toml`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AddonCommand {
+    /// Unique within the add-on, a-z, 0-9, - and _.
+    pub id: String,
+    pub label: String,
+    /// Default keys, written like `secondary-shift-k`. The user can change them
+    /// in keymap.json under `addon.<add-on id>.<command id>`.
+    #[serde(default)]
+    pub keys: Vec<String>,
+    /// Where else it shows: `editor` is the right-click menu of the editor.
+    #[serde(default)]
+    pub menus: Vec<CommandMenu>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandMenu {
+    Editor,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -615,6 +641,8 @@ pub enum HostMessage {
     LookupDoi { suggestion: String },
     /// The user closed the dialog.
     DialogClosed,
+    /// The user ran a command of the add-on, with where the cursor was.
+    Command { id: String, context: Option<ActiveFile> },
     /// Another document became active, or none.
     ActiveFileChanged { path: Option<String> },
     /// Where the cursor rests. Lines and columns start at 1.
@@ -655,6 +683,15 @@ mod tests {
             toml::from_str("id = \"a\"\nname = \"A\"\nversion = \"1\"\nauthor = \"B\"\napi = 1\nprogram = \"a\"\n").unwrap();
         assert_eq!(manifest.activation, Activation::Panel);
         assert_eq!(manifest.description, "");
+    }
+
+    #[test]
+    fn commands_come_from_the_manifest() {
+        let manifest: Manifest = toml::from_str(
+            "id = \"a\"\nname = \"A\"\nversion = \"1\"\nauthor = \"B\"\napi = 2\nprogram = \"a\"\n[[commands]]\nid = \"ask\"\nlabel = \"Ask about the selection\"\nkeys = [\"secondary-shift-k\"]\nmenus = [\"editor\"]\n",
+        )
+        .unwrap();
+        assert_eq!(manifest.commands, [AddonCommand { id: "ask".into(), label: "Ask about the selection".into(), keys: vec!["secondary-shift-k".into()], menus: vec![CommandMenu::Editor] }]);
     }
 
     #[test]

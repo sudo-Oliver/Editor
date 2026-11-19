@@ -86,6 +86,10 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
     if !(OLDEST_API_VERSION..=API_VERSION).contains(&manifest.api) {
         return Err(format!("{} needs add-on API {}, and this editor has {OLDEST_API_VERSION} to {API_VERSION}.", manifest.name, manifest.api));
     }
+    let valid_id = |id: &str| !id.is_empty() && id.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '_');
+    if let Some(command) = manifest.commands.iter().find(|command| !valid_id(&command.id)) {
+        return Err(format!("{}: \"{}\" is not a valid command id. Use a-z, 0-9, - and _.", manifest.name, command.id));
+    }
     if !stays_inside(Path::new(&manifest.program)) || manifest.icon.as_deref().is_some_and(|icon| !stays_inside(Path::new(icon))) {
         return Err(format!("{}: files must stay inside the add-on folder.", manifest.name));
     }

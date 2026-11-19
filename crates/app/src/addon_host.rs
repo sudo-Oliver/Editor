@@ -9,14 +9,20 @@ use std::{
     time::Duration,
 };
 
-use addon_api::{BibInfo, EventKind, FileOutline, HostMessage, OutlineEntry, ProjectInfo, Reply};
+use addon_api::{BibInfo, CommandMenu, EventKind, FileOutline, HostMessage, OutlineEntry, ProjectInfo, Reply};
 use editor_core::{HeadingKind, Language, SymbolKind};
 use build::Severity;
-use gpui::{AppContext, Context, Entity};
+use gpui::{AppContext, Context, Entity, Pixels, Point, Window};
 use pdf::{PdfEvent, PdfWorker};
 
-use super::Workspace;
-use crate::{addon_panel::AddonPanel, addons, bib, editor_view::EditorView, file_tree, outline, toolchain};
+use super::{LeftPanel, Menu, MenuEntry, Workspace, entry, menu_separator};
+use crate::{
+    actions::{AddonBinding, Copy, Cut, Paste, RunAddonCommand},
+    addon_panel::AddonPanel,
+    addons, bib,
+    editor_view::EditorView,
+    file_tree, outline, toolchain,
+};
 
 /// The cursor has to rest this long before add-ons hear where it is.
 const CONTEXT_DELAY: Duration = Duration::from_millis(250);
@@ -34,6 +40,70 @@ pub(crate) struct AddonContext {
 }
 
 impl Workspace {
+    /// The keys of the commands of the add-ons that are on.
+    pub(super) fn addon_bindings(&self, cx: &gpui::App) -> Vec<AddonBinding> {
+        self.addon_panels
+            .iter()
+            .flat_map(|entry| {
+                let manifest = &entry.panel.read(cx).add_on.manifest;
+                manifest.commands.iter().map(|command| AddonBinding { addon: manifest.id.clone(), command: command.id.clone(), keys: command.keys.clone() })
+            })
+            .collect()
+    }
+
+    /// Shows the add-on's panel and tells it to run the command, starting it
+    /// first when it does not run.
+    pub(super) fn run_addon_command(&mut self, action: &RunAddonCommand, cx: &mut Context<Self>) {
+        let Some(index) = self.addon_panels.iter().position(|entry| entry.panel.read(cx).add_on.manifest.id == action.addon) else {
+            return;
+        };
+        let context = self.active_file_info(cx);
+        self.left_panel = LeftPanel::Addon(index);
+        self.show_file_panel = true;
+        let panel = self.addon_panels[index].panel.clone();
+        panel.update(cx, |panel, cx| panel.run_command(&action.command, context, cx));
+        cx.notify();
+    }
+
+    /// The right-click menu of the editor.
+    pub(super) fn open_editor_menu(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_menu = Some(Menu::EditorContext);
+        self.menu_origin = position;
+        window.focus(&self.menu_focus, cx);
+        cx.notify();
+    }
+
+    pub(super) fn editor_menu_entries(&self, cx: &gpui::App) -> Vec<MenuEntry> {
+        let clipboard = |action: fn() -> Box<dyn gpui::Action>| {
+            move |this: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>| {
+                this.focus_active(window, cx);
+                window.dispatch_action(action(), cx);
+            }
+        };
+        let mut entries = vec![
+            entry("Cut", self.shortcut("cut"), clipboard(|| Box::new(Cut))),
+            entry("Copy", self.shortcut("copy"), clipboard(|| Box::new(Copy))),
+            entry("Paste", self.shortcut("paste"), clipboard(|| Box::new(Paste))),
+        ];
+        let commands: Vec<MenuEntry> = self
+            .addon_panels
+            .iter()
+            .flat_map(|panel| {
+                let manifest = &panel.panel.read(cx).add_on.manifest;
+                manifest.commands.iter().filter(|command| command.menus.contains(&CommandMenu::Editor)).map(|command| {
+                    let action = RunAddonCommand { addon: manifest.id.clone(), command: command.id.clone() };
+                    let keys = command.keys.first().map(|keys| crate::keymap::display(keys, crate::keymap::host_os())).unwrap_or_default();
+                    entry(&command.label, keys, move |this, _, cx| this.run_addon_command(&action, cx))
+                })
+            })
+            .collect();
+        if !commands.is_empty() {
+            entries.push(menu_separator());
+            entries.extend(commands);
+        }
+        entries
+    }
+
     fn panels_wanting(&self, kind: EventKind, cx: &gpui::App) -> Vec<Entity<AddonPanel>> {
         self.addon_panels.iter().filter(|entry| entry.panel.read(cx).wants(kind)).map(|entry| entry.panel.clone()).collect()
     }
