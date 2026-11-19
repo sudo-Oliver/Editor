@@ -8,7 +8,7 @@ use std::{
 };
 
 use addon_api::{
-    API_VERSION, Activation, AddonMessage, CitationEntry, DropdownOption, EventKind, FEATURES, HostMessage, Node, Permission, Reply, Request, Role,
+    API_VERSION, Activation, AddonMessage, CitationEntry, DropdownOption, EventKind, StatusItem, FEATURES, HostMessage, Node, Permission, Reply, Request, Role,
     Tone,
 };
 use gpui::{
@@ -89,6 +89,8 @@ pub struct AddonPanel {
     scroll_pending: bool,
     /// The events the add-on asked for.
     subscriptions: HashSet<EventKind>,
+    /// The line at the top of the panel.
+    status: Vec<StatusItem>,
 }
 
 impl EventEmitter<AddonPanelEvent> for AddonPanel {}
@@ -116,6 +118,7 @@ impl AddonPanel {
             toggled: HashMap::new(),
             scroll_pending: false,
             subscriptions: HashSet::new(),
+            status: Vec::new(),
         }
     }
 
@@ -270,6 +273,7 @@ impl AddonPanel {
         self.task = None;
         self.process = None;
         self.subscriptions.clear();
+        self.status.clear();
     }
 
 
@@ -362,6 +366,13 @@ impl AddonPanel {
                 }
             }
             ProcessEvent::Message(AddonMessage::Notify { text, .. }) => cx.emit(AddonPanelEvent::Notify(text)),
+            ProcessEvent::Message(AddonMessage::SetStatus { mut items }) => {
+                if self.speaks_two() {
+                    // A line, not a page: a few short items.
+                    items.truncate(8);
+                    self.status = items;
+                }
+            }
             ProcessEvent::Message(AddonMessage::Subscribe { events }) => {
                 if self.speaks_two() {
                     self.subscriptions = events.into_iter().collect();
@@ -398,6 +409,7 @@ impl AddonPanel {
                 }
                 self.process = None;
                 self.subscriptions.clear();
+                self.status.clear();
                 cx.emit(AddonPanelEvent::Stopped);
                 self.citations.clear();
                 self.dialog = None;
@@ -514,6 +526,11 @@ impl AddonPanel {
     }
 
     fn render_dropdown(&self, id: &str, options: &[DropdownOption], selected: usize, cx: &mut Context<Self>) -> AnyElement {
+        self.render_dropdown_toward(id, options, selected, true, cx)
+    }
+
+    /// `upward` for a dropdown low in the panel, downward for one at its top.
+    fn render_dropdown_toward(&self, id: &str, options: &[DropdownOption], selected: usize, upward: bool, cx: &mut Context<Self>) -> AnyElement {
         let dropdown = id.to_string();
         let open = self.open_dropdown.as_ref().filter(|open| open.id == id);
         let label = options.get(selected).map_or_else(String::new, |option| option.label.clone());
@@ -544,13 +561,13 @@ impl AddonPanel {
                     .flex_none()
                     .text_color(theme::color(theme::palette().ui_muted)),
             )
-            .children(open.map(|open| self.render_dropdown_list(open, options, selected, cx)))
+            .children(open.map(|open| self.render_dropdown_list(open, options, selected, upward, cx)))
             .into_any_element()
     }
 
     /// The list opens upward from the button, since dropdowns sit low in a panel.
     /// The backdrop takes a click elsewhere, so that it only closes the list.
-    fn render_dropdown_list(&self, open: &OpenDropdown, options: &[DropdownOption], selected: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn render_dropdown_list(&self, open: &OpenDropdown, options: &[DropdownOption], selected: usize, upward: bool, cx: &mut Context<Self>) -> AnyElement {
         let count = options.len().max(1);
         let backdrop = anchored().position(point(px(0.), px(0.))).child(
             div()
@@ -561,14 +578,15 @@ impl AddonPanel {
                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.close_dropdown(window, cx)))
                 .on_mouse_down(MouseButton::Right, cx.listener(|this, _, window, cx| this.close_dropdown(window, cx))),
         );
-        let list = anchored().anchor(Anchor::BottomLeft).snap_to_window_with_margin(px(8.)).child(
+        let list = anchored().anchor(if upward { Anchor::BottomLeft } else { Anchor::TopLeft }).snap_to_window_with_margin(px(8.)).child(
             div()
                 .id("dropdown-list")
                 .track_focus(&open.focus)
                 .flex()
                 .flex_col()
                 .w(px(DROPDOWN_WIDTH))
-                .mb(px(4.))
+                .when(upward, |style| style.mb(px(4.)))
+                .when(!upward, |style| style.mt(px(22.)))
                 .p(px(4.))
                 .gap(px(2.))
                 .rounded(px(8.))
@@ -932,6 +950,44 @@ impl AddonPanel {
         }
     }
 
+    /// Facts in one line, with the choices among them as small dropdowns.
+    fn render_status(&self, cx: &mut Context<Self>) -> AnyElement {
+        let palette = theme::palette();
+        div()
+            .flex()
+            .flex_none()
+            .flex_wrap()
+            .items_center()
+            .gap(px(2.))
+            .pb(px(4.))
+            .text_size(px(12.))
+            .border_b_1()
+            .border_color(theme::color(palette.divider))
+            .children(self.status.iter().map(|item| {
+                let color = match item.tone {
+                    Tone::Info | Tone::Success => palette.ui_muted,
+                    Tone::Warning => palette.warning,
+                    Tone::Danger => palette.error,
+                };
+                if item.options.is_empty() {
+                    let id = item.id.clone();
+                    div()
+                        .id(SharedString::from(format!("status-{}", item.id)))
+                        .px(px(6.))
+                        .py(px(2.))
+                        .rounded(px(4.))
+                        .text_color(theme::color(color))
+                        .hover(|style| style.bg(theme::color(palette.panel)))
+                        .on_click(cx.listener(move |this, _, _, _| this.send(HostMessage::Click { id: id.clone() })))
+                        .child(item.text.clone())
+                        .into_any_element()
+                } else {
+                    self.render_dropdown_toward(&item.id, &item.options, item.selected, false, cx)
+                }
+            }))
+            .into_any_element()
+    }
+
     fn render_blocks(&self, blocks: &[Block], cx: &mut Context<Self>) -> AnyElement {
         div()
             .flex()
@@ -1180,7 +1236,7 @@ impl Render for AddonPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.viewport = window.viewport_size();
         // The add-on can take the dropdown away while its list shows.
-        if self.open_dropdown.as_ref().is_some_and(|open| !contains_dropdown(&self.view, &open.id)) {
+        if self.open_dropdown.as_ref().is_some_and(|open| !contains_dropdown(&self.view, &open.id) && !self.status.iter().any(|item| item.id == open.id && !item.options.is_empty())) {
             self.close_dropdown(window, cx);
         }
         // Taken out and put back, so that drawing never copies the whole view.
@@ -1211,6 +1267,7 @@ impl Render for AddonPanel {
                         this.send(HostMessage::FilesDropped { paths });
                     }))
             })
+            .when(!self.status.is_empty(), |element| element.child(self.render_status(cx)))
             .children(failure.map(banner))
             .children(invalid.map(banner))
             .when(restart, |element| {
