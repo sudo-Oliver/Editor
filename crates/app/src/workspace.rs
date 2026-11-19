@@ -3975,7 +3975,7 @@ impl Workspace {
                         .filter(|entry| !entry.is_dir)
                         .map(|entry| entry.path)
                         .filter(|path| match kind {
-                            PickerKind::Files | PickerKind::Text | PickerKind::Branches | PickerKind::Themes | PickerKind::Fonts(_) => true,
+                            PickerKind::Files | PickerKind::Text | PickerKind::Branches | PickerKind::Themes | PickerKind::Fonts(_) | PickerKind::Commands => true,
                             PickerKind::Figures => language.is_some_and(|language| snippets::is_figure_file(language, path)),
                             PickerKind::Citations => path.extension().is_some_and(|extension| extension == "bib"),
                         })
@@ -4001,6 +4001,66 @@ impl Workspace {
             .ok();
         }));
         cx.notify();
+    }
+
+    /// Every command by name, with its keys. An item's path holds the
+    /// command's id, since commands have no file.
+    fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let os = keymap::host_os();
+        let mut entries: Vec<picker::PickerItem> = COMMANDS
+            .iter()
+            .filter(|command| command.runs_anywhere())
+            .map(|command| picker::PickerItem {
+                path: PathBuf::from(command.id),
+                label: format!("{}: {}", command.group, command.label),
+                position: None,
+                summary: None,
+                detail: Some(self.keymap.keys(command).first().map(|keys| keymap::display(keys, os)).unwrap_or_default()).filter(|keys| !keys.is_empty()),
+            })
+            .collect();
+        for entry in &self.addon_panels {
+            let manifest = &entry.panel.read(cx).add_on.manifest;
+            for command in &manifest.commands {
+                let id = format!("{}{}.{}", keymap::ADDON_PREFIX, manifest.id, command.id);
+                let keys = self.keymap.addon_keys(&id, &command.keys);
+                entries.push(picker::PickerItem {
+                    path: PathBuf::from(id),
+                    label: format!("{}: {}", manifest.name, command.label),
+                    position: None,
+                    summary: None,
+                    detail: keys.first().map(|keys| keymap::display(keys, os)),
+                });
+            }
+        }
+        self.picker = Some(Picker {
+            kind: PickerKind::Commands,
+            query: String::new(),
+            items: Vec::new(),
+            selected: 0,
+            root: PathBuf::new(),
+            files: Arc::new(Vec::new()),
+            entries: Arc::new(entries),
+            cancel: Arc::new(AtomicBool::new(false)),
+            task: None,
+            themes: Arc::default(),
+            original: None,
+        });
+        window.focus(&self.picker_focus, cx);
+        self.refresh_picker(cx);
+    }
+
+    fn run_palette_command(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((addon, command)) = id.strip_prefix(keymap::ADDON_PREFIX).and_then(|rest| rest.split_once('.')) {
+            return self.run_addon_command(&RunAddonCommand { addon: addon.to_string(), command: command.to_string() }, cx);
+        }
+        let Some(command) = COMMANDS.iter().find(|command| command.id == id) else {
+            return;
+        };
+        // Commands of the editor act on the document.
+        if command.context.is_some() {
+            self.focus_active(window, cx);
+        }
+        window.dispatch_action(command.action(), cx);
     }
 
     /// Lists the cached themes at once and asks Neovim for the current ones.
@@ -4144,7 +4204,7 @@ impl Workspace {
                 picker.items = picker::match_files(&picker.files, &picker.root, &picker.query);
                 picker.selected = 0;
             }
-            PickerKind::Citations => {
+            PickerKind::Citations | PickerKind::Commands => {
                 picker.items = picker::match_in_order(&picker.entries, &picker.query);
                 picker.selected = 0;
             }
@@ -4233,6 +4293,7 @@ impl Workspace {
         self.close_picker(window, cx);
         match kind {
             PickerKind::Files | PickerKind::Text => {}
+            PickerKind::Commands => return self.run_palette_command(&item.path.to_string_lossy(), window, cx),
             PickerKind::Themes => {
                 let name = (item.label != theme::DEFAULT_THEME).then_some(item.label);
                 // A theme is a choice against paper, which would cover it.
@@ -7849,6 +7910,7 @@ impl Workspace {
             PickerKind::Themes => "Select theme",
             PickerKind::Fonts(FontSlot::Editor) => "Editor font",
             PickerKind::Fonts(FontSlot::Interface) => "Interface font",
+            PickerKind::Commands => "Run a command",
         };
         let empty = match (picker.kind, picker.query.is_empty()) {
             (PickerKind::Text, true) => "Type to search the project.",
@@ -8229,6 +8291,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &LayoutPdfTab, window, cx| this.set_layout(PaneLayout::PdfTab, window, cx)))
             .on_action(cx.listener(|this, _: &ToggleFocusMode, window, cx| this.toggle_focus_mode(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleHub, window, cx| this.toggle_hub(window, cx)))
+            .on_action(cx.listener(|this, _: &CommandPalette, window, cx| this.open_command_palette(window, cx)))
             .on_action(cx.listener(|this, _: &OpenGitPanel, window, cx| this.open_git_panel(window, cx)))
             .on_action(cx.listener(|this, _: &StartPresentation, window, cx| this.start_presentation(window, cx)))
             .on_action(cx.listener(|this, _: &ExitPresentation, window, cx| this.exit_presentation(window, cx)))
