@@ -1,6 +1,21 @@
 use gpui::{Action, App, KeyBinding, KeyBindingContextPredicate, actions};
 
-use crate::keymap::Keymap;
+use crate::keymap::{ADDON_PREFIX, Keymap};
+
+/// Runs a command that an add-on declared in its manifest.
+#[derive(Clone, Debug, PartialEq, Eq, Action)]
+#[action(namespace = editor, no_json)]
+pub struct RunAddonCommand {
+    pub addon: String,
+    pub command: String,
+}
+
+/// An add-on command with its default keys, for binding.
+pub struct AddonBinding {
+    pub addon: String,
+    pub command: String,
+    pub keys: Vec<String>,
+}
 
 actions!(
     editor,
@@ -219,7 +234,7 @@ pub const COMMANDS: &[Command] = &[
 
 /// Binds every command to its keys from `keymap`, in place of what was bound
 /// before. Returns the keys that gpui could not read.
-pub fn bind_keys(keymap: &Keymap, cx: &mut App) -> Vec<String> {
+pub fn bind_keys(keymap: &Keymap, addon_commands: &[AddonBinding], cx: &mut App) -> Vec<String> {
     let mut problems = Vec::new();
     let mut bindings = Vec::new();
     for command in COMMANDS {
@@ -229,6 +244,18 @@ pub fn bind_keys(keymap: &Keymap, cx: &mut App) -> Vec<String> {
             match KeyBinding::load(&keys, command.action(), predicate.clone(), false, None, cx) {
                 Ok(binding) => bindings.push(binding),
                 Err(_) => problems.push(format!("{}: cannot read the keys \"{keys}\"", command.id)),
+            }
+        }
+    }
+    // After the editor's own, so that an add-on's keys win where they overlap,
+    // as the user chose to turn it on.
+    for command in addon_commands {
+        let id = format!("{ADDON_PREFIX}{}.{}", command.addon, command.command);
+        for keys in keymap.addon_keys(&id, &command.keys) {
+            let action = RunAddonCommand { addon: command.addon.clone(), command: command.command.clone() };
+            match KeyBinding::load(&keys, Box::new(action), None, false, None, cx) {
+                Ok(binding) => bindings.push(binding),
+                Err(_) => problems.push(format!("{id}: cannot read the keys \"{keys}\"")),
             }
         }
     }

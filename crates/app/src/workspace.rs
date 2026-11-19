@@ -157,6 +157,8 @@ enum Menu {
     Code,
     /// The right-click menu of a row in the file tree.
     Tree,
+    /// The right-click menu of the editor.
+    EditorContext,
 }
 
 /// How the editor and the PDF share the window.
@@ -1585,7 +1587,7 @@ impl Workspace {
     /// Binds the shortcuts of `keymap.json`, or the defaults without it.
     fn reload_keymap(&mut self, cx: &mut Context<Self>) {
         let (keymap, mut problems) = keymap::default_path().map(|path| Keymap::load(&path)).unwrap_or_default();
-        problems.extend(crate::actions::bind_keys(&keymap, cx));
+        problems.extend(crate::actions::bind_keys(&keymap, &self.addon_bindings(cx), cx));
         self.keymap = keymap;
         if let Some(problem) = problems.first() {
             self.set_status(format!("keymap.json: {problem}"), cx);
@@ -1595,7 +1597,7 @@ impl Workspace {
 
     /// Saves and binds the shortcuts changed on the shortcuts page.
     fn apply_keymap(&mut self, keymap: Keymap, cx: &mut Context<Self>) {
-        let problems = crate::actions::bind_keys(&keymap, cx);
+        let problems = crate::actions::bind_keys(&keymap, &self.addon_bindings(cx), cx);
         self.keymap = keymap;
         if let Some(path) = keymap::default_path()
             && let Err(error) = self.keymap.save(&path)
@@ -1700,6 +1702,11 @@ impl Workspace {
             self.left_panel = index.map_or(LeftPanel::Files, LeftPanel::Addon);
         }
         self.installed_addons = installed;
+        // The keys of add-ons that were turned on come, and of others go.
+        let problems = crate::actions::bind_keys(&self.keymap, &self.addon_bindings(cx), cx);
+        if let Some(problem) = problems.first() {
+            self.set_status(format!("keymap.json: {problem}"), cx);
+        }
         cx.notify();
     }
 
@@ -4653,15 +4660,15 @@ impl Workspace {
         cx.notify();
     }
 
-    fn menu_entries(&self, menu: Menu) -> Vec<MenuEntry> {
+    fn menu_entries(&self, menu: Menu, cx: &App) -> Vec<MenuEntry> {
         #[allow(unused_mut)]
-        let mut entries = self.base_menu_entries(menu);
+        let mut entries = self.base_menu_entries(menu, cx);
         #[cfg(feature = "collab")]
         self.add_collab_entries(menu, &mut entries);
         entries
     }
 
-    fn base_menu_entries(&self, menu: Menu) -> Vec<MenuEntry> {
+    fn base_menu_entries(&self, menu: Menu, cx: &App) -> Vec<MenuEntry> {
         let check = |on: bool, label: &str| format!("{} {label}", if on { "✓" } else { "  " });
         match menu {
             Menu::File => vec![
@@ -4741,6 +4748,7 @@ impl Workspace {
                 }),
             ],
             Menu::Tree => self.tree_menu_entries(),
+            Menu::EditorContext => self.editor_menu_entries(cx),
             Menu::Symbols | Menu::Table | Menu::Code => Vec::new(),
             Menu::Help => vec![
                 entry("Editor tour", "", |this, window, cx| this.start_tour(window, cx)),
@@ -4859,9 +4867,9 @@ impl Workspace {
     /// The tree's menu is a sheet of the side panel: a raised tone without a
     /// frame, and a pill under the row in reach.
     fn render_menu(&self, menu: Menu, cx: &mut Context<Self>) -> impl IntoElement {
-        let items = self.menu_entries(menu);
+        let items = self.menu_entries(menu, cx);
         let palette = theme::palette();
-        let paper = menu == Menu::Tree;
+        let paper = matches!(menu, Menu::Tree | Menu::EditorContext);
         deferred(
             anchored()
                 .anchor(Anchor::TopLeft)
@@ -6146,6 +6154,7 @@ impl Workspace {
 
     fn render_editor_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let active = self.active_view();
+        let has_document = active.is_some();
         let pdf_tab = self.pdf_tab_shown && !self.focus_mode;
         let toolbar = if self.focus_mode {
             None
@@ -6184,7 +6193,18 @@ impl Workspace {
             .when(self.show_tab_bar(), |element| element.child(self.render_tabs(cx)))
             .when(self.show_breadcrumbs(), |element| element.child(self.render_breadcrumbs(cx)))
             .children(toolbar)
-            .child(div().relative().flex_1().min_h_0().child(body).children(self.tour_anchor(TourAnchor::Editor)))
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .when(has_document && !pdf_tab, |element| {
+                        element.on_mouse_down(MouseButton::Right, cx.listener(|this, event: &MouseDownEvent, window, cx| this.open_editor_menu(event.position, window, cx)))
+                    })
+                    .child(body)
+                    .children(self.tour_anchor(TourAnchor::Editor))
+                    .when(self.open_menu == Some(Menu::EditorContext), |element| element.child(self.render_menu(Menu::EditorContext, cx))),
+            )
             .children(self.render_conflict_strip(cx))
             .when_some(self.cursor_hint(cx).cloned(), |element, hint| element.child(self.render_hint_strip(&hint, cx)))
             .when(self.error_count() > 0, |element| element.child(self.render_error_strip(cx)))
@@ -8172,6 +8192,7 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &LookupDoi, _, cx| this.lookup_doi(cx)))
             .on_action(cx.listener(|this, _: &QuickFix, _, cx| this.quick_fix(cx)))
+            .on_action(cx.listener(|this, action: &RunAddonCommand, _, cx| this.run_addon_command(action, cx)))
             .on_action(cx.listener(|this, _: &InsertCitation, window, cx| {
                 if matches!(this.active_language(cx), Some(Language::Latex | Language::Typst)) && this.dialog_panel(cx).is_none() {
                     this.open_picker(PickerKind::Citations, window, cx);
