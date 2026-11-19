@@ -14,7 +14,7 @@ pub const OLDEST_API_VERSION: u32 = 1;
 /// What this editor can do beyond `API_VERSION`, sent with `HostMessage::Init`.
 /// Add-ons check these rather than the version, so that they work on an
 /// editor that lacks one by doing without it.
-pub const FEATURES: &[&str] = &["markdown", "tree_edits", "notify", "events", "pdf", "bib", "insert", "files", "review", "outline"];
+pub const FEATURES: &[&str] = &["markdown", "tree_edits", "notify", "events", "pdf", "bib", "insert", "files", "review", "outline", "status"];
 
 /// What an add-on may ask the editor for. Add-ons are not sandboxed, so this
 /// limits the requests below and not the program itself.
@@ -311,6 +311,11 @@ pub enum AddonMessage {
         #[serde(default)]
         tone: Tone,
     },
+    /// Small facts in a line at the top of the panel, such as the model and
+    /// how much of a limit is used, replacing the ones before. An item with
+    /// options opens them, and choosing one sends `HostMessage::Select`; a
+    /// plain item sends `HostMessage::Click`.
+    SetStatus { items: Vec<StatusItem> },
     /// Which events the add-on wants, replacing an earlier choice. The editor
     /// does the work for an event only while someone wants it.
     Subscribe { events: Vec<EventKind> },
@@ -322,6 +327,21 @@ pub enum AddonMessage {
     /// enabled primary button and `Esc` closes it, which `HostMessage::DialogClosed`
     /// reports. Needs `Permission::LookupDoi`.
     SetDialog { view: Option<Node> },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct StatusItem {
+    pub id: String,
+    pub text: String,
+    /// Shown on hover, for what does not fit.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tooltip: String,
+    #[serde(default)]
+    pub tone: Tone,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<DropdownOption>,
+    #[serde(default)]
+    pub selected: usize,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Hash, Serialize)]
