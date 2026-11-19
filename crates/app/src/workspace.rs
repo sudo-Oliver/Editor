@@ -1899,6 +1899,7 @@ impl Workspace {
             Request::PdfText { page } => return self.answer_from_pdf(panel, id, page, None, cx),
             Request::PdfPage { page, width } => return self.answer_from_pdf(panel, id, page, Some(addon_host::pdf_page_width(width)), cx),
             Request::BibEntries => return self.answer_bib_entries(panel, id, cx),
+            Request::Outline => return self.answer_outline(panel, id, cx),
             Request::InsertText { text } => self.addon_insert_text(&text, cx),
             Request::InsertAt { path, line, column, text } => self.addon_insert_at(&path, line, column, &text, cx),
             Request::CopyIntoProject { source, dest } => return self.answer_copy_into_project(panel, id, source, dest, cx),

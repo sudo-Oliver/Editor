@@ -9,13 +9,14 @@ use std::{
     time::Duration,
 };
 
-use addon_api::{BibInfo, EventKind, HostMessage, ProjectInfo, Reply};
+use addon_api::{BibInfo, EventKind, FileOutline, HostMessage, OutlineEntry, ProjectInfo, Reply};
+use editor_core::{HeadingKind, Language, SymbolKind};
 use build::Severity;
 use gpui::{AppContext, Context, Entity};
 use pdf::{PdfEvent, PdfWorker};
 
 use super::Workspace;
-use crate::{addon_panel::AddonPanel, addons, bib, editor_view::EditorView, file_tree, toolchain};
+use crate::{addon_panel::AddonPanel, addons, bib, editor_view::EditorView, file_tree, outline, toolchain};
 
 /// The cursor has to rest this long before add-ons hear where it is.
 const CONTEXT_DELAY: Duration = Duration::from_millis(250);
@@ -217,6 +218,34 @@ impl Workspace {
         .detach();
     }
 
+    /// The map of the project. Open documents count with their unsaved text;
+    /// the rest is read in the background.
+    pub(super) fn answer_outline(&self, panel: Entity<AddonPanel>, id: u64, cx: &mut Context<Self>) {
+        let root = self.root.clone();
+        let open: Vec<(PathBuf, String)> =
+            self.documents.iter().filter_map(|document| Some((document.view.read(cx).path.clone()?, document.view.read(cx).state.buffer().to_string()))).collect();
+        let active = self.active_view().and_then(|view| view.read(cx).path.clone());
+        let main = root.as_deref().and_then(|root| build::find_main(root, &self.config, active.as_deref()));
+        self.answer_in_background(panel, id, cx, move || {
+            let root = root.ok_or("No project is open.")?;
+            let mut files: Vec<FileOutline> = file_tree::scan(&root, &HashSet::new())
+                .into_iter()
+                .filter(|entry| !entry.is_dir && is_source(&entry.path))
+                .filter_map(|entry| {
+                    let text = match open.iter().find(|(path, _)| *path == entry.path) {
+                        Some((_, text)) => text.clone(),
+                        None => addons::read_file_limited(&entry.path).ok()?,
+                    };
+                    let relative = entry.path.strip_prefix(&root).unwrap_or(&entry.path).to_string_lossy().into_owned();
+                    Some(file_outline(&entry.path, relative, &text, &root))
+                })
+                .collect();
+            let main = main.as_deref().map(|main| main.strip_prefix(&root).unwrap_or(main).to_string_lossy().into_owned());
+            files.sort_by_key(|file| (Some(&file.path) != main.as_ref(), file.path.clone()));
+            Ok(Reply::Outline { main, files })
+        });
+    }
+
     pub(super) fn answer_bib_entries(&self, panel: Entity<AddonPanel>, id: u64, cx: &mut Context<Self>) {
         let root = self.root.clone();
         self.answer_in_background(panel, id, cx, move || {
@@ -296,6 +325,37 @@ impl Workspace {
     }
 }
 
+fn is_source(path: &Path) -> bool {
+    path.extension().and_then(|extension| extension.to_str()).is_some_and(|extension| matches!(extension, "tex" | "latex" | "typ" | "md" | "markdown"))
+}
+
+fn file_outline(path: &Path, relative: String, text: &str, root: &Path) -> FileOutline {
+    let language = Language::from_path(path);
+    let (headings, symbols) = editor_core::outline_of(language, text);
+    let entries = outline::outline(&headings, language)
+        .into_iter()
+        .map(|item| OutlineEntry {
+            kind: match item.kind {
+                HeadingKind::Section => "section",
+                HeadingKind::Figure => "figure",
+                HeadingKind::Table => "table",
+                HeadingKind::References => "references",
+            }
+            .to_string(),
+            level: if item.kind == HeadingKind::Section { item.level } else { 0 },
+            title: item.title,
+            line: item.line + 1,
+        })
+        .collect();
+    let labels = symbols.into_iter().filter(|symbol| symbol.kind == SymbolKind::Label).map(|symbol| symbol.name).collect();
+    // Prose words, as the word count of the editor counts them, where it can.
+    let words = match language {
+        Language::Latex => editor_core::word_count::count_words(path, text, root, &mut |_| None).total(),
+        _ => text.split_whitespace().count(),
+    };
+    FileOutline { path: relative, words, lines: text.lines().count(), entries, labels }
+}
+
 pub(super) fn pdf_page_width(width: Option<u32>) -> u32 {
     width.unwrap_or(PDF_PAGE_WIDTH).clamp(100, PDF_PAGE_WIDTH_MAX)
 }
@@ -336,6 +396,43 @@ mod tests {
         assert_eq!(free_name(&path), directory.path().join("figure-2.png"));
         std::fs::write(directory.path().join("figure-2.png"), "").unwrap();
         assert_eq!(free_name(&path), directory.path().join("figure-3.png"));
+    }
+
+    #[test]
+    fn the_outline_of_a_chapter() {
+        let text = "\\chapter{Intro}\\label{ch:intro}\nSome words here.\n\\section{Why \\emph{this}}\nMore words.\n\\begin{figure}\\caption{A plot}\\label{fig:plot}\\end{figure}\n";
+        let outline = file_outline(Path::new("/p/intro.tex"), "intro.tex".to_string(), text, Path::new("/p"));
+        let titles: Vec<_> = outline.entries.iter().map(|entry| (entry.kind.as_str(), entry.title.as_str(), entry.line)).collect();
+        assert_eq!(titles, [("section", "Intro", 1), ("section", "Why this", 3), ("figure", "A plot", 5)]);
+        assert_eq!(outline.labels, ["ch:intro", "fig:plot"]);
+        assert!(outline.words >= 5, "{}", outline.words);
+    }
+
+    /// A book of about 500 pages: how long the map takes and how big it is.
+    /// cargo test -p app outline_of_a_book -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn outline_of_a_book() {
+        let paragraph = "This sentence stands for the prose of a long book, with \\emph{some} markup and a citation \\cite{knuth84}. ".repeat(12);
+        let mut chapters = Vec::new();
+        for chapter in 0..30 {
+            let mut text = format!("\\chapter{{Chapter {chapter}}}\\label{{ch:{chapter}}}\n");
+            for section in 0..8 {
+                text.push_str(&format!("\\section{{Section {chapter}.{section}}}\\label{{sec:{chapter}:{section}}}\n"));
+                for _ in 0..6 {
+                    text.push_str(&paragraph);
+                    text.push_str("\n\n");
+                }
+                text.push_str(&format!("\\begin{{figure}}\\caption{{Figure in {chapter}.{section}}}\\label{{fig:{chapter}:{section}}}\\end{{figure}}\n"));
+            }
+            chapters.push(text);
+        }
+        let started = std::time::Instant::now();
+        let files: Vec<FileOutline> = chapters.iter().enumerate().map(|(index, text)| file_outline(Path::new(&format!("/p/ch{index}.tex")), format!("ch{index}.tex"), text, Path::new("/p"))).collect();
+        let elapsed = started.elapsed();
+        let words: usize = files.iter().map(|file| file.words).sum();
+        let json = serde_json::to_string(&Reply::Outline { main: Some("main.tex".into()), files }).unwrap();
+        println!("{words} words, {} KB of source, map {} KB (about {} tokens), in {elapsed:?}", chapters.iter().map(String::len).sum::<usize>() / 1024, json.len() / 1024, json.len() / 4);
     }
 
     #[test]
