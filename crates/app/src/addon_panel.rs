@@ -52,6 +52,8 @@ pub enum AddonPanelEvent {
     Notify(String),
     /// The user asked to put this text at the cursor of the document.
     InsertText(String),
+    /// The program ended or was stopped, so what waits on it ends too.
+    Stopped,
     /// The dialog opened, closed or changed, and the workspace draws it.
     DialogChanged,
     /// The program ended before it answered the shortcut.
@@ -250,6 +252,7 @@ impl AddonPanel {
     pub fn set_root(&mut self, root: Option<PathBuf>, cx: &mut Context<Self>) {
         self.root = root;
         self.stop();
+        cx.emit(AddonPanelEvent::Stopped);
         self.stopped = None;
         self.view = Node::default();
         self.dialog = None;
@@ -268,6 +271,7 @@ impl AddonPanel {
         self.process = None;
         self.subscriptions.clear();
     }
+
 
     fn start(&mut self, cx: &mut Context<Self>) {
         self.invalid = None;
@@ -394,6 +398,7 @@ impl AddonPanel {
                 }
                 self.process = None;
                 self.subscriptions.clear();
+                cx.emit(AddonPanelEvent::Stopped);
                 self.citations.clear();
                 self.dialog = None;
                 cx.emit(AddonPanelEvent::DialogChanged);

@@ -70,6 +70,8 @@ mod collab_session;
 mod git_sync;
 #[path = "addon_host.rs"]
 mod addon_host;
+#[path = "review.rs"]
+mod review;
 
 const RECOVERY_DELAY: Duration = Duration::from_secs(3);
 const TOP_BAR_HEIGHT: f32 = 40.0;
@@ -454,6 +456,8 @@ pub struct Workspace {
     addon_context_task: Option<Task<()>>,
     /// Focuses the active document at the next frame, for actions without a window.
     focus_requested: bool,
+    /// Changes from add-ons that wait for the user.
+    proposals: Vec<review::Review>,
     layout: PaneLayout,
     /// The PDF tab is the one on screen.
     pdf_tab_shown: bool,
@@ -708,6 +712,7 @@ impl Workspace {
             addon_context_pending: None,
             addon_context_task: None,
             focus_requested: false,
+            proposals: Vec::new(),
             layout: PaneLayout::Split,
             pdf_tab_shown: false,
             focus_mode: false,
@@ -1684,6 +1689,12 @@ impl Workspace {
             };
             self.addon_panels.push(entry);
         }
+        // Add-ons that were turned off or removed: their program ends with
+        // the panel, and nothing of them stays behind.
+        for entry in old {
+            self.end_proposals_of(&entry.panel, cx);
+            self.compile_waiters.retain(|(panel, _)| panel != &entry.panel);
+        }
         if matches!(self.left_panel, LeftPanel::Addon(_)) {
             let index = self.addon_panels.iter().position(|entry| Some(&entry.panel.read(cx).add_on.manifest.id) == shown.as_ref());
             self.left_panel = index.map_or(LeftPanel::Files, LeftPanel::Addon);
@@ -1704,6 +1715,7 @@ impl Workspace {
                 }
                 AddonPanelEvent::LookupFailed(reason) => this.set_status(reason.clone(), cx),
                 AddonPanelEvent::Notify(text) => this.set_status(text.clone(), cx),
+                AddonPanelEvent::Stopped => this.end_proposals_of(&panel, cx),
                 AddonPanelEvent::InsertText(text) => {
                     if this.active_view().is_some() {
                         this.with_active(cx, |view, cx| view.insert_text(text, cx));
@@ -1890,6 +1902,12 @@ impl Workspace {
             Request::InsertText { text } => self.addon_insert_text(&text, cx),
             Request::InsertAt { path, line, column, text } => self.addon_insert_at(&path, line, column, &text, cx),
             Request::CopyIntoProject { source, dest } => return self.answer_copy_into_project(panel, id, source, dest, cx),
+            Request::ProposeEdits { path, title, edits, text } => match self.start_proposal(panel.clone(), id, &path, title, edits, text, cx) {
+                Some(result) => result,
+                // The reply waits for the user.
+                None => return,
+            },
+            Request::CancelReview { path } => self.cancel_proposal(&path, cx),
             Request::DiscardEdits => {
                 self.discard_addon_edits(&add_on, cx);
                 Ok(Reply::Done)
@@ -6140,6 +6158,7 @@ impl Workspace {
         } else {
             match (self.image_preview(), active) {
             (Some(preview), _) => preview.view.clone().into_any_element(),
+            (None, Some(_)) if let Some(index) = self.active_proposal(cx) => self.render_proposal(index, cx),
             (None, Some(view)) => view.into_any_element(),
             (None, None) => div()
                 .size_full()

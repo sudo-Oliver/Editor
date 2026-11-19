@@ -14,7 +14,7 @@ pub const OLDEST_API_VERSION: u32 = 1;
 /// What this editor can do beyond `API_VERSION`, sent with `HostMessage::Init`.
 /// Add-ons check these rather than the version, so that they work on an
 /// editor that lacks one by doing without it.
-pub const FEATURES: &[&str] = &["markdown", "tree_edits", "notify", "events", "pdf", "bib", "insert", "files"];
+pub const FEATURES: &[&str] = &["markdown", "tree_edits", "notify", "events", "pdf", "bib", "insert", "files", "review"];
 
 /// What an add-on may ask the editor for. Add-ons are not sandboxed, so this
 /// limits the requests below and not the program itself.
@@ -413,6 +413,28 @@ pub enum Request {
     /// project. `dest` is relative to it; an existing file gets a number. The
     /// reply is the path it got, as text.
     CopyIntoProject { source: String, dest: String },
+    /// Shows changes to a file for the user to accept or reject, block by
+    /// block, before anything changes. Either `edits`, each `old` occurring
+    /// once, or the whole new `text`. The reply comes when every block is
+    /// decided, or the review ends early.
+    ProposeEdits {
+        path: String,
+        /// What the change is for, shown above it.
+        #[serde(default)]
+        title: String,
+        #[serde(default)]
+        edits: Vec<TextEdit>,
+        #[serde(default)]
+        text: Option<String>,
+    },
+    /// Ends an open review of the file without changing it.
+    CancelReview { path: String },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct TextEdit {
+    pub old: String,
+    pub new: String,
 }
 
 impl Request {
@@ -437,7 +459,9 @@ impl Request {
             | Self::DiscardEdits
             | Self::InsertText { .. }
             | Self::InsertAt { .. }
-            | Self::CopyIntoProject { .. } => Permission::EditDocuments,
+            | Self::CopyIntoProject { .. }
+            | Self::ProposeEdits { .. }
+            | Self::CancelReview { .. } => Permission::EditDocuments,
             Self::Compile => Permission::Compile,
             Self::GetSecret { .. } | Self::SetSecret { .. } => Permission::Secrets,
             Self::InsertCitation { .. } => Permission::Citations,
@@ -508,6 +532,8 @@ pub enum Reply {
     Pdf { pages: usize, page: usize },
     File { path: String },
     Bib { entries: Vec<BibInfo> },
+    /// The blocks of a review by their order in the file, from 0.
+    Reviewed { accepted: Vec<usize>, rejected: Vec<usize> },
 }
 
 /// Lines to the add-on.
