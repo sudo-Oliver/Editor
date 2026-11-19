@@ -103,6 +103,7 @@ actions!(
         LayoutPdfTab,
         ToggleFocusMode,
         ToggleHub,
+        CommandPalette,
         StartTour,
         OpenGitPanel,
         StartPresentation,
@@ -124,6 +125,12 @@ pub struct Command {
 }
 
 impl Command {
+    /// Whether it makes sense to run from the palette, outside a special state
+    /// such as an open completion list or a presentation.
+    pub fn runs_anywhere(&self) -> bool {
+        self.id != "close_menu" && self.id != "command_palette" && self.context.is_none_or(|context| context == "Editor")
+    }
+
     pub fn action(&self) -> Box<dyn Action> {
         (self.action)()
     }
@@ -150,6 +157,7 @@ pub const COMMANDS: &[Command] = &[
     command!("new_file", "General", "New file", NewFile, None, &["secondary-n"]),
     command!("open_folder", "General", "Open folder", OpenFolder, None, &["secondary-o"]),
     command!("project_hub", "General", "Project hub", ToggleHub, None, &["secondary-shift-p"]),
+    command!("command_palette", "General", "Command palette", CommandPalette, None, &["secondary-k"]),
     command!("git_panel", "General", "Git panel", OpenGitPanel, None, &["secondary-shift-g"]),
     command!("close_tab", "General", "Close tab", CloseTab, None, &["secondary-w"]),
     command!("tab_1", "General", "Go to tab 1", GoToTab1, None, &["secondary-1"]),
