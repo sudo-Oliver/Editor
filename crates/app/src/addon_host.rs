@@ -20,8 +20,8 @@ use crate::{
     actions::{AddonBinding, Copy, Cut, Paste, RunAddonCommand},
     addon_panel::AddonPanel,
     addons, bib,
-    editor_view::EditorView,
-    file_tree, outline, toolchain,
+    editor_view::{DragContent, DragItem, EditorView},
+    file_tree, outline, snippets, toolchain,
 };
 
 /// The cursor has to rest this long before add-ons hear where it is.
@@ -102,6 +102,54 @@ impl Workspace {
             entries.extend(commands);
         }
         entries
+    }
+
+    /// Places what was dropped into a document at its cursor: text as it is, a
+    /// picture as a figure, copied into the project when it lies outside.
+    pub(super) fn drop_into(&mut self, view: &Entity<EditorView>, item: DragItem, cx: &mut Context<Self>) {
+        self.active = self.documents.iter().position(|document| &document.view == view);
+        match item.content {
+            DragContent::Text(text) => view.update(cx, |view, cx| view.insert_text(&text, cx)),
+            DragContent::File(path) => {
+                let language = view.read(cx).state.language();
+                if !snippets::is_figure_file(language, &path) {
+                    return self.set_status("Only pictures can be dropped into a document.", cx);
+                }
+                let path = match self.copy_into_figures(&path) {
+                    Ok(path) => path,
+                    Err(error) => return self.set_status(error, cx),
+                };
+                // A figure starts a line of its own.
+                if view.read(cx).cursor_position().1 > 1 {
+                    view.update(cx, |view, cx| view.insert_text("\n", cx));
+                }
+                self.insert_figure(&path, cx);
+                self.refresh_from_disk(cx);
+            }
+        }
+        if let Some((addon, node)) = item.origin {
+            let view = view.read(cx);
+            let path = view.path.as_deref().map(|path| self.relative_to_project(path)).unwrap_or_default();
+            let line = view.cursor_position().0;
+            if let Some(entry) = self.addon_panels.iter().find(|entry| entry.panel.read(cx).add_on.manifest.id == addon) {
+                entry.panel.read(cx).send_event(HostMessage::Dropped { id: node, path, line });
+            }
+        }
+        cx.notify();
+    }
+
+    /// A picture inside the project stays where it is; one from elsewhere is
+    /// copied into its `figures` folder.
+    fn copy_into_figures(&self, path: &Path) -> Result<PathBuf, String> {
+        let root = self.root.as_deref().ok_or("Open a project first.")?;
+        if path.starts_with(root) {
+            return Ok(path.to_path_buf());
+        }
+        let name = path.file_name().ok_or("The file has no name.")?;
+        let target = free_name(&root.join("figures").join(name));
+        std::fs::create_dir_all(root.join("figures")).map_err(|error| format!("Cannot make the figures folder: {error}"))?;
+        std::fs::copy(path, &target).map_err(|error| format!("Cannot copy {}: {error}", path.display()))?;
+        Ok(target)
     }
 
     fn panels_wanting(&self, kind: EventKind, cx: &gpui::App) -> Vec<Entity<AddonPanel>> {

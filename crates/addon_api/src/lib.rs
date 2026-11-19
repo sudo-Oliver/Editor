@@ -14,7 +14,7 @@ pub const OLDEST_API_VERSION: u32 = 1;
 /// What this editor can do beyond `API_VERSION`, sent with `HostMessage::Init`.
 /// Add-ons check these rather than the version, so that they work on an
 /// editor that lacks one by doing without it.
-pub const FEATURES: &[&str] = &["markdown", "tree_edits", "notify", "events", "pdf", "bib", "insert", "files", "review", "outline", "status", "commands"];
+pub const FEATURES: &[&str] = &["markdown", "tree_edits", "notify", "events", "pdf", "bib", "insert", "files", "review", "outline", "status", "commands", "drag"];
 
 /// What an add-on may ask the editor for. Add-ons are not sandboxed, so this
 /// limits the requests below and not the program itself.
@@ -225,9 +225,21 @@ pub enum Node {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_height: Option<u32>,
     },
+    /// Its children can be dragged into a document. Text lands where it is
+    /// dropped; a picture is copied into the project and placed as a figure.
+    /// `HostMessage::Dropped` says where.
+    Draggable { id: String, payload: DragPayload, children: Vec<Node> },
     /// A node from a newer editor, which this one cannot draw and skips.
     #[serde(other)]
     Unknown,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DragPayload {
+    Text { text: String },
+    /// An absolute path, such as a picture the add-on made.
+    File { path: String },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -278,7 +290,7 @@ impl Node {
             Self::Column { id, .. } | Self::Row { id, .. } | Self::Text { id, .. } | Self::Code { id, .. } | Self::Markdown { id, .. } | Self::Message { id, .. } | Self::Card { id, .. } => {
                 id.as_deref()
             }
-            Self::Scroll { id, .. } | Self::Button { id, .. } | Self::Input { id, .. } | Self::Select { id, .. } | Self::Dropdown { id, .. } | Self::Check { id, .. } | Self::Collapsible { id, .. } | Self::Chips { id, .. } => {
+            Self::Scroll { id, .. } | Self::Draggable { id, .. } | Self::Button { id, .. } | Self::Input { id, .. } | Self::Select { id, .. } | Self::Dropdown { id, .. } | Self::Check { id, .. } | Self::Collapsible { id, .. } | Self::Chips { id, .. } => {
                 Some(id)
             }
             Self::Alert { .. } | Self::Divider | Self::Image { .. } | Self::Unknown => None,
@@ -287,18 +299,26 @@ impl Node {
 
     pub fn children(&self) -> &[Node] {
         match self {
-            Self::Column { children, .. } | Self::Row { children, .. } | Self::Scroll { children, .. } | Self::Message { children, .. } | Self::Collapsible { children, .. } | Self::Card { children, .. } => {
-                children
-            }
+            Self::Column { children, .. }
+            | Self::Row { children, .. }
+            | Self::Scroll { children, .. }
+            | Self::Message { children, .. }
+            | Self::Collapsible { children, .. }
+            | Self::Card { children, .. }
+            | Self::Draggable { children, .. } => children,
             _ => &[],
         }
     }
 
     pub fn children_mut(&mut self) -> Option<&mut Vec<Node>> {
         match self {
-            Self::Column { children, .. } | Self::Row { children, .. } | Self::Scroll { children, .. } | Self::Message { children, .. } | Self::Collapsible { children, .. } | Self::Card { children, .. } => {
-                Some(children)
-            }
+            Self::Column { children, .. }
+            | Self::Row { children, .. }
+            | Self::Scroll { children, .. }
+            | Self::Message { children, .. }
+            | Self::Collapsible { children, .. }
+            | Self::Card { children, .. }
+            | Self::Draggable { children, .. } => Some(children),
             _ => None,
         }
     }
@@ -641,6 +661,8 @@ pub enum HostMessage {
     LookupDoi { suggestion: String },
     /// The user closed the dialog.
     DialogClosed,
+    /// A `Draggable` was dropped into a document, which put it at this line.
+    Dropped { id: String, path: String, line: usize },
     /// The user ran a command of the add-on, with where the cursor was.
     Command { id: String, context: Option<ActiveFile> },
     /// Another document became active, or none.

@@ -1161,6 +1161,7 @@ impl Workspace {
             view
         });
         let subscription = cx.subscribe(&view, |this, view, event, cx| match event {
+            EditorEvent::Dropped(item) => this.drop_into(&view, item.clone(), cx),
             EditorEvent::Edited => {
                 #[cfg(feature = "collab")]
                 this.collab_edited(&view, cx);

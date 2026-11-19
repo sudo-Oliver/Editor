@@ -20,7 +20,7 @@ use gpui::{
 use crate::{
     actions::{CloseMenu, Newline, Paste, Recompile},
     addons::{self, AddonProcess, Installed, ProcessEvent},
-    editor_view::EditorView,
+    editor_view::{DragContent, DragItem, DragPreview, EditorView},
     markdown::{self, Block, Inline},
     theme,
 };
@@ -954,6 +954,27 @@ impl AddonPanel {
                 .h(px(max_height.unwrap_or(240) as f32))
                 .child(img(PathBuf::from(path)).size_full().object_fit(ObjectFit::Contain))
                 .into_any_element(),
+            Node::Draggable { id, payload, children } => {
+                let (content, label) = match payload {
+                    addon_api::DragPayload::Text { text } => (DragContent::Text(text.clone()), text.chars().take(40).collect::<String>()),
+                    addon_api::DragPayload::File { path } => {
+                        let path = PathBuf::from(path);
+                        let label = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+                        (DragContent::File(path), label)
+                    }
+                };
+                let item = DragItem { content, origin: Some((self.add_on.manifest.id.clone(), id.clone())), label: label.into() };
+                div()
+                    .id(SharedString::from(format!("draggable-{id}")))
+                    .flex()
+                    .flex_col()
+                    .flex_none()
+                    .gap(px(6.))
+                    .cursor_grab()
+                    .on_drag(item, |item, _, _, cx| cx.new(|_| DragPreview(item.label.clone())))
+                    .children(children.iter().map(|child| self.render_node(child, cx)).collect::<Vec<_>>())
+                    .into_any_element()
+            }
             Node::Unknown => div().into_any_element(),
         }
     }

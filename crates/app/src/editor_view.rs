@@ -50,7 +50,44 @@ struct Completion {
     selected: usize,
 }
 
+/// Something dragged into a document: text from a panel, or a file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DragItem {
+    pub content: DragContent,
+    /// The add-on and the node it came from, to tell where it landed.
+    pub origin: Option<(String, String)>,
+    /// What the drag shows under the pointer.
+    pub label: SharedString,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DragContent {
+    Text(String),
+    File(PathBuf),
+}
+
+/// The small label that follows the pointer while dragging.
+pub struct DragPreview(pub SharedString);
+
+impl Render for DragPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let palette = theme::palette();
+        div()
+            .px(px(8.))
+            .py(px(3.))
+            .rounded(px(6.))
+            .bg(theme::color(palette.panel))
+            .border_1()
+            .border_color(theme::color(palette.accent))
+            .text_size(px(12.))
+            .text_color(theme::color(palette.ui_text))
+            .child(self.0.clone())
+    }
+}
+
 pub enum EditorEvent {
+    /// Something was dropped, and the cursor stands where it goes.
+    Dropped(DragItem),
     Edited,
     /// Someone else changed the text, in a shared session.
     #[cfg_attr(not(feature = "collab"), allow(dead_code))]
@@ -679,6 +716,16 @@ impl EditorView {
         self.changed(cx);
     }
 
+    /// Puts the cursor where the pointer let go, for the workspace to place the item.
+    fn drop_at(&mut self, item: DragItem, window: &mut Window, cx: &mut Context<Self>) {
+        let offset = self.position_to_offset(window.mouse_position(), window);
+        self.state.set_selections(vec![Selection::cursor(offset)]);
+        self.vim_after_mouse();
+        self.focus_handle.focus(window, cx);
+        cx.emit(EditorEvent::Dropped(item));
+        cx.notify();
+    }
+
     /// Puts `text` in place of the selection, as pasting would.
     pub fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
         if let Some(vim) = &mut self.vim {
@@ -1200,7 +1247,18 @@ impl Render for EditorView {
             .track_focus(&self.focus_handle)
             .size_full()
             .bg(theme::color(theme::palette().bg))
-            .cursor(CursorStyle::IBeam);
+            .cursor(CursorStyle::IBeam)
+            .when(!self.state.is_read_only() && !self.plain, |root| {
+                root.drag_over::<DragItem>(|style, _, _, _| style.bg(theme::color(theme::palette().panel)))
+                    .drag_over::<gpui::ExternalPaths>(|style, _, _, _| style.bg(theme::color(theme::palette().panel)))
+                    .on_drop(cx.listener(|this, item: &DragItem, window, cx| this.drop_at(item.clone(), window, cx)))
+                    .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                        for path in paths.paths() {
+                            let label = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+                            this.drop_at(DragItem { content: DragContent::File(path.clone()), origin: None, label: label.into() }, window, cx);
+                        }
+                    }))
+            });
         motion_actions!(self, root, cx;
             MoveLeft => Left, false;
             MoveRight => Right, false;
