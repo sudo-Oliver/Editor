@@ -14,7 +14,7 @@ pub const OLDEST_API_VERSION: u32 = 1;
 /// What this editor can do beyond `API_VERSION`, sent with `HostMessage::Init`.
 /// Add-ons check these rather than the version, so that they work on an
 /// editor that lacks one by doing without it.
-pub const FEATURES: &[&str] = &["markdown", "tree_edits", "notify", "events", "pdf", "bib", "insert", "files", "review"];
+pub const FEATURES: &[&str] = &["markdown", "tree_edits", "notify", "events", "pdf", "bib", "insert", "files", "review", "outline"];
 
 /// What an add-on may ask the editor for. Add-ons are not sandboxed, so this
 /// limits the requests below and not the program itself.
@@ -404,6 +404,10 @@ pub enum Request {
     },
     /// The entries of the project's bibliography files.
     BibEntries,
+    /// A map of the whole project for finding one's way in it without reading
+    /// it all: each source file with its headings, figures, tables, labels and
+    /// words, open documents with their unsaved text. Small even for a book.
+    Outline,
     /// Puts text at the cursor of the open document, in place of the selection.
     InsertText { text: String },
     /// Puts text at a place in a file, which opens if it is not. Lines and
@@ -451,7 +455,8 @@ impl Request {
             | Self::PdfInfo
             | Self::PdfText { .. }
             | Self::PdfPage { .. }
-            | Self::BibEntries => Permission::ReadProject,
+            | Self::BibEntries
+            | Self::Outline => Permission::ReadProject,
             Self::EditFile { .. }
             | Self::CreateFile { .. }
             | Self::WriteFile { .. }
@@ -517,6 +522,29 @@ pub struct BibInfo {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct FileOutline {
+    /// Relative to the project.
+    pub path: String,
+    pub words: usize,
+    pub lines: usize,
+    pub entries: Vec<OutlineEntry>,
+    /// `\label` names, which `\ref` points to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct OutlineEntry {
+    /// `section`, `figure`, `table` or `references`.
+    pub kind: String,
+    /// 1 for a part or chapter in LaTeX, a `=` heading in Typst, and so on down.
+    pub level: usize,
+    pub title: String,
+    /// Starts at 1.
+    pub line: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "reply", rename_all = "snake_case")]
 pub enum Reply {
     Done,
@@ -532,6 +560,8 @@ pub enum Reply {
     Pdf { pages: usize, page: usize },
     File { path: String },
     Bib { entries: Vec<BibInfo> },
+    /// The main file first, then the others by path.
+    Outline { main: Option<String>, files: Vec<FileOutline> },
     /// The blocks of a review by their order in the file, from 0.
     Reviewed { accepted: Vec<usize>, rejected: Vec<usize> },
 }
