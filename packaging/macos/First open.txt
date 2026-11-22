@@ -1,0 +1,29 @@
+Opening Editor for the first time
+=================================
+
+1. Drag Editor onto the Applications folder in this window.
+
+2. Open Applications and double-click Editor.
+
+Editor is free and not registered with Apple, so the first time macOS
+says it cannot check the app for malicious software. That is expected.
+
+On macOS 15 (Sequoia) and later:
+
+3. Click "Done" in the warning.
+4. Open System Settings > Privacy & Security.
+5. Scroll down to "Editor was blocked to protect your Mac" and click
+   "Open Anyway". Confirm with your Mac password or Touch ID.
+6. Confirm once more in the last question.
+
+On macOS 14 and earlier, right-click Editor in Applications, choose
+"Open" and click "Open" in the question instead.
+
+macOS asks only once. After that Editor opens like any other app.
+
+For people at home in Terminal, this line does the same in one step:
+
+    xattr -dr com.apple.quarantine /Applications/Editor.app
+
+If Editor ever starts from this window or from Downloads, it offers to
+move itself to Applications. Say yes: from there it can update itself.
