@@ -540,7 +540,7 @@ pub fn run_pandoc(pandoc: &Path, main: &Path, format: DraftFormat, target: &Path
     let mut command = Command::new(pandoc);
     command
         .args(pandoc_args(reader, format, &Path::new(".").join(name), temp.path()))
-        .env("PATH", build::child_path())
+        .envs(build::child_env())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());

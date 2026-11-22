@@ -23,7 +23,7 @@ For LaTeX it offers the complete MacTeX (about 7 GB, every package offline) or t
 It shows the download and disk size of every part and checks the free space before anything starts. Then it installs in one of three ways:
 
 - **With Homebrew**, the default when Homebrew is already there: `brew install tectonic`, `typst` or `pandoc`.
-- **In the app's folder**, the default when it is not. Nobody without Homebrew has to know what it is. The official programs go into the app's own folder (`~/.config/editor/tools`), are checked against a fingerprint, and can be removed under Writing tools. No password.
+- **In the app's folder**, the default when it is not. Nobody without Homebrew has to know what it is. The official programs go into the app's own folder (`~/Library/Application Support/io.github.sudo-oliver.editor/tools`), are checked against a fingerprint, and can be removed under Writing tools. No password. The packages Tectonic and Typst download go to `~/Library/Caches/io.github.sudo-oliver.editor`, and removing either removes its packages too.
 - **Install Homebrew first**, under "Other ways to install". Apple's developer tools through Apple's own dialog, then Homebrew's official installer, which asks for your password once, then the formulas.
 - **By hand**, also under "Other ways to install". The setup lists each file with its download link and says where it goes: programs into `~/Applications/Editor Tools` (packed or unpacked), MacTeX through its own installer. It notices the files on its own, checks them and makes them runnable.
 
@@ -187,7 +187,7 @@ The crate `addon_api` describes the protocol: one JSON message per line over std
 
 ## Settings
 
-The gear at the bottom left opens the settings, the question mark above it lists the keyboard shortcuts. Cmd+, (macOS) or Ctrl+, (Linux) also opens the settings. They are stored in `~/.config/editor/settings.toml`, or under `XDG_CONFIG_HOME` if it is set. Project settings stay in `.editor.toml`.
+The gear at the bottom left opens the settings, the question mark above it lists the keyboard shortcuts. Cmd+, (macOS) or Ctrl+, (Linux) also opens the settings. They are stored in `~/Library/Application Support/io.github.sudo-oliver.editor/settings.toml` on macOS, next to everything else the app keeps, and in `~/.config/editor/settings.toml` on Linux, or under `XDG_CONFIG_HOME` if it is set. Caches and downloads go to `~/Library/Caches/io.github.sudo-oliver.editor`. Project settings stay in `.editor.toml`.
 
 ## Vim mode
 

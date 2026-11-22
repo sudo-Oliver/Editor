@@ -109,10 +109,12 @@ fn move_into(from: &Path, to: &Path) {
 
 /// Removes what a crash or force quit left behind: half-finished tool
 /// downloads and unpacks, half-copied add-ons, and package downloads nobody
-/// continued for two weeks. Runs once per start, away from typing.
+/// continued for two weeks. Also removes tool versions an update replaced.
+/// Runs once per start, away from typing.
 pub fn sweep() {
     if let Some(tools) = data_dir().map(|data| data.join("tools")) {
         remove_matching(&tools, |name| name.starts_with(".download-") || name.starts_with(".unpack-"));
+        crate::toolchain::remove_old_versions(&tools);
     }
     if let Some(addons) = data_dir().map(|data| data.join("addons")) {
         remove_matching(&addons, |name| name.starts_with(".installing-"));
