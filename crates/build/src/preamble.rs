@@ -174,9 +174,13 @@ fn preamble_text(text: &str) -> Option<&str> {
                 return None;
             }
             let preamble = &text[..offset];
-            let comments_removed = preamble.lines().map(|line| line.split('%').next().unwrap_or_default());
-            let harmless = !comments_removed.into_iter().any(|line| NOT_FOR_FORMATS.iter().any(|word| line.contains(word)));
-            return (harmless && preamble.contains("\\documentclass")).then_some(preamble);
+            let code: Vec<&str> = preamble.lines().map(|line| line.split('%').next().unwrap_or_default()).collect();
+            let harmless = !code.iter().any(|line| NOT_FOR_FORMATS.iter().any(|word| line.contains(word)));
+            // mylatex.ltx ends the format with \makeatother, so a body that relies on
+            // `@` being a letter would change its meaning without an error.
+            let code = code.join("\n");
+            let at_is_letter = code.rfind("\\makeatletter").is_some_and(|letter| code.rfind("\\makeatother").is_none_or(|other| other < letter));
+            return (harmless && !at_is_letter && preamble.contains("\\documentclass")).then_some(preamble);
         }
         offset += line.len();
     }
@@ -227,6 +231,10 @@ mod tests {
         }
         let commented = "\\documentclass{a}\n% \\jobname\n\\begin{document}\n";
         assert!(preamble_text(commented).is_some());
+        // `@` left a letter for the body, which a format would undo.
+        assert_eq!(preamble_text("\\documentclass{a}\n\\makeatletter\n\\def\\x{}\n\\begin{document}\n"), None);
+        assert!(preamble_text("\\documentclass{a}\n\\makeatletter\n\\def\\x{}\n\\makeatother\n\\begin{document}\n").is_some());
+        assert!(preamble_text("\\documentclass{a}\n\\makeatletter % \\makeatother\n\\begin{document}\n").is_none());
     }
 
     #[test]
