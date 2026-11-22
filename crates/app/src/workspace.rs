@@ -64,6 +64,7 @@ use crate::{
     theme,
     toolchain::{self, Tool, Toolchain, ToolchainEvent},
     updater::{self, Updater},
+    app_location::{self, Mover, MoverEvent},
 };
 
 #[cfg(feature = "collab")]
@@ -458,6 +459,8 @@ pub struct Workspace {
     setup: Option<(Entity<SetupView>, Subscription)>,
     updater: Entity<Updater>,
     _updater_observer: Subscription,
+    mover: Entity<Mover>,
+    _mover_subscriptions: [Subscription; 2],
     /// Opens the setup at the next frame, for actions without a window.
     setup_requested: bool,
     /// The draft export that waits for Pandoc to be installed.
@@ -669,6 +672,16 @@ impl Workspace {
             settings.tour_done = true;
         }
         apply_look(&settings);
+        let mover = cx.new(|_| Mover::new(settings.move_declined));
+        let _mover_subscriptions = [
+            cx.observe(&mover, |_, _, cx| cx.notify()),
+            cx.subscribe(&mover, |this, _, event, cx| match event {
+                MoverEvent::Declined => {
+                    this.settings.move_declined = true;
+                    this.save_settings(cx);
+                }
+            }),
+        ];
         #[cfg(feature = "collab")]
         let collab = {
             let name = if settings.collab_name.is_empty() { collab_session::default_name() } else { settings.collab_name.clone() };
@@ -711,6 +724,8 @@ impl Workspace {
             setup: None,
             updater,
             _updater_observer,
+            mover,
+            _mover_subscriptions,
             setup_requested: false,
             export_after_pandoc: None,
             tour: None,
@@ -8308,6 +8323,9 @@ impl Render for Workspace {
                 this.open_dialog(Dialog::Settings(SettingsPage::Editor), window, cx);
             }))
             .on_action(|_: &Quit, _, cx: &mut App| cx.quit())
+            .on_action(cx.listener(|this, _: &MoveToApplications, _, cx| this.mover.update(cx, |mover, cx| mover.start(cx))))
+            // Before the setup too: moving first saves a second setup in the copy.
+            .when(!presenting, |element| element.children(app_location::banner(&self.mover, cx)))
             .when(!presenting && setup.is_none(), |element| element.children(updater::banner(&self.updater, cx)))
             .when(hub, |element| {
                 let page = match setup {
