@@ -1000,6 +1000,8 @@ impl Workspace {
             self.recompile(cx);
         }
         self.forget_saved_recovery(cx);
+        let swept = root.clone();
+        cx.background_spawn(async move { crate::atomic::sweep(&swept) }).detach();
         self.git_root_opened(cx);
         #[cfg(feature = "collab")]
         self.collab_root_opened(&root, cx);
