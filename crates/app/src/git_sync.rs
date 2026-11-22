@@ -164,7 +164,16 @@ impl Workspace {
             return;
         };
         cx.spawn(async move |this, cx| {
-            let repository = cx.background_spawn(async move { program.discover(&root).ok().flatten() }).await;
+            let repository = cx
+                .background_spawn(async move {
+                    let repository = program.discover(&root).ok().flatten();
+                    // Build output is never part of the project, also for other git programs.
+                    if let Some(repository) = &repository {
+                        repository.ignore_build_output_locally().ok();
+                    }
+                    repository
+                })
+                .await;
             this.update(cx, |this, cx| {
                 if this.root.as_deref().is_some_and(|root| repository.as_ref().is_some_and(|repository| root.starts_with(repository.root()))) {
                     this.git.repository = repository;

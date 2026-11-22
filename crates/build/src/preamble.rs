@@ -10,8 +10,9 @@ use std::{
     time::SystemTime,
 };
 
-const PREFIX: &str = "preamble-";
+pub(crate) const PREFIX: &str = "preamble-";
 const BEGIN_DOCUMENT: &str = "\\begin{document}";
+const FORMAT_VERSION: &[u8] = b"2";
 /// Things that only work in a normal run, because a format keeps no open files and
 /// freezes the name of the job.
 const NOT_FOR_FORMATS: &[&str] = &["\\jobname", "\\openout", "\\write18"];
@@ -40,6 +41,8 @@ impl Preamble {
         let preamble = preamble_text(&String::from_utf8_lossy(&text))?.to_string();
         let mut hasher = DefaultHasher::new();
         hasher.write(preamble.as_bytes());
+        // A new way of building formats replaces the ones built the old way.
+        hasher.write(FORMAT_VERSION);
         Some(Self { key: hasher.finish(), directory: directory.to_path_buf() })
     }
 
@@ -171,9 +174,13 @@ fn preamble_text(text: &str) -> Option<&str> {
                 return None;
             }
             let preamble = &text[..offset];
-            let comments_removed = preamble.lines().map(|line| line.split('%').next().unwrap_or_default());
-            let harmless = !comments_removed.into_iter().any(|line| NOT_FOR_FORMATS.iter().any(|word| line.contains(word)));
-            return (harmless && preamble.contains("\\documentclass")).then_some(preamble);
+            let code: Vec<&str> = preamble.lines().map(|line| line.split('%').next().unwrap_or_default()).collect();
+            let harmless = !code.iter().any(|line| NOT_FOR_FORMATS.iter().any(|word| line.contains(word)));
+            // mylatex.ltx ends the format with \makeatother, so a body that relies on
+            // `@` being a letter would change its meaning without an error.
+            let code = code.join("\n");
+            let at_is_letter = code.rfind("\\makeatletter").is_some_and(|letter| code.rfind("\\makeatother").is_none_or(|other| other < letter));
+            return (harmless && !at_is_letter && preamble.contains("\\documentclass")).then_some(preamble);
         }
         offset += line.len();
     }
@@ -224,6 +231,10 @@ mod tests {
         }
         let commented = "\\documentclass{a}\n% \\jobname\n\\begin{document}\n";
         assert!(preamble_text(commented).is_some());
+        // `@` left a letter for the body, which a format would undo.
+        assert_eq!(preamble_text("\\documentclass{a}\n\\makeatletter\n\\def\\x{}\n\\begin{document}\n"), None);
+        assert!(preamble_text("\\documentclass{a}\n\\makeatletter\n\\def\\x{}\n\\makeatother\n\\begin{document}\n").is_some());
+        assert!(preamble_text("\\documentclass{a}\n\\makeatletter % \\makeatother\n\\begin{document}\n").is_none());
     }
 
     #[test]
@@ -286,6 +297,31 @@ mod tests {
         assert_eq!(preamble.state(), State::Unsuitable);
         fs::write(&main, "\\documentclass{b}\n\\begin{document}\n").unwrap();
         assert_ne!(Preamble::of(&main, &root).unwrap().name(), preamble.name());
+    }
+
+    #[test]
+    fn only_the_current_format_stays() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let main = root.join("main.tex");
+        fs::write(&main, "\\documentclass{a}\n\\begin{document}\n").unwrap();
+        let preamble = Preamble::of(&main, root).unwrap();
+        let name = preamble.name();
+        let own = [format!("{name}.fmt"), format!("{name}.inputs")];
+        let others = ["preamble-00000000000000aa.fmt", "preamble-00000000000000aa.inputs", "preamble-00000000000000bb.log"];
+        for file in own.iter().map(String::as_str).chain(others).chain(["main.pdf", "main.aux"]) {
+            fs::write(root.join(file), "").unwrap();
+        }
+        preamble.remove_others();
+        let mut left: Vec<String> = fs::read_dir(root).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        let mut expected = vec!["main.aux".to_string(), "main.pdf".to_string(), "main.tex".to_string()];
+        expected.extend(own.iter().cloned());
+        expected.sort();
+        assert_eq!(left, expected);
+
+        remove_formats(root, None);
+        assert!(!root.join(&own[0]).exists() && root.join("main.pdf").exists());
     }
 
     #[test]

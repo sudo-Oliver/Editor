@@ -33,6 +33,10 @@ pub enum PickerKind {
     Themes,
     /// Installed fonts, shown while moving through them.
     Fonts(FontSlot),
+    /// Earlier versions of one file, from the local history.
+    History,
+    /// Every command, the editor's and those of add-ons that are on.
+    Commands,
 }
 
 /// Which text a font picked in the settings is for.

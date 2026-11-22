@@ -20,11 +20,16 @@ use crate::{
     explain, fontmap,
     parse::{self, Diagnostic, Severity},
     preamble::{self, Preamble, State},
-    tools::{child_path, find_tool},
+    tidy,
+    tools::{child_env, find_tool},
 };
 
-const OUTPUT_DIRECTORY: &str = ".build";
+/// Where a build writes: in the main file's folder, or in the project for Typst.
+pub const OUTPUT_DIRECTORY: &str = ".build";
 const MAX_LATEX_RUNS: usize = 3;
+/// zlib's own default. pdfTeX's 9 spends a quarter of a build on compressing the
+/// PDF and its images, for a file only about 4% smaller.
+const PDF_COMPRESSION: &str = "\\pdfcompresslevel=6 \\input mylatex.ltx";
 const KILL_GRACE: Duration = Duration::from_millis(500);
 /// How long the pipes may stay open after the compiler has ended.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
@@ -32,9 +37,18 @@ const RUN_TIME_LIMIT: Duration = Duration::from_secs(15 * 60);
 const EVENT_CAPACITY: usize = 1024;
 const MAX_LINE_BYTES: u64 = 64 * 1024;
 const OUTPUT_TAIL_BYTES: usize = 1024 * 1024;
+/// latexmk knows BibTeX, Biber and makeindex, but a glossary or a nomenclature
+/// only through rules that -norc leaves out. Without them both stay empty.
+/// makeindex writes only below its working folder, which `.build` is not.
+const LATEXMK_RULES: &str = "add_cus_dep('glo', 'gls', 0, 'editor_glossaries'); \
+    add_cus_dep('acn', 'acr', 0, 'editor_glossaries'); \
+    add_cus_dep('nlo', 'nls', 0, 'editor_nomenclature'); \
+    sub editor_glossaries { my ($name, $path) = fileparse($_[0]); return system('makeglossaries', '-q', '-d', $path, $name); } \
+    sub editor_nomenclature { my ($name, $path) = fileparse($_[0]); my $here = Cwd::getcwd(); chdir $path; \
+    my $result = system('makeindex', '-q', '-s', 'nomencl.ist', '-o', \"$name.nls\", \"$name.nlo\"); chdir $here; return $result; }";
 /// Files LaTeX carries between runs. A failed or stopped run can leave them
 /// broken, and the next run then fails on them. The PDF is not in this list.
-const LATEX_STATE_EXTENSIONS: &[&str] = &[
+pub(crate) const LATEX_STATE_EXTENSIONS: &[&str] = &[
     "aux", "bbl", "bcf", "blg", "fdb_latexmk", "fls", "idx", "ilg", "ind", "lof", "log", "lot", "nav", "out",
     "run.xml", "snm", "toc", "vrb", "xdv",
 ];
@@ -173,7 +187,9 @@ async fn build(
     if let Err(error) = std::fs::create_dir_all(&output_directory) {
         return Some(failure(format!("Cannot create {}: {error}", output_directory.display()), started));
     }
+    tidy::keep_out_of_backups(&output_directory);
     let stem = request.main.file_stem().map_or_else(|| "main".into(), |stem| stem.to_string_lossy().into_owned());
+    tidy::remove_orphans(&cwd, &output_directory, &stem);
     let input = match request.engine {
         Engine::Typst => request.main.strip_prefix(&request.root).unwrap_or(&request.main),
         _ => Path::new(request.main.file_name().unwrap_or_default()),
@@ -193,7 +209,8 @@ async fn build(
     let is_latex = matches!(request.engine, Engine::PdfLatex | Engine::LuaLatex);
     let log_path = output_directory.join(format!("{stem}.log"));
     let mut cleaned = request.clean;
-    if request.clean {
+    // Only pdfLaTeX uses a format, so after a switch to another LaTeX the old one is of no use.
+    if request.clean || matches!(request.engine, Engine::LuaLatex | Engine::Tectonic) {
         preamble::remove_formats(&output_directory, None);
     }
     let mut format = if request.engine == Engine::PdfLatex && !request.clean {
@@ -236,10 +253,12 @@ async fn build(
                 break run;
             }
         };
+        let mut by_latexmk = direct.tool == "latexmk";
         if reruns_by_hand && find_tool("latexmk").is_some() && needs_latexmk(&cwd, &output_directory, &stem) {
             // The full font map, since latexmk's runs would make bitmaps for a missing font.
             let full = invocation(request.engine, &input, &stem, name.as_deref(), true, false);
             run = run_process(&full, &cwd, events, cancelled, group).await?;
+            by_latexmk = true;
         }
         if run.success && request.engine == Engine::PdfLatex && !font_map {
             fontmap::update(&output_directory, &stem);
@@ -253,6 +272,13 @@ async fn build(
                 parse::parse_latex_log(&String::from_utf8_lossy(&log), &cwd)
             }
         };
+        let mut diagnostics = diagnostics;
+        // latexmk fails when BibTeX complains, even when LaTeX made the whole
+        // document. A fresh PDF and a log without errors mean it worked.
+        if by_latexmk && !run.success && !diagnostics.iter().any(|diagnostic| diagnostic.severity == Severity::Error) && written_since(&output_directory.join(format!("{stem}.pdf")), started_at) {
+            run.success = true;
+            diagnostics.extend(bibliography_problems(&output_directory, &stem));
+        }
         // An untested format could be what is wrong, and one normal run decides that.
         if let Some(used) = format.take_if(|used| {
             let log = std::fs::read_to_string(&log_path).ok();
@@ -315,8 +341,33 @@ async fn build(
     })
 }
 
+fn written_since(path: &Path, since: SystemTime) -> bool {
+    std::fs::metadata(path).and_then(|metadata| metadata.modified()).is_ok_and(|modified| modified >= since)
+}
+
+/// A warning when BibTeX found problems in the bibliography that it worked around.
+fn bibliography_problems(output_directory: &Path, stem: &str) -> Option<Diagnostic> {
+    let blg = std::fs::read(output_directory.join(format!("{stem}.blg"))).ok()?;
+    let blg = String::from_utf8_lossy(&blg);
+    let count = blg.lines().find_map(|line| line.trim().strip_prefix("(There were ")?.strip_suffix(" error messages)")?.parse::<usize>().ok()).or_else(|| blg.contains("(There was 1 error message)").then_some(1))?;
+    let example = blg.lines().find(|line| line.contains("is a missing field") || line.starts_with("I was expecting") || line.starts_with("Repeated entry")).map(str::trim);
+    let mut message = format!("BibTeX found {count} problems in the bibliography and skipped over them, so the PDF is complete.");
+    if let Some(example) = example {
+        message.push_str(&format!(" The first: {example}"));
+    }
+    Some(Diagnostic {
+        file: Some(output_directory.join(format!("{stem}.blg"))),
+        line: None,
+        column: None,
+        severity: Severity::Warning,
+        message,
+        ..Default::default()
+    })
+}
+
 /// Whether the last LaTeX run left work that only latexmk does: BibTeX or
-/// Biber for the bibliography, or makeindex for an index.
+/// Biber for the bibliography, or makeindex for an index, a glossary or a
+/// nomenclature.
 fn needs_latexmk(cwd: &Path, output_directory: &Path, stem: &str) -> bool {
     let log = std::fs::read(output_directory.join(format!("{stem}.log"))).unwrap_or_default();
     let log = String::from_utf8_lossy(&log);
@@ -326,7 +377,7 @@ fn needs_latexmk(cwd: &Path, output_directory: &Path, stem: &str) -> bool {
     if asks.iter().any(|ask| log.contains(ask)) || log.contains(&format!("No file {stem}.bbl")) || new_citation {
         return true;
     }
-    if output_directory.join(format!("{stem}.idx")).is_file() || output_directory.join(format!("{stem}.glo")).is_file() {
+    if ["idx", "glo", "nlo"].iter().any(|extension| output_directory.join(format!("{stem}.{extension}")).is_file()) {
         return true;
     }
     // An edited .bib file changes the bibliography without LaTeX noticing.
@@ -412,7 +463,13 @@ async fn prepare_format(
     let (Some(preamble), Some(compiler)) = (Preamble::of(main, output_directory), find_tool("pdflatex")) else {
         return Some(None);
     };
-    match preamble.state() {
+    let state = preamble.state();
+    // Only this preamble's format is of use. A new preamble may still be undone,
+    // so the old format stays until the new one settles.
+    if state != State::New {
+        preamble.remove_others();
+    }
+    match state {
         State::New => {
             preamble.mark_seen();
             Some(None)
@@ -420,7 +477,6 @@ async fn prepare_format(
         State::Unsuitable => Some(None),
         State::Untested | State::Trusted => Some(Some(preamble)),
         State::Wanted => {
-            preamble.remove_others();
             let name = preamble.name();
             let args = [
                 "-ini",
@@ -430,7 +486,8 @@ async fn prepare_format(
                 &format!("-output-directory={OUTPUT_DIRECTORY}"),
                 &format!("-jobname={name}"),
                 "&pdflatex",
-                "mylatex.ltx",
+                // Kept in the format, so every build with it compresses less.
+                PDF_COMPRESSION,
                 input,
             ];
             let build = Invocation {
@@ -466,7 +523,10 @@ fn latex_invocation(engine: Engine, input: &str, format: Option<&str>, latexmk: 
     if latexmk && find_tool("latexmk").is_some() {
         // -norc ignores latexmkrc files, which can run arbitrary commands from a project.
         let mode = if engine == Engine::LuaLatex { "-lualatex" } else { "-pdf" };
-        let mut args = vec!["-norc".to_string(), mode.to_string()];
+        // -f carries on past BibTeX's complaints, such as a missing field in
+        // one entry, which otherwise stop latexmk before LaTeX reads the
+        // bibliography. LaTeX's own log still decides whether the build worked.
+        let mut args = vec!["-norc".to_string(), "-f".to_string(), mode.to_string(), "-e".to_string(), LATEXMK_RULES.to_string()];
         args.extend(common.iter().map(ToString::to_string));
         if let Some(format) = format {
             args.push(format!("-pdflatex=pdflatex %O \"&{format}\" %S"));
@@ -546,7 +606,7 @@ async fn run_process(
     command
         .args(&invocation.args)
         .current_dir(cwd)
-        .env("PATH", child_path())
+        .envs(child_env())
         .envs(invocation.env.iter().map(|(name, value)| (*name, value.as_str())))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -731,6 +791,20 @@ mod tests {
         };
         assert!(!outcome.success);
         assert_eq!(outcome.diagnostics[0].file.as_deref(), Some(main.as_path()));
+    }
+
+    #[test]
+    fn bibliography_problems_become_one_warning() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(bibliography_problems(directory.path(), "main").is_none());
+        let blg = "Database file #1: references.bib\n`journal' is a missing field, not a string, for entry a2020\nwhile executing---line 1733 of file style.bst\n(There were 44 error messages)\n";
+        std::fs::write(directory.path().join("main.blg"), blg).unwrap();
+        let warning = bibliography_problems(directory.path(), "main").unwrap();
+        assert_eq!(warning.severity, Severity::Warning);
+        assert!(warning.message.starts_with("BibTeX found 44 problems"), "{}", warning.message);
+        assert!(warning.message.contains("for entry a2020"), "{}", warning.message);
+        std::fs::write(directory.path().join("main.blg"), "Database file #1: references.bib\n").unwrap();
+        assert!(bibliography_problems(directory.path(), "main").is_none());
     }
 
     #[test]
@@ -1066,5 +1140,24 @@ mod direct_latex {
         std::fs::write(&main, body("\\cite{knuth} \\cite{lamport}")).unwrap();
         let text = pdf_text(compile(&manager, &main).pdf.as_ref().unwrap());
         assert!(text.contains("Lamport"), "{text}");
+    }
+
+    #[test]
+    #[ignore]
+    fn a_glossary_and_a_nomenclature_get_filled() {
+        let source = "\\documentclass{article}\n\\usepackage{glossaries}\n\\makeglossaries\n\\usepackage{nomencl}\n\\makenomenclature\n\
+                      \\newglossaryentry{filler}{name=filler,description={made-up words}}\n\
+                      \\begin{document}\nSome \\gls{filler}.\\nomenclature{$q$}{a made-up quantity}\n\\printglossaries\n\\printnomenclature\n\\end{document}\n";
+        let manager = BuildManager::new();
+        let directory = tempfile::tempdir().unwrap();
+        let main = directory.path().join("main.tex");
+        std::fs::write(&main, source).unwrap();
+        // The first build, by latexmk, and one more, which LaTeX starts alone.
+        for _ in 0..2 {
+            let outcome = compile(&manager, &main);
+            assert!(outcome.success);
+            let text = pdf_text(outcome.pdf.as_ref().unwrap());
+            assert!(text.contains("made-up words") && text.contains("a made-up quantity"), "{text}");
+        }
     }
 }

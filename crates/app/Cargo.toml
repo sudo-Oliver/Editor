@@ -20,6 +20,8 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 gpui.workspace = true
 gpui_platform.workspace = true
 ignore = "0.4"
+encoding_rs = "0.8"
+flate2 = "1"
 libc = "0.2"
 notify = "8"
 serde = { version = "1", features = ["derive"] }

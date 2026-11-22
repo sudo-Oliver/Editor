@@ -10,6 +10,10 @@ const EXTRA_DIRECTORIES: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin", "/Li
 /// TeX distribution or a Typst the user installed wins.
 static ADDED_DIRECTORIES: RwLock<Vec<PathBuf>> = RwLock::new(Vec::new());
 
+/// Where the compilers the app starts keep what they download, with the
+/// variables that tell them.
+static CACHE_DIRECTORIES: RwLock<Vec<(&'static str, PathBuf)>> = RwLock::new(Vec::new());
+
 /// Directories to search. Apps started from Finder miss the shell's `PATH`, so
 /// the usual install locations are added.
 fn search_path() -> Vec<PathBuf> {
@@ -63,6 +67,23 @@ pub fn child_path() -> OsString {
     std::env::join_paths(search_path()).unwrap_or_default()
 }
 
+/// Makes the compilers the app starts keep their packages in `tectonic` and
+/// `typst`, where the app can show and clear them, instead of in caches of
+/// their own. What they downloaded before stays where it is.
+pub fn set_cache_directories(tectonic: PathBuf, typst: PathBuf) {
+    if let Ok(mut caches) = CACHE_DIRECTORIES.write() {
+        *caches = vec![("TECTONIC_CACHE_DIR", tectonic), ("TYPST_PACKAGE_CACHE_PATH", typst)];
+    }
+}
+
+/// The environment for child processes: `PATH`, and the cache folders once set.
+pub fn child_env() -> Vec<(&'static str, OsString)> {
+    let caches = CACHE_DIRECTORIES.read().map(|caches| caches.clone()).unwrap_or_default();
+    let mut variables = vec![("PATH", child_path())];
+    variables.extend(caches.into_iter().map(|(name, directory)| (name, directory.into_os_string())));
+    variables
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,5 +104,14 @@ mod tests {
 
         remove_directory(directory.path());
         assert_eq!(find_tool(name), None);
+    }
+
+    #[test]
+    fn children_get_the_cache_folders() {
+        assert!(child_env().iter().any(|(name, _)| *name == "PATH"));
+        set_cache_directories(PathBuf::from("/caches/tectonic"), PathBuf::from("/caches/typst"));
+        let variables = child_env();
+        assert!(variables.contains(&("TECTONIC_CACHE_DIR", OsString::from("/caches/tectonic"))));
+        assert!(variables.contains(&("TYPST_PACKAGE_CACHE_PATH", OsString::from("/caches/typst"))));
     }
 }

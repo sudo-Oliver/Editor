@@ -3,7 +3,6 @@
 
 use std::{
     fs, io,
-    hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
 };
 
@@ -22,9 +21,7 @@ pub fn directory() -> Option<PathBuf> {
 }
 
 fn file_for(directory: &Path, path: &Path) -> PathBuf {
-    let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
-    directory.join(format!("{:016x}.json", hasher.finish()))
+    directory.join(format!("{}.json", crate::history::stable_hash(path)))
 }
 
 pub fn write(directory: &Path, path: &Path, text: &str) -> io::Result<()> {
@@ -66,7 +63,7 @@ pub fn pending(directory: &Path, root: &Path) -> Vec<Snapshot> {
         if !snapshot.path.starts_with(root) || process_runs(snapshot.pid) {
             continue;
         }
-        if fs::read(&snapshot.path).is_ok_and(|disk| disk == snapshot.text.as_bytes()) {
+        if crate::text_file::read(&snapshot.path).is_ok_and(|disk| disk.text == snapshot.text) {
             fs::remove_file(&file).ok();
             continue;
         }

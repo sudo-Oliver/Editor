@@ -12,8 +12,12 @@ use serde::{Deserialize, Serialize};
 use crate::picker::fuzzy_score;
 
 /// Neither copied into a template nor out of one.
-const SKIPPED: [&str; 4] = [".build", ".git", ".DS_Store", TEMPLATE_FILE];
+const SKIPPED: [&str; 6] = [".build", ".git", "node_modules", ".editor", ".DS_Store", TEMPLATE_FILE];
 const TEMPLATE_FILE: &str = "template.toml";
+/// Files larger than this are data, not part of a template, and stay behind.
+const MAX_TEMPLATE_FILE: u64 = 50 * 1024 * 1024;
+/// Every new project gets a copy, so a template stays small.
+const MAX_TEMPLATE: u64 = 200 * 1024 * 1024;
 /// Deep enough for chapters in folders, short of walking a whole disk.
 const LANGUAGE_DEPTH: usize = 3;
 
@@ -363,9 +367,18 @@ pub fn save_template(from: &Path, library: &Path, name: &str, description: &str)
         dir = library.join(format!("{base}-{number}"));
         number += 1;
     }
-    copy_tree(from, &dir)?;
+    let plan = plan_copy(from, &dir)?;
+    let bytes: u64 = plan.iter().filter_map(|step| step.bytes).sum();
+    if bytes > MAX_TEMPLATE {
+        let (size, limit) = (crate::storage::human(bytes), crate::storage::human(MAX_TEMPLATE));
+        return Err(io::Error::other(format!("The project holds {size} without its build output, more than the {limit} a template may hold.")));
+    }
     let file = TemplateFile { name: name.to_string(), language: detect_language(from), description: description.trim().to_string() };
-    write_template_file(&dir, &file)?;
+    // Half a template would show up in the library as if it were whole.
+    if let Err(error) = copy_planned(&plan, &dir).and_then(|()| write_template_file(&dir, &file)) {
+        fs::remove_dir_all(&dir).ok();
+        return Err(error);
+    }
     Ok(dir)
 }
 
@@ -397,25 +410,63 @@ fn slug(name: &str) -> String {
     if slug.is_empty() { "template".to_string() } else { slug }
 }
 
-/// Copies a folder, leaving out build output, git history and template metadata.
+/// Copies a folder, leaving out build output, git history, installed
+/// packages, template metadata and files too large for a template.
 pub fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
+    copy_planned(&plan_copy(from, to)?, to)
+}
+
+/// One step of a copy: a folder to make, or a file with its size.
+struct CopyStep {
+    source: PathBuf,
+    target: PathBuf,
+    bytes: Option<u64>,
+}
+
+/// What a copy of `from` to `to` takes along, parents before what is in them.
+fn plan_copy(from: &Path, to: &Path) -> io::Result<Vec<CopyStep>> {
+    fn walk(from: &Path, to: &Path, root: &Path, plan: &mut Vec<CopyStep>) -> io::Result<()> {
+        for entry in fs::read_dir(from)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if SKIPPED.iter().any(|skipped| name == *skipped) {
+                continue;
+            }
+            let source = entry.path();
+            let target = to.join(&name);
+            // A template inside its own project must not copy itself forever.
+            if root.starts_with(&source) {
+                continue;
+            }
+            if entry.file_type()?.is_dir() {
+                plan.push(CopyStep { source: source.clone(), target: target.clone(), bytes: None });
+                walk(&source, &target, root, plan)?;
+            } else {
+                let bytes = match fs::metadata(&source) {
+                    Ok(metadata) => metadata.len(),
+                    // A link to nowhere has nothing to copy.
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                };
+                if bytes <= MAX_TEMPLATE_FILE {
+                    plan.push(CopyStep { source, target, bytes: Some(bytes) });
+                }
+            }
+        }
+        Ok(())
+    }
+    let mut plan = Vec::new();
+    walk(from, to, to, &mut plan)?;
+    Ok(plan)
+}
+
+fn copy_planned(plan: &[CopyStep], to: &Path) -> io::Result<()> {
     fs::create_dir_all(to)?;
-    for entry in fs::read_dir(from)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        if SKIPPED.iter().any(|skipped| name == *skipped) {
-            continue;
-        }
-        let source = entry.path();
-        let target = to.join(&name);
-        // A template inside its own project must not copy itself forever.
-        if to.starts_with(&source) {
-            continue;
-        }
-        if entry.file_type()?.is_dir() {
-            copy_tree(&source, &target)?;
+    for step in plan {
+        if step.bytes.is_some() {
+            fs::copy(&step.source, &step.target)?;
         } else {
-            fs::copy(&source, &target)?;
+            fs::create_dir_all(&step.target)?;
         }
     }
     Ok(())
@@ -596,6 +647,53 @@ mod tests {
         assert!(!to.join(".build").exists());
         assert!(!to.join(".git").exists());
         assert!(!to.join(TEMPLATE_FILE).exists());
+    }
+
+    #[test]
+    fn templates_leave_out_packages_and_large_files_and_refuse_large_projects() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("project");
+        for dir in ["node_modules/x", ".editor", "data"] {
+            fs::create_dir_all(project.join(dir)).unwrap();
+        }
+        fs::write(project.join("main.typ"), "= Hi").unwrap();
+        fs::write(project.join("node_modules/x/index.js"), "x").unwrap();
+        fs::write(project.join(".editor/state"), "x").unwrap();
+        fs::write(project.join(".DS_Store"), "x").unwrap();
+        // Sparse, so the test writes nothing.
+        fs::File::create(project.join("data/video.mov")).unwrap().set_len(MAX_TEMPLATE_FILE + 1).unwrap();
+        let library = directory.path().join("library");
+        let saved = save_template(&project, &library, "Small", "").unwrap();
+        assert!(saved.join("main.typ").is_file());
+        assert!(saved.join("data").is_dir());
+        for left_out in ["node_modules", ".editor", ".DS_Store", "data/video.mov"] {
+            assert!(!saved.join(left_out).exists(), "{left_out}");
+        }
+
+        for part in 0..5 {
+            fs::File::create(project.join(format!("data/part-{part}"))).unwrap().set_len(MAX_TEMPLATE_FILE).unwrap();
+        }
+        let error = save_template(&project, &library, "Large", "").unwrap_err();
+        assert!(error.to_string().contains("200.0 MB a template may hold"), "{error}");
+        assert!(!library.join("Large").exists());
+    }
+
+    #[test]
+    fn a_failed_template_copy_leaves_no_half_template() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("main.tex"), "x").unwrap();
+        std::os::unix::fs::symlink(directory.path().join("missing"), project.join("nowhere")).unwrap();
+        let library = directory.path().join("library");
+        assert!(save_template(&project, &library, "Linked", "").unwrap().join("main.tex").is_file());
+
+        // A file nobody may read fails once the copy has begun.
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(project.join("secret.tex"), "x").unwrap();
+        fs::set_permissions(project.join("secret.tex"), fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(save_template(&project, &library, "Broken", "").is_err());
+        assert!(!library.join("Broken").exists());
     }
 
     #[test]
