@@ -53,6 +53,7 @@ use crate::{
     problems::{self, Problem},
     recovery,
     settings::{self, Settings},
+    storage,
     setup::{SetupEvent, SetupView},
     projects::{self, TemplateLanguage},
     tour::{self, Tour, TourAnchor},
@@ -185,6 +186,7 @@ enum SettingsPage {
     Compiler,
     Tools,
     Shortcuts,
+    Storage,
 }
 
 /// The name field for a new file or folder at the top of the file tree.
@@ -538,6 +540,9 @@ pub struct Workspace {
     recording_shortcut: Option<&'static str>,
     dialog: Option<Dialog>,
     dialog_focus: FocusHandle,
+    /// What the app's folders take, measured each time the storage settings open.
+    storage_usage: Option<storage::Usage>,
+    storage_task: Option<Task<()>>,
     picker: Option<Picker>,
     /// Where `\cite{` last opened the picker by itself.
     citation_trigger: Option<(EntityId, usize)>,
@@ -770,6 +775,8 @@ impl Workspace {
             recording_shortcut: None,
             dialog: None,
             dialog_focus: cx.focus_handle(),
+            storage_usage: None,
+            storage_task: None,
             picker: None,
             citation_trigger: None,
             citation_check_task: None,
@@ -2215,6 +2222,9 @@ impl Workspace {
 
     fn finish_build(&mut self, outcome: BuildOutcome, cx: &mut Context<Self>) {
         self.building = false;
+        if self.dialog == Some(Dialog::Settings(SettingsPage::Storage)) {
+            self.measure_storage(cx);
+        }
         self.status = Some(
             format!(
                 "{} in {:.1} s",
@@ -2673,6 +2683,10 @@ impl Workspace {
         if matches!(dialog, Dialog::Settings(_)) {
             // Tools may have come or gone outside the app since the last look.
             self.toolchain.read(cx).forget_found();
+        }
+        if dialog == Dialog::Settings(SettingsPage::Storage) {
+            self.storage_usage = None;
+            self.measure_storage(cx);
         }
         self.open_menu = None;
         self.dialog = Some(dialog);
@@ -7445,6 +7459,188 @@ impl Workspace {
         elements
     }
 
+    /// Where the build of the open project writes, as `recompile` and the runner decide it.
+    fn build_directory(&self, cx: &App) -> Option<PathBuf> {
+        let root = self.root.clone()?;
+        let active = self.active_view().and_then(|view| view.read(cx).path.clone());
+        let main = self.last_main.clone().or_else(|| find_main(&root, &self.config, active.as_deref()));
+        let engine = self.config.engine.or_else(|| main.as_deref().and_then(Engine::for_path));
+        let folder = match main {
+            Some(main) if engine != Some(Engine::Typst) => main.parent().map_or_else(|| root.clone(), Path::to_path_buf),
+            _ => root,
+        };
+        Some(folder.join(build::OUTPUT_DIRECTORY))
+    }
+
+    /// Measures in the background, since walking gigabytes of tools takes a while.
+    fn measure_storage(&mut self, cx: &mut Context<Self>) {
+        let build = self.build_directory(cx);
+        self.storage_task = Some(cx.spawn(async move |this, cx| {
+            let usage = cx.background_spawn(async move { storage::measure(build.as_deref()) }).await;
+            this.update(cx, |this, cx| {
+                this.storage_usage = Some(usage);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Clears away from the UI thread, then measures again.
+    fn clear_storage(&mut self, part: &'static str, clear: impl FnOnce() -> std::io::Result<()> + Send + 'static, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let cleared = cx.background_spawn(async move { clear() }).await;
+            this.update(cx, |this, cx| {
+                match cleared {
+                    Ok(()) => this.set_status(format!("{part} cleared."), cx),
+                    Err(error) => this.set_status(format!("Cannot clear {}: {error}", part.to_lowercase()), cx),
+                }
+                this.measure_storage(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Nothing brings the versions back, so it asks first.
+    fn clear_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(directory) = history::directory() else {
+            return;
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let detail = "Earlier versions of every file go away, also of deleted files. The files themselves stay as they are.";
+            if ask(&this, cx, PromptLevel::Warning, "Clear the file history?", detail, &["Clear history", "Cancel"]).await != Some(0) {
+                return;
+            }
+            this.update(cx, |this, cx| this.clear_storage("File history", move || history::clear(&directory), cx)).ok();
+        })
+        .detach();
+    }
+
+    /// The colors of a Neovim theme in use stay, since the next start reads them from the cache.
+    fn clear_caches(&mut self, cx: &mut Context<Self>) {
+        let theme = self.settings.theme.clone().filter(|name| theme::built_in(name).is_none());
+        self.clear_storage(
+            "Caches",
+            move || {
+                let kept = theme.zip(nvim_themes::cache_path()).and_then(|(name, path)| {
+                    let palette = nvim_themes::load_cache(&path).remove(&name)?;
+                    Some((path, nvim_themes::Themes::from([(name, palette)])))
+                });
+                storage::clear_caches()?;
+                kept.map_or(Ok(()), |(path, themes)| nvim_themes::save_cache(&path, &themes))
+            },
+            cx,
+        );
+    }
+
+    fn render_storage_settings(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let palette = theme::palette();
+        let usage = self.storage_usage.as_ref();
+        // The sizes stand in one column at the right, with "…" while measuring.
+        let row = |button: Option<AnyElement>, bytes: Option<u64>| {
+            div().flex().flex_none().items_center().gap(px(12.)).children(button).child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .justify_end()
+                    .w(px(64.))
+                    .text_color(theme::color(palette.ui_muted))
+                    .child(bytes.map_or_else(|| "…".to_string(), storage::human)),
+            )
+        };
+        let size = |part: fn(&storage::Usage) -> u64| usage.map(part);
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let shown = |path: &Path| match home.as_deref().and_then(|home| path.strip_prefix(home).ok()) {
+            Some(rest) => format!("~/{}", rest.display()),
+            None => path.display().to_string(),
+        };
+        let installing = self.toolchain.read(cx).busy();
+        let limit = history::TOTAL_LIMIT / (1024 * 1024);
+        let mut elements = vec![
+            div()
+                .flex_none()
+                .pb(px(4.))
+                .text_color(theme::color(palette.ui_muted))
+                .child(match usage {
+                    Some(usage) => format!("The app keeps {} outside your projects.", storage::human(usage.total)),
+                    None => "Measuring what the app keeps outside your projects…".to_string(),
+                })
+                .into_any_element(),
+            Self::setting_row(
+                "File history",
+                format!("Earlier versions of your files. Compressed and at most {limit} MB in total, so older versions thin out over time."),
+                row(
+                    Some(self.settings_button("clear-history", "Clear history", cx, |this, window, cx| this.clear_history(window, cx)).into_any_element()),
+                    size(|usage| usage.history),
+                ),
+            )
+            .into_any_element(),
+            Self::setting_row(
+                "Crash recovery copies",
+                "Unsaved text, so that a crash loses at most a few seconds. Gone once saved.",
+                row(None, size(|usage| usage.recovery)),
+            )
+            .into_any_element(),
+            Self::setting_row("Installed tools", "Tectonic, Typst and Pandoc. Remove them under Writing tools.", row(None, size(|usage| usage.tools)))
+                .into_any_element(),
+            Self::setting_row("Add-ons", "Remove them in the Add-ons panel.", row(None, size(|usage| usage.addons))).into_any_element(),
+            Self::setting_row("Templates", "Your own templates. Remove them on the Home screen under Templates.", row(None, size(|usage| usage.templates)))
+                .into_any_element(),
+            Self::setting_row(
+                "Downloads",
+                if installing {
+                    "Installs that did not finish, so that a second try continues. In use while an install runs."
+                } else {
+                    "Installs that did not finish, so that a second try continues. Gone after two weeks."
+                },
+                row(
+                    (!installing).then(|| {
+                        self.settings_button("clear-downloads", "Clear", cx, |this, _, cx| {
+                            this.clear_storage("Downloads", || storage::downloads_dir().map_or(Ok(()), |downloads| storage::clear(&downloads)), cx);
+                        })
+                        .into_any_element()
+                    }),
+                    size(|usage| usage.downloads),
+                ),
+            )
+            .into_any_element(),
+            Self::setting_row(
+                "Caches",
+                "Lists of themes and LaTeX commands, made again when needed.",
+                row(Some(self.settings_button("clear-caches", "Clear", cx, |this, _, cx| this.clear_caches(cx)).into_any_element()), size(|usage| usage.caches)),
+            )
+            .into_any_element(),
+        ];
+        if let Some(root) = &self.root {
+            let name = root.file_name().map_or_else(|| shown(root), |name| name.to_string_lossy().into_owned());
+            elements.push(
+                Self::setting_row(
+                    "Build output",
+                    format!("The .build folder of {name}, which makes the next build fast. Recompiling from scratch starts it over."),
+                    row(
+                        Some(self.settings_button("storage-recompile", "Recompile from scratch", cx, |this, _, cx| this.recompile_from_scratch(cx)).into_any_element()),
+                        usage.and_then(|usage| usage.build),
+                    ),
+                )
+                .into_any_element(),
+            );
+        }
+        for (id, title, folder) in [("show-data", "App folder", storage::data_dir()), ("show-cache", "Cache folder", storage::cache_dir())] {
+            let Some(folder) = folder else {
+                continue;
+            };
+            elements.push(
+                Self::setting_row(
+                    title,
+                    shown(&folder),
+                    self.settings_button(id, "Show in Finder", cx, move |_, _, cx| cx.reveal_path(&folder)),
+                )
+                .into_any_element(),
+            );
+        }
+        elements
+    }
+
     fn render_tool_settings(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut elements = vec![
             div()
@@ -7791,6 +7987,10 @@ impl Workspace {
             .when(page == current, |style| style.bg(theme::color(theme::palette().accent_soft)).font_weight(FontWeight::SEMIBOLD))
             .when(page != current, |style| style.hover(|style| style.bg(theme::color(theme::palette().divider))))
             .on_click(cx.listener(move |this, _, _, cx| {
+                if page == SettingsPage::Storage && this.dialog != Some(Dialog::Settings(page)) {
+                    this.storage_usage = None;
+                    this.measure_storage(cx);
+                }
                 this.dialog = Some(Dialog::Settings(page));
                 this.recording_shortcut = None;
                 cx.notify();
@@ -7813,6 +8013,7 @@ impl Workspace {
             Dialog::Settings(SettingsPage::Compiler) => self.render_compiler_settings(cx),
             Dialog::Settings(SettingsPage::Tools) => self.render_tool_settings(cx),
             Dialog::Settings(SettingsPage::Shortcuts) => self.render_shortcut_settings(cx),
+            Dialog::Settings(SettingsPage::Storage) => self.render_storage_settings(cx),
             Dialog::Shortcuts => self.render_shortcuts(),
             Dialog::WordCount => self.render_word_count(),
             #[cfg(feature = "collab")]
@@ -7886,7 +8087,8 @@ impl Workspace {
                                             .child(self.settings_tab(SettingsPage::Editor, page, "Editor", cx))
                                             .child(self.settings_tab(SettingsPage::Compiler, page, "Compiler", cx))
                                             .child(self.settings_tab(SettingsPage::Tools, page, "Writing tools", cx))
-                                            .child(self.settings_tab(SettingsPage::Shortcuts, page, "Shortcuts", cx)),
+                                            .child(self.settings_tab(SettingsPage::Shortcuts, page, "Shortcuts", cx))
+                                            .child(self.settings_tab(SettingsPage::Storage, page, "Storage", cx)),
                                     )
                                 },
                             )
