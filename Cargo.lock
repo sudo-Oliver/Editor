@@ -227,6 +227,7 @@ dependencies = [
  "collab",
  "editor_core",
  "encoding_rs",
+ "flate2",
  "git",
  "gpui",
  "gpui_platform",

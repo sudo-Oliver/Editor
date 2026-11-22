@@ -29,6 +29,8 @@ pub fn decode(bytes: Vec<u8>) -> io::Result<Loaded> {
 
 /// Larger files are data or logs, not writing, and would stall the editor.
 pub const MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// Larger files are not kept in the history when they go to the Trash.
+pub const HISTORY_LIMIT: u64 = 8 * 1024 * 1024;
 
 pub fn read(path: &Path) -> io::Result<Loaded> {
     let size = fs::metadata(path)?.len();

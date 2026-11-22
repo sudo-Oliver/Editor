@@ -3,7 +3,6 @@
 
 use std::{
     fs, io,
-    hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
 };
 
@@ -22,9 +21,7 @@ pub fn directory() -> Option<PathBuf> {
 }
 
 fn file_for(directory: &Path, path: &Path) -> PathBuf {
-    let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
-    directory.join(format!("{:016x}.json", hasher.finish()))
+    directory.join(format!("{}.json", crate::history::stable_hash(path)))
 }
 
 pub fn write(directory: &Path, path: &Path, text: &str) -> io::Result<()> {

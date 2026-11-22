@@ -3723,8 +3723,9 @@ impl Workspace {
             let target = path.clone();
             let trashed = cx
                 .background_spawn(async move {
-                    // Also safe from emptying the Trash.
-                    if target.is_file()
+                    // Also safe from emptying the Trash. Writing is text, so a big
+                    // file such as a video has no place in the history.
+                    if std::fs::metadata(&target).is_ok_and(|metadata| metadata.is_file() && metadata.len() <= text_file::HISTORY_LIMIT)
                         && let Some(directory) = history::directory()
                     {
                         history::keep_disk(&directory, &target).ok();
@@ -4093,7 +4094,7 @@ impl Workspace {
 
     /// Puts an earlier version in place as one edit, which undo takes back.
     fn restore_version(&mut self, path: PathBuf, item: PickerItem, cx: &mut Context<Self>) {
-        let loaded = match std::fs::read(&item.path).and_then(text_file::decode) {
+        let loaded = match history::read(&item.path).and_then(text_file::decode) {
             Ok(loaded) => loaded,
             Err(error) => return self.set_status(format!("Cannot read that version: {error}"), cx),
         };
@@ -8499,7 +8500,7 @@ fn history_items(versions: &[history::Version], current: &str) -> Vec<PickerItem
     versions
         .iter()
         .map(|version| {
-            let text = std::fs::read(&version.file).ok().and_then(|bytes| text_file::decode(bytes).ok()).map(|loaded| loaded.text);
+            let text = history::read(&version.file).ok().and_then(|bytes| text_file::decode(bytes).ok()).map(|loaded| loaded.text);
             let changes = match text.as_deref().map(|text| editor_core::line_diff::line_diff(current, text)) {
                 Some(Some(hunks)) if hunks.is_empty() => "Same as now".to_string(),
                 Some(Some(hunks)) => {
@@ -8513,7 +8514,7 @@ fn history_items(versions: &[history::Version], current: &str) -> Vec<PickerItem
                 label: projects::ago(now, version.time),
                 position: None,
                 summary: None,
-                detail: Some(format!("{changes} · {} KB", version.size.div_ceil(1024))),
+                detail: Some(changes),
             }
         })
         .collect()
