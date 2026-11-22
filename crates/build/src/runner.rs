@@ -25,6 +25,9 @@ use crate::{
 
 const OUTPUT_DIRECTORY: &str = ".build";
 const MAX_LATEX_RUNS: usize = 3;
+/// zlib's own default. pdfTeX's 9 spends a quarter of a build on compressing the
+/// PDF and its images, for a file only about 4% smaller.
+const PDF_COMPRESSION: &str = "\\pdfcompresslevel=6 \\input mylatex.ltx";
 const KILL_GRACE: Duration = Duration::from_millis(500);
 /// How long the pipes may stay open after the compiler has ended.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
@@ -236,10 +239,12 @@ async fn build(
                 break run;
             }
         };
+        let mut by_latexmk = direct.tool == "latexmk";
         if reruns_by_hand && find_tool("latexmk").is_some() && needs_latexmk(&cwd, &output_directory, &stem) {
             // The full font map, since latexmk's runs would make bitmaps for a missing font.
             let full = invocation(request.engine, &input, &stem, name.as_deref(), true, false);
             run = run_process(&full, &cwd, events, cancelled, group).await?;
+            by_latexmk = true;
         }
         if run.success && request.engine == Engine::PdfLatex && !font_map {
             fontmap::update(&output_directory, &stem);
@@ -253,6 +258,13 @@ async fn build(
                 parse::parse_latex_log(&String::from_utf8_lossy(&log), &cwd)
             }
         };
+        let mut diagnostics = diagnostics;
+        // latexmk fails when BibTeX complains, even when LaTeX made the whole
+        // document. A fresh PDF and a log without errors mean it worked.
+        if by_latexmk && !run.success && !diagnostics.iter().any(|diagnostic| diagnostic.severity == Severity::Error) && written_since(&output_directory.join(format!("{stem}.pdf")), started_at) {
+            run.success = true;
+            diagnostics.extend(bibliography_problems(&output_directory, &stem));
+        }
         // An untested format could be what is wrong, and one normal run decides that.
         if let Some(used) = format.take_if(|used| {
             let log = std::fs::read_to_string(&log_path).ok();
@@ -312,6 +324,30 @@ async fn build(
         synctex: (request.engine.has_synctex() && synctex.is_file()).then_some(synctex),
         diagnostics,
         duration: started.elapsed(),
+    })
+}
+
+fn written_since(path: &Path, since: SystemTime) -> bool {
+    std::fs::metadata(path).and_then(|metadata| metadata.modified()).is_ok_and(|modified| modified >= since)
+}
+
+/// A warning when BibTeX found problems in the bibliography that it worked around.
+fn bibliography_problems(output_directory: &Path, stem: &str) -> Option<Diagnostic> {
+    let blg = std::fs::read(output_directory.join(format!("{stem}.blg"))).ok()?;
+    let blg = String::from_utf8_lossy(&blg);
+    let count = blg.lines().find_map(|line| line.trim().strip_prefix("(There were ")?.strip_suffix(" error messages)")?.parse::<usize>().ok()).or_else(|| blg.contains("(There was 1 error message)").then_some(1))?;
+    let example = blg.lines().find(|line| line.contains("is a missing field") || line.starts_with("I was expecting") || line.starts_with("Repeated entry")).map(str::trim);
+    let mut message = format!("BibTeX found {count} problems in the bibliography and skipped over them, so the PDF is complete.");
+    if let Some(example) = example {
+        message.push_str(&format!(" The first: {example}"));
+    }
+    Some(Diagnostic {
+        file: Some(output_directory.join(format!("{stem}.blg"))),
+        line: None,
+        column: None,
+        severity: Severity::Warning,
+        message,
+        ..Default::default()
     })
 }
 
@@ -430,7 +466,8 @@ async fn prepare_format(
                 &format!("-output-directory={OUTPUT_DIRECTORY}"),
                 &format!("-jobname={name}"),
                 "&pdflatex",
-                "mylatex.ltx",
+                // Kept in the format, so every build with it compresses less.
+                PDF_COMPRESSION,
                 input,
             ];
             let build = Invocation {
@@ -466,7 +503,10 @@ fn latex_invocation(engine: Engine, input: &str, format: Option<&str>, latexmk: 
     if latexmk && find_tool("latexmk").is_some() {
         // -norc ignores latexmkrc files, which can run arbitrary commands from a project.
         let mode = if engine == Engine::LuaLatex { "-lualatex" } else { "-pdf" };
-        let mut args = vec!["-norc".to_string(), mode.to_string()];
+        // -f carries on past BibTeX's complaints, such as a missing field in
+        // one entry, which otherwise stop latexmk before LaTeX reads the
+        // bibliography. LaTeX's own log still decides whether the build worked.
+        let mut args = vec!["-norc".to_string(), "-f".to_string(), mode.to_string()];
         args.extend(common.iter().map(ToString::to_string));
         if let Some(format) = format {
             args.push(format!("-pdflatex=pdflatex %O \"&{format}\" %S"));
@@ -731,6 +771,20 @@ mod tests {
         };
         assert!(!outcome.success);
         assert_eq!(outcome.diagnostics[0].file.as_deref(), Some(main.as_path()));
+    }
+
+    #[test]
+    fn bibliography_problems_become_one_warning() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(bibliography_problems(directory.path(), "main").is_none());
+        let blg = "Database file #1: references.bib\n`journal' is a missing field, not a string, for entry a2020\nwhile executing---line 1733 of file style.bst\n(There were 44 error messages)\n";
+        std::fs::write(directory.path().join("main.blg"), blg).unwrap();
+        let warning = bibliography_problems(directory.path(), "main").unwrap();
+        assert_eq!(warning.severity, Severity::Warning);
+        assert!(warning.message.starts_with("BibTeX found 44 problems"), "{}", warning.message);
+        assert!(warning.message.contains("for entry a2020"), "{}", warning.message);
+        std::fs::write(directory.path().join("main.blg"), "Database file #1: references.bib\n").unwrap();
+        assert!(bibliography_problems(directory.path(), "main").is_none());
     }
 
     #[test]

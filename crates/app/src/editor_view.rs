@@ -313,10 +313,11 @@ impl EditorView {
         let Some(base) = self.diff_base.clone() else {
             return;
         };
-        let text = self.state.buffer().to_string();
+        // Cloning the buffer is cheap, and the text is built away from typing.
+        let buffer = self.state.buffer().clone();
         self.diff_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(delay).await;
-            let hunks = cx.background_spawn(async move { line_diff(&base, &text).unwrap_or_default() }).await;
+            let hunks = cx.background_spawn(async move { line_diff(&base, &buffer.to_string()).unwrap_or_default() }).await;
             this.update(cx, |this, cx| {
                 this.diff_task = None;
                 if this.diff_hunks != hunks {
