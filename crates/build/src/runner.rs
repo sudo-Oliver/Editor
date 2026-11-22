@@ -23,7 +23,8 @@ use crate::{
     tools::{child_path, find_tool},
 };
 
-const OUTPUT_DIRECTORY: &str = ".build";
+/// Where a build writes: in the main file's folder, or in the project for Typst.
+pub const OUTPUT_DIRECTORY: &str = ".build";
 const MAX_LATEX_RUNS: usize = 3;
 /// zlib's own default. pdfTeX's 9 spends a quarter of a build on compressing the
 /// PDF and its images, for a file only about 4% smaller.
