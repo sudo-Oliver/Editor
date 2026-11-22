@@ -35,6 +35,15 @@ const RUN_TIME_LIMIT: Duration = Duration::from_secs(15 * 60);
 const EVENT_CAPACITY: usize = 1024;
 const MAX_LINE_BYTES: u64 = 64 * 1024;
 const OUTPUT_TAIL_BYTES: usize = 1024 * 1024;
+/// latexmk knows BibTeX, Biber and makeindex, but a glossary or a nomenclature
+/// only through rules that -norc leaves out. Without them both stay empty.
+/// makeindex writes only below its working folder, which `.build` is not.
+const LATEXMK_RULES: &str = "add_cus_dep('glo', 'gls', 0, 'editor_glossaries'); \
+    add_cus_dep('acn', 'acr', 0, 'editor_glossaries'); \
+    add_cus_dep('nlo', 'nls', 0, 'editor_nomenclature'); \
+    sub editor_glossaries { my ($name, $path) = fileparse($_[0]); return system('makeglossaries', '-q', '-d', $path, $name); } \
+    sub editor_nomenclature { my ($name, $path) = fileparse($_[0]); my $here = Cwd::getcwd(); chdir $path; \
+    my $result = system('makeindex', '-q', '-s', 'nomencl.ist', '-o', \"$name.nls\", \"$name.nlo\"); chdir $here; return $result; }";
 /// Files LaTeX carries between runs. A failed or stopped run can leave them
 /// broken, and the next run then fails on them. The PDF is not in this list.
 const LATEX_STATE_EXTENSIONS: &[&str] = &[
@@ -352,7 +361,8 @@ fn bibliography_problems(output_directory: &Path, stem: &str) -> Option<Diagnost
 }
 
 /// Whether the last LaTeX run left work that only latexmk does: BibTeX or
-/// Biber for the bibliography, or makeindex for an index.
+/// Biber for the bibliography, or makeindex for an index, a glossary or a
+/// nomenclature.
 fn needs_latexmk(cwd: &Path, output_directory: &Path, stem: &str) -> bool {
     let log = std::fs::read(output_directory.join(format!("{stem}.log"))).unwrap_or_default();
     let log = String::from_utf8_lossy(&log);
@@ -362,7 +372,7 @@ fn needs_latexmk(cwd: &Path, output_directory: &Path, stem: &str) -> bool {
     if asks.iter().any(|ask| log.contains(ask)) || log.contains(&format!("No file {stem}.bbl")) || new_citation {
         return true;
     }
-    if output_directory.join(format!("{stem}.idx")).is_file() || output_directory.join(format!("{stem}.glo")).is_file() {
+    if ["idx", "glo", "nlo"].iter().any(|extension| output_directory.join(format!("{stem}.{extension}")).is_file()) {
         return true;
     }
     // An edited .bib file changes the bibliography without LaTeX noticing.
@@ -506,7 +516,7 @@ fn latex_invocation(engine: Engine, input: &str, format: Option<&str>, latexmk: 
         // -f carries on past BibTeX's complaints, such as a missing field in
         // one entry, which otherwise stop latexmk before LaTeX reads the
         // bibliography. LaTeX's own log still decides whether the build worked.
-        let mut args = vec!["-norc".to_string(), "-f".to_string(), mode.to_string()];
+        let mut args = vec!["-norc".to_string(), "-f".to_string(), mode.to_string(), "-e".to_string(), LATEXMK_RULES.to_string()];
         args.extend(common.iter().map(ToString::to_string));
         if let Some(format) = format {
             args.push(format!("-pdflatex=pdflatex %O \"&{format}\" %S"));
@@ -1120,5 +1130,24 @@ mod direct_latex {
         std::fs::write(&main, body("\\cite{knuth} \\cite{lamport}")).unwrap();
         let text = pdf_text(compile(&manager, &main).pdf.as_ref().unwrap());
         assert!(text.contains("Lamport"), "{text}");
+    }
+
+    #[test]
+    #[ignore]
+    fn a_glossary_and_a_nomenclature_get_filled() {
+        let source = "\\documentclass{article}\n\\usepackage{glossaries}\n\\makeglossaries\n\\usepackage{nomencl}\n\\makenomenclature\n\
+                      \\newglossaryentry{filler}{name=filler,description={made-up words}}\n\
+                      \\begin{document}\nSome \\gls{filler}.\\nomenclature{$q$}{a made-up quantity}\n\\printglossaries\n\\printnomenclature\n\\end{document}\n";
+        let manager = BuildManager::new();
+        let directory = tempfile::tempdir().unwrap();
+        let main = directory.path().join("main.tex");
+        std::fs::write(&main, source).unwrap();
+        // The first build, by latexmk, and one more, which LaTeX starts alone.
+        for _ in 0..2 {
+            let outcome = compile(&manager, &main);
+            assert!(outcome.success);
+            let text = pdf_text(outcome.pdf.as_ref().unwrap());
+            assert!(text.contains("made-up words") && text.contains("a made-up quantity"), "{text}");
+        }
     }
 }
