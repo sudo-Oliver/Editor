@@ -139,13 +139,10 @@ impl SetupView {
     }
 
     /// What has to be installed, smallest first, so that something works soon.
+    /// MacTeX comes alone: one long download, and then everything works,
+    /// rather than a second LaTeX that behaves differently in the meantime.
     fn to_install(&self, cx: &App) -> Vec<Tool> {
         let mut tools: Vec<Tool> = self.chosen().into_iter().filter(|tool| !self.has(*tool, cx)).collect();
-        // MacTeX takes a while to download. Tectonic is small, so the user can
-        // start writing after a minute, and MacTeX takes over once it is there.
-        if tools.contains(&Tool::MacTex) && self.way != Way::Manual && !self.ready(Tool::Tectonic, cx) && Tool::Tectonic.installable() {
-            tools.push(Tool::Tectonic);
-        }
         tools.sort_by_key(|tool| tool.installed_megabytes());
         tools
     }
@@ -474,7 +471,7 @@ impl SetupView {
                     .child(self.option(
                         "setup-mactex",
                         "Complete (recommended)",
-                        format!("Every package at once, also offline. A {mactex} download, but you can start writing after a minute."),
+                        format!("Every package at once. One {mactex} download, then everything works, also offline."),
                         self.full_latex,
                         cx,
                         |this, cx| {
@@ -608,12 +605,10 @@ impl SetupView {
                     .into_any_element(),
             );
         }
-        if to_install.contains(&Tool::MacTex) && to_install.contains(&Tool::Tectonic) {
+        if to_install.contains(&Tool::MacTex) {
             elements.push(paragraph(
-                "You can start writing after about a minute: the small LaTeX comes first. The complete one keeps downloading in the background, about 15 minutes on a fast connection, and takes over once it is there.",
+                "The complete LaTeX is one long download: on a fast connection about 15 minutes, on a slow one longer. The setup shows how long it still takes. After that, everything works offline, and updates come from inside the app.",
             ));
-        } else if to_install.contains(&Tool::MacTex) {
-            elements.push(paragraph("The complete LaTeX is a large download: on a fast connection about 15 minutes, on a slow one longer. The setup shows how long it still takes."));
         }
         if passwords > 0 && self.way != Way::Manual {
             elements.push(paragraph(if passwords == 1 {
@@ -697,9 +692,10 @@ impl SetupView {
         } else if busy {
             // Waiting here beats a document without a PDF that nobody can explain.
             let left = self.toolchain.read(cx).jobs.values().filter_map(toolchain::Job::remaining).max();
+            let once = if self.toolchain.read(cx).installing(Tool::MacTex) { " You wait only this once: afterwards LaTeX works offline." } else { "" };
             elements.push(paragraph(match left {
-                Some(left) => format!("Please wait, {} left. The setup then tests everything and tells you when you can start.", toolchain::spoken(left)),
-                None => "Please wait until this is done. The setup then tests everything and tells you when you can start.".to_string(),
+                Some(left) => format!("Please wait, {} left.{once} The setup then tests everything and tells you when you can start.", toolchain::spoken(left)),
+                None => format!("Please wait until this is done.{once} The setup then tests everything and tells you when you can start."),
             }));
         } else {
             let left = self.to_install(cx);
