@@ -81,8 +81,14 @@ pub fn parse(text: &str) -> Vec<Entry> {
             continue;
         }
         let body = &rest[open + 1..];
-        let end = body_end(body, rest.as_bytes()[open] == b'(');
-        rest = &body[(end + 1).min(body.len())..];
+        let mut end = body_end(body, rest.as_bytes()[open] == b'(');
+        if end == body.len() {
+            // Never closed: it ends where the next entry starts a line, as BibTeX recovers.
+            end = body.find("\n@").map_or(end, |line| line + 1);
+            rest = &body[end..];
+        } else {
+            rest = &body[end + 1..];
+        }
         if kind == "string" {
             let defined = parse_fields(&body[..end], &macros);
             macros.extend(defined);
@@ -523,6 +529,54 @@ mod tests {
 \endentry";
         let letters = bbl_letters(biblatex);
         assert_eq!((letters["one"], letters["two"]), (Some('b'), None));
+    }
+
+    /// A made-up bibliography, as large as they grow over a career.
+    fn large_bib(entries: usize) -> String {
+        let surnames = [r#"M{\"u}ller"#, "Schmidt", "{van der Berg}", "O'Neil", "Nakamura", r"Dvo{\v r}{\'a}k"];
+        let mut text = String::from("@string{jfill = \"Journal of Filler\"}\n");
+        for index in 0..entries {
+            let surname = surnames[index % surnames.len()];
+            let year = 1950 + index % 70;
+            text.push_str(&match index % 3 {
+                0 => format!("@article{{key{index},\n  author = {{{surname}, Alex and Other, Bo}},\n  title = {{Filler Title {index}}},\n  journal = jfill,\n  year = {year},\n}}\n\n"),
+                1 => format!("@book(key{index}, author = \"{surname}, Alex\", title = \"Filler {{Book}} {index}\", publisher = {{Filler Press}}, date = {{{year}-01-02}})\n"),
+                _ => format!("@misc{{key{index}, editor = {{{surname}, Alex and Other, Bo and others}}, title = {{Note}} # \" \" # {{{index}}}}}\n"),
+            });
+        }
+        text
+    }
+
+    #[test]
+    fn twenty_thousand_entries_parse_and_sort() {
+        let text = large_bib(20_000);
+        let started = std::time::Instant::now();
+        let entries = parse(&text);
+        assert_eq!(entries.len(), 20_000);
+        assert_eq!(entries[0].authors, "Müller and Other");
+        assert_eq!(entries[0].venue, "Journal of Filler");
+        assert_eq!((entries[1].authors.as_str(), entries[1].year.as_str()), ("Schmidt", "1951"));
+        assert_eq!(entries[2].title, "Note 2");
+        assert_eq!(entries[5].authors, "Dvořák et al.");
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("large.bib");
+        std::fs::write(&path, &text).unwrap();
+        let items = citation_items(std::slice::from_ref(&path), None);
+        assert_eq!(items.len(), 20_000);
+        let firsts: Vec<String> = items.iter().map(|item| fold(item.summary.as_deref().unwrap_or_default())).collect();
+        assert!(firsts.windows(2).all(|pair| pair[0].split(' ').next() <= pair[1].split(' ').next()), "sorted by author");
+        // Authors and years repeat, so the letters tell them apart.
+        assert!(items.iter().any(|item| item.summary.as_deref().is_some_and(|summary| summary.ends_with('b'))));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+    }
+
+    /// One entry without its closing brace must not take the rest of the file with it.
+    #[test]
+    fn an_unclosed_entry_loses_only_itself() {
+        let text = "@article{first, title = {One}, year = 2001}\n@article{broken, title = {Never closed, year = 2002\n\n@book{after, title = {Two}, year = 2003}\n@misc{last, title = {Three}}\n";
+        let keys: Vec<String> = parse(text).into_iter().map(|entry| entry.key).collect();
+        assert_eq!(keys, ["first", "broken", "after", "last"]);
     }
 
     #[test]
