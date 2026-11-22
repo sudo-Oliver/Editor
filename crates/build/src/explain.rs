@@ -204,6 +204,13 @@ fn explain_latex(message: &str, context: Option<&str>) -> Option<Explanation> {
             "Check the name, or add \\label{…} where the reference should point.",
         );
     }
+    if message.contains("You have requested") && let Some(package) = between(message, "of package ", ",").or_else(|| message.split_once("of package ").map(|(_, rest)| rest.trim())) {
+        return Some(Explanation {
+            title: format!("The package {package} is older than this document needs"),
+            hint: "Update your LaTeX packages, then click Recompile.".to_string(),
+            fix: Some(Fix::UpdateLatex),
+        });
+    }
     if message.starts_with("Overfull") {
         return found("A line sticks out past the margin", "This does not stop the build. Rephrase the text or make the image or table smaller.");
     }
@@ -265,10 +272,11 @@ fn missing_file(name: &str) -> Option<Explanation> {
         if let Some(closest) = closest_package(package) {
             return found(format!("The package {package} is not installed"), format!("Did you mean {closest}? Check the name in \\usepackage."));
         }
-        return found(
-            format!("The package {package} is not installed"),
-            "Check the name in \\usepackage. If the name is right, install the package with your TeX distribution.",
-        );
+        return Some(Explanation {
+            title: format!("The package {package} is not installed"),
+            hint: "Check the name in \\usepackage. If the name is right, update your LaTeX packages: new packages come with updates.".to_string(),
+            fix: Some(Fix::UpdateLatex),
+        });
     }
     if let Some(class) = name.strip_suffix(".cls") {
         return found(format!("The document class {class} is not installed"), "Check the name in \\documentclass.");
@@ -472,6 +480,19 @@ mod tests {
     fn a_mistyped_package_gets_the_closest_name() {
         let diagnostic = Diagnostic { message: "LaTeX Error: File `amsmth.sty' not found.".into(), ..Default::default() };
         assert!(explain(&diagnostic).unwrap().hint.contains("Did you mean amsmath?"));
+    }
+
+    #[test]
+    fn a_missing_or_old_package_offers_the_update() {
+        let diagnostic = Diagnostic { message: "LaTeX Error: File `zqxwvfancy.sty' not found.".into(), ..Default::default() };
+        assert_eq!(explain(&diagnostic).unwrap().fix, Some(Fix::UpdateLatex));
+        let diagnostic = Diagnostic {
+            message: "LaTeX Warning: You have requested, on input line 3, version `2026/01/01' of package siunitx,".into(),
+            ..Default::default()
+        };
+        let explained = explain(&diagnostic).unwrap();
+        assert!(explained.title.contains("siunitx"), "{explained:?}");
+        assert_eq!(explained.fix, Some(Fix::UpdateLatex));
     }
 
     #[test]

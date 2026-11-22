@@ -38,6 +38,7 @@ mod smear;
 mod snippets;
 mod status_bar;
 mod storage;
+mod texlive;
 mod text_file;
 mod theme;
 mod toolchain;
