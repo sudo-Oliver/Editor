@@ -61,7 +61,7 @@ pub struct Package {
     bytes: u64,
 }
 
-const MACTEX_TEXBIN: &str = "/Library/TeX/texbin";
+pub const MACTEX_TEXBIN: &str = "/Library/TeX/texbin";
 
 impl Tool {
     /// The ones listed in the settings, in the order shown.
@@ -670,6 +670,48 @@ fn install_package(tool: Tool, package: &Package, tools: &Path, received: &Atomi
     Ok(())
 }
 
+/// Why a command for an administrator did not run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AdminError {
+    /// The user closed the password dialog.
+    Closed,
+    Failed(String),
+}
+
+/// Runs `program` with `args` as an administrator, through the same password
+/// dialog of macOS as the installer packages, which shows `prompt`. Each part
+/// is quoted on its own, so no argument is read by a shell. Blocks.
+pub(crate) fn as_administrator(prompt: &str, program: &Path, args: &[&std::ffi::OsStr]) -> Result<(), AdminError> {
+    let output = Command::new("osascript")
+        .args([
+            "-e",
+            "on run argv",
+            "-e",
+            "set command to \"\"",
+            "-e",
+            "repeat with index from 2 to count of argv",
+            "-e",
+            "set command to command & quoted form of item index of argv & \" \"",
+            "-e",
+            "end repeat",
+            "-e",
+            "do shell script command with prompt (item 1 of argv) with administrator privileges",
+            "-e",
+            "end run",
+        ])
+        .arg(prompt)
+        .arg(program)
+        .args(args)
+        .output()
+        .map_err(|error| AdminError::Failed(format!("Cannot ask for the password: {error}")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let error = marketplace::failure(&output);
+    // -128 is the cancel button of the password dialog.
+    Err(if error.contains("-128") { AdminError::Closed } else { AdminError::Failed(error) })
+}
+
 fn check_package(package: &Package, file: &Path) -> Result<(), String> {
     if let Some(expected) = package.sha256 {
         if file_digest::<sha2::Sha256>(file)? != expected {
@@ -1144,7 +1186,7 @@ fn install_homebrew(tools: &Path, job: &JobHandle) -> Result<(), String> {
     homebrew().map(|_| ()).ok_or_else(|| "Homebrew's installer ended, but Homebrew is not there.".to_string())
 }
 
-fn small_button(id: (&'static str, usize), label: &'static str, primary: bool, on_click: impl Fn(&mut App) + 'static) -> impl IntoElement {
+pub(crate) fn small_button(id: (&'static str, usize), label: impl Into<SharedString>, primary: bool, on_click: impl Fn(&mut App) + 'static) -> impl IntoElement {
     let palette = theme::palette();
     div()
         .id(id)
@@ -1158,7 +1200,7 @@ fn small_button(id: (&'static str, usize), label: &'static str, primary: bool, o
         .when(primary, |style| style.text_color(theme::color(palette.on_accent)))
         .hover(|style| style.opacity(0.85))
         .on_click(move |_, _, cx| on_click(cx))
-        .child(label)
+        .child(label.into())
 }
 
 /// One row per tool: what it is for, where it comes from, and a button to

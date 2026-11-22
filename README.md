@@ -28,8 +28,7 @@ It shows the download and disk size of every part and checks the free space befo
 - **By hand**, also under "Other ways to install". The setup lists each file with its download link and says where it goes: programs into `~/Applications/Editor Tools` (packed or unpacked), MacTeX through its own installer. It notices the files on its own, checks them and makes them runnable.
 
 MacTeX always comes from its official package, checked against CTAN's checksum and its author's signature, and installed to `/Library/TeX` after macOS asks for your password.
-With the complete LaTeX, the setup also installs the compact one first, so that you can start writing after about a minute; MacTeX takes over once its download is done.
-Big downloads run in the background: you can start writing at once, the status bar shows how far it is, and the first PDF follows once the compiler is there.
+MacTeX is the recommended LaTeX: you wait once for its download, about 15 minutes on a fast connection, and the setup shows how long it still takes. After that everything works offline.
 At the end, a test document compiles in each chosen language, so that the setup only says "all set" when it works.
 To add a language later, open the setup again from the project hub. Pandoc, which only the Word and HTML exports need, installs on the first such export.
 If you already have MacTeX, Typst or Homebrew, the setup sees them and the app uses them.
@@ -42,6 +41,16 @@ Then a welcome document opens and a tour shows each part of the editor. Help, Ed
 The app asks GitHub for the newest release a few seconds after it starts and then every six hours. When there is a newer one, a bar offers "Update and restart". The app downloads the dmg, checks it against the checksum GitHub lists for it, its bundle identifier, its version and its signature (the same Apple team as the running app), puts it in place of the old app and starts again. Open files are saved first. If anything fails, the old app stays as it was.
 An app installed with the Homebrew cask updates through `brew upgrade --cask` instead, so that Homebrew stays in step.
 Only an app bundle updates itself, never a build run with cargo. The only request is one to `api.github.com`, with nothing about you in it.
+
+### LaTeX updates
+
+MacTeX keeps itself current from inside the app, without Homebrew or the Terminal.
+
+- Once a week the app asks TeX Live's package manager, `tlmgr`, which packages have newer versions. Asking needs no password, and without internet it simply tries again later.
+- Settings, Writing tools shows the installed TeX Live year, when it last checked and how many updates there are. "Update LaTeX packages" first says why the password is needed, then macOS asks for it once, since MacTeX belongs to the system. `tlmgr` then updates itself and every package. Closing the password dialog changes nothing.
+- When a document stops because a package is missing or too old, the error offers the same update.
+- Each spring tug.org publishes the TeX Live of the new year, which the old one cannot update to. The weekly check notices, since `tlmgr` then names the new year. The app offers "Install MacTeX 2027" (or whichever year), the same download as in the setup. Your LaTeX keeps working until the new one is installed.
+- The old year stays on the disk until you remove it: the settings show how much space it takes and remove it after asking for confirmation and your password. Nothing is ever deleted on its own.
 
 ## Building a release
 
