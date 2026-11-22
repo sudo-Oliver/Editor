@@ -470,6 +470,13 @@ pub fn latex() -> Found {
     find(Tool::Tectonic)
 }
 
+/// Whether a complete TeX distribution is there, such as MacTeX or TeX Live
+/// from Homebrew, rather than only Tectonic.
+pub fn complete_latex() -> bool {
+    let tools = tools_directory();
+    find(Tool::MacTex) != Found::Missing || ["latexmk", "pdflatex"].iter().any(|program| matches!(found_program(program, tools.as_deref()), Found::Own(_)))
+}
+
 /// Whether a language works, by any of its compilers.
 pub fn language_ready(tool: Tool) -> bool {
     match tool {
@@ -511,7 +518,7 @@ pub fn install(tool: Tool, tools: &Path, received: &AtomicU64, cancel: &AtomicBo
 
 /// Downloads `url` to `target`, counting the bytes in `received`. With
 /// `resume`, a part from an earlier try is continued instead of started over.
-fn download(url: &str, target: &Path, resume: bool, seconds: &str, received: &AtomicU64, cancel: &AtomicBool) -> Result<(), String> {
+pub(crate) fn download(url: &str, target: &Path, resume: bool, seconds: &str, received: &AtomicU64, cancel: &AtomicBool) -> Result<(), String> {
     let mut command = marketplace::curl(seconds);
     if resume {
         command.args(["--continue-at", "-"]);
@@ -549,7 +556,7 @@ fn download(url: &str, target: &Path, resume: bool, seconds: &str, received: &At
 }
 
 /// The checksum of a file of any size, without reading it into memory at once.
-fn file_digest<D: sha2::Digest>(path: &Path) -> Result<String, String> {
+pub(crate) fn file_digest<D: sha2::Digest>(path: &Path) -> Result<String, String> {
     use std::io::Read;
     let mut file = std::fs::File::open(path).map_err(|error| format!("Cannot read the download: {error}"))?;
     let mut digest = D::new();
@@ -866,6 +873,7 @@ pub struct Toolchain {
     /// What `find` said, since looking costs file system calls in every frame.
     found: std::cell::RefCell<HashMap<Tool, Found>>,
     latex: std::cell::RefCell<Option<bool>>,
+    complete: std::cell::RefCell<Option<bool>>,
 }
 
 impl EventEmitter<ToolchainEvent> for Toolchain {}
@@ -884,10 +892,16 @@ impl Toolchain {
         }
     }
 
+    /// `complete_latex`, remembered the same way.
+    pub fn has_complete_latex(&self) -> bool {
+        *self.complete.borrow_mut().get_or_insert_with(complete_latex)
+    }
+
     /// Forgets what was found, after installs or changes from outside.
     pub fn forget_found(&self) {
         self.found.borrow_mut().clear();
         self.latex.borrow_mut().take();
+        self.complete.borrow_mut().take();
     }
 
     pub fn installing(&self, tool: Tool) -> bool {
@@ -1276,10 +1290,11 @@ pub fn promise(toolchain: &Entity<Toolchain>, cx: &App) -> &'static str {
     }
 }
 
-/// Where to install from: Homebrew, which the app installs first when it is
-/// missing, or the app's own folder.
+/// Where to install from: Homebrew or the app's own folder. Shown only to
+/// people who have Homebrew: everyone else gets the app's folder without
+/// having to know what Homebrew is. The setup still offers to install it.
 pub fn installer_choice(toolchain: &Entity<Toolchain>, cx: &App) -> Option<AnyElement> {
-    if !cfg!(target_os = "macos") {
+    if !cfg!(target_os = "macos") || toolchain.read(cx).found(Tool::Homebrew) == Found::Missing {
         return None;
     }
     let palette = theme::palette();
@@ -1305,26 +1320,18 @@ pub fn installer_choice(toolchain: &Entity<Toolchain>, cx: &App) -> Option<AnyEl
             .child(div().font_weight(FontWeight::SEMIBOLD).child(label))
             .child(div().text_size(px(11.)).text_color(theme::color(palette.ui_muted)).child(text))
     };
-    let homebrew_text = if toolchain.read(cx).found(Tool::Homebrew) != Found::Missing {
-        "You have it. brew install, updated with brew upgrade.".to_string()
-    } else {
-        format!(
-            "Installs Homebrew first: {} and Apple's developer tools, about 2 GB. Asks for your password once.",
-            size(Tool::Homebrew.megabytes().unwrap_or(0))
-        )
-    };
     Some(
         div()
             .flex()
             .gap(px(8.))
-            .child(option(0, "With Homebrew (recommended)", homebrew_text, true))
+            .child(option(0, "With Homebrew (recommended)", "You have it. brew install, updated with brew upgrade.".to_string(), true))
             .child(option(1, "In the app's folder", "No Homebrew and no password, removed with one click.".to_string(), false))
             .into_any_element(),
     )
 }
 
 /// The install's result once it is done, or `None` when `tick` comes first.
-async fn futures_select<T>(install: &mut std::pin::Pin<&mut impl std::future::Future<Output = T>>, tick: gpui::Task<()>) -> Option<T> {
+pub(crate) async fn futures_select<T>(install: &mut std::pin::Pin<&mut impl std::future::Future<Output = T>>, tick: gpui::Task<()>) -> Option<T> {
     use std::task::Poll;
     let mut tick = std::pin::pin!(tick);
     std::future::poll_fn(|context| {

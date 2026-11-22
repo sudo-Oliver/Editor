@@ -22,11 +22,13 @@ On the first start, a short setup asks whether you write LaTeX, Typst or both, a
 For LaTeX it offers the complete MacTeX (about 7 GB, every package offline) or the compact Tectonic (about 20 MB, fetches packages as documents need them).
 It shows the download and disk size of every part and checks the free space before anything starts. Then it installs in one of three ways:
 
-- **With Homebrew** (recommended). If Homebrew is missing, the setup installs it first: Apple's developer tools through Apple's own dialog, then Homebrew's official installer, which asks for your password once. Then `brew install tectonic`, `typst` or `pandoc`.
-- **Without Homebrew.** The official programs go into the app's own folder (`~/.config/editor/tools`), are checked against a fingerprint, and can be removed under Writing tools. No password.
-- **By hand.** The setup lists each file with its download link and says where it goes: programs into `~/Applications/Editor Tools` (packed or unpacked), MacTeX through its own installer. It notices the files on its own, checks them and makes them runnable.
+- **With Homebrew**, the default when Homebrew is already there: `brew install tectonic`, `typst` or `pandoc`.
+- **In the app's folder**, the default when it is not. Nobody without Homebrew has to know what it is. The official programs go into the app's own folder (`~/.config/editor/tools`), are checked against a fingerprint, and can be removed under Writing tools. No password.
+- **Install Homebrew first**, under "Other ways to install". Apple's developer tools through Apple's own dialog, then Homebrew's official installer, which asks for your password once, then the formulas.
+- **By hand**, also under "Other ways to install". The setup lists each file with its download link and says where it goes: programs into `~/Applications/Editor Tools` (packed or unpacked), MacTeX through its own installer. It notices the files on its own, checks them and makes them runnable.
 
 MacTeX always comes from its official package, checked against CTAN's checksum and its author's signature, and installed to `/Library/TeX` after macOS asks for your password.
+With the complete LaTeX, the setup also installs the compact one first, so that you can start writing after about a minute; MacTeX takes over once its download is done.
 Big downloads run in the background: you can start writing at once, the status bar shows how far it is, and the first PDF follows once the compiler is there.
 At the end, a test document compiles in each chosen language, so that the setup only says "all set" when it works.
 To add a language later, open the setup again from the project hub. Pandoc, which only the Word and HTML exports need, installs on the first such export.
@@ -35,11 +37,18 @@ If you already have MacTeX, Typst or Homebrew, the setup sees them and the app u
 Git and GitHub are not part of the setup. The git panel sets them up when you want them: "Set up git" opens Apple's dialog for its developer tools, and "Put it on GitHub" signs you in through the browser, creates a private repository and pushes.
 Then a welcome document opens and a tour shows each part of the editor. Help, Editor tour plays it again.
 
+## Updates
+
+The app asks GitHub for the newest release a few seconds after it starts and then every six hours. When there is a newer one, a bar offers "Update and restart". The app downloads the dmg, checks it against the checksum GitHub lists for it, its bundle identifier, its version and its signature (the same Apple team as the running app), puts it in place of the old app and starts again. Open files are saved first. If anything fails, the old app stays as it was.
+An app installed with the Homebrew cask updates through `brew upgrade --cask` instead, so that Homebrew stays in step.
+Only an app bundle updates itself, never a build run with cargo. The only request is one to `api.github.com`, with nothing about you in it.
+
 ## Building a release
 
 `scripts/bundle-macos.sh` builds `target/bundle/Editor.app` for both architectures and packs it into a dmg.
 Without signing details it signs ad hoc, which is enough for your own Mac.
 A release needs an Apple Developer ID; the script header lists the environment variables, and `.github/workflows/release.yml` reads them from repository secrets when a `v*` tag is pushed.
+The workflow creates a draft release. Publishing the draft is what the update bar of installed apps sees; the version comes from `Cargo.toml` and must be higher than the last release.
 
 ## Setup for development
 
