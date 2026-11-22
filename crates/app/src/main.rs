@@ -1,6 +1,7 @@
 mod actions;
 mod addon_panel;
 mod addons;
+mod app_location;
 mod assets;
 mod atomic;
 mod bib;
@@ -75,7 +76,13 @@ fn main() {
                 .add_fonts(assets::FONTS.iter().map(|font| std::borrow::Cow::Borrowed(*font)).collect())
                 .expect("the bundled fonts load");
             cx.on_action(|_: &actions::Quit, cx| cx.quit());
-            cx.set_menus([Menu::new("Editor").items([MenuItem::action("Quit", actions::Quit)])]);
+            let mut items = Vec::new();
+            // For the keyboard too, through the menu bar, as the offer itself is a bar.
+            if app_location::running().is_some() {
+                items.push(MenuItem::action("Move to Applications…", actions::MoveToApplications));
+            }
+            items.push(MenuItem::action("Quit", actions::Quit));
+            cx.set_menus([Menu::new("Editor").items(items)]);
 
             let bounds = Bounds::centered(None, size(px(1400.), px(900.)), cx);
             let root = root.clone();
