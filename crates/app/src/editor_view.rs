@@ -29,6 +29,8 @@ use crate::{
     actions::*,
     completion::{self, Entry, Extra},
     smear::{self, Smear},
+    history,
+    text_file::{self, Encoding},
     theme,
 };
 
@@ -179,6 +181,8 @@ pub struct EditorView {
     pub path: Option<PathBuf>,
     /// The file as this document last read or wrote it.
     disk_hash: u64,
+    /// How the file stores its characters, kept when saving.
+    encoding: &'static Encoding,
     focus_handle: FocusHandle,
     scroll_y: Pixels,
     rows: Rows,
@@ -249,6 +253,14 @@ fn is_conflict(disk: &[u8], known: u64, mine: &[u8]) -> bool {
 }
 
 impl EditorView {
+    /// Text read in the current encoding always encodes back to the same bytes.
+    fn set_disk_hash(&mut self, text: &str) {
+        let bytes = text_file::encode(text, self.encoding).unwrap_or(std::borrow::Cow::Borrowed(text.as_bytes()));
+        self.disk_hash = content_hash(&bytes);
+    }
+}
+
+impl EditorView {
     pub fn new(text: &str, path: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
         let language = path
             .as_deref()
@@ -257,6 +269,7 @@ impl EditorView {
             state: EditorState::new(text, language),
             path,
             disk_hash: content_hash(text.as_bytes()),
+            encoding: text_file::UTF_8,
             focus_handle: cx.focus_handle(),
             scroll_y: px(0.),
             rows: Rows::default(),
@@ -396,26 +409,57 @@ impl EditorView {
             return Ok(false);
         }
         let text = self.state.buffer().to_string();
+        let bytes = self.bytes_of(&text)?;
+        let disk = std::fs::read(path).ok();
         // A file that went away or cannot be read has nothing to protect here.
-        if std::fs::read(path).is_ok_and(|disk| is_conflict(&disk, self.disk_hash, text.as_bytes())) {
+        if disk.as_deref().is_some_and(|disk| is_conflict(disk, self.disk_hash, &bytes)) {
             return Err(io::Error::other(SaveConflict));
         }
-        self.write_text(&text, cx)?;
+        self.keep_version(disk.as_deref(), &bytes);
+        self.write_bytes(&bytes, cx)?;
         Ok(true)
     }
 
     /// Replaces the file even though it changed on disk.
     pub fn save_anyway(&mut self, cx: &mut Context<Self>) -> io::Result<()> {
         let text = self.state.buffer().to_string();
-        self.write_text(&text, cx)
+        let bytes = self.bytes_of(&text)?;
+        let disk = self.path.as_deref().and_then(|path| std::fs::read(path).ok());
+        self.keep_version(disk.as_deref(), &bytes);
+        self.write_bytes(&bytes, cx)
     }
 
-    fn write_text(&mut self, text: &str, cx: &mut Context<Self>) -> io::Result<()> {
+    /// Puts what is about to be replaced into the file's history. The history
+    /// only adds safety, so a failure there never stops a save.
+    fn keep_version(&self, old: Option<&[u8]>, new: &[u8]) {
+        if let (Some(path), Some(directory), Some(old)) = (&self.path, history::directory(), old)
+            && old != new
+        {
+            history::keep(&directory, path, old).ok();
+        }
+    }
+
+    /// Keeps the text as it is now, before something replaces it.
+    pub fn keep_current_text(&self) {
+        let text = self.state.buffer().to_string();
+        let bytes = text_file::encode(&text, self.encoding).unwrap_or(std::borrow::Cow::Borrowed(text.as_bytes()));
+        self.keep_version(Some(&bytes), &[]);
+    }
+
+    /// The text in the file's own encoding. A character it lacks stops the save,
+    /// since writing a stand-in would change the text without a word.
+    fn bytes_of(&self, text: &str) -> io::Result<Vec<u8>> {
+        text_file::encode(text, self.encoding)
+            .map(std::borrow::Cow::into_owned)
+            .map_err(|character| text_file::unencodable(character, self.encoding))
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8], cx: &mut Context<Self>) -> io::Result<()> {
         let Some(path) = &self.path else {
             return Ok(());
         };
-        crate::atomic::write(path, text.as_bytes())?;
-        self.disk_hash = content_hash(text.as_bytes());
+        crate::atomic::write(path, bytes)?;
+        self.disk_hash = content_hash(bytes);
         self.state.mark_saved();
         cx.notify();
         Ok(())
@@ -423,7 +467,43 @@ impl EditorView {
 
     /// Writes this text somewhere else. The document and its file stay as they are.
     pub fn save_copy(&self, target: &Path) -> io::Result<()> {
-        crate::atomic::write(target, self.state.buffer().to_string().as_bytes())
+        crate::atomic::write(target, &self.bytes_of(&self.state.buffer().to_string())?)
+    }
+
+    /// The file went away on disk. Its text is now the only copy.
+    pub fn mark_file_gone(&mut self, cx: &mut Context<Self>) {
+        self.state.mark_unsaved();
+        cx.notify();
+    }
+
+    /// The encoding the file was read in. Anything but UTF-8 is worth a mention.
+    pub fn encoding(&self) -> &'static Encoding {
+        self.encoding
+    }
+
+    /// Takes the encoding of the file this text came from.
+    pub fn set_encoding(&mut self, encoding: &'static Encoding) {
+        self.encoding = encoding;
+        let text = self.state.buffer().to_string();
+        if let Ok(bytes) = text_file::encode(&text, encoding) {
+            self.disk_hash = content_hash(&bytes);
+        }
+    }
+
+    /// From now on saves as UTF-8. The text stays, and the next save rewrites the file.
+    pub fn convert_to_utf8(&mut self, cx: &mut Context<Self>) {
+        if self.encoding == text_file::UTF_8 {
+            return;
+        }
+        self.encoding = text_file::UTF_8;
+        // LaTeX has to read the file the new way too.
+        let text = self.state.buffer().to_string();
+        if let Some(range) = text_file::inputenc_option(&text) {
+            self.edit_from_outside(range, "utf8", cx);
+        }
+        // The file on disk is still the old encoding, so it counts as changed.
+        self.state.mark_unsaved();
+        cx.notify();
     }
 
     /// Takes the file from disk and drops local edits, which undo can bring back.
@@ -431,8 +511,14 @@ impl EditorView {
         let Some(path) = &self.path else {
             return Ok(());
         };
-        let text = std::fs::read_to_string(path)?;
-        self.disk_hash = content_hash(text.as_bytes());
+        let loaded = text_file::read(path)?;
+        // Local edits that the disk version replaces stay in the history.
+        if self.state.is_dirty() {
+            self.keep_current_text();
+        }
+        let text = loaded.text;
+        self.encoding = loaded.encoding;
+        self.set_disk_hash(&text);
         self.may_conflict = text.contains(CONFLICT_START);
         self.state.reload(&text);
         self.schedule_parse(cx);
@@ -448,20 +534,23 @@ impl EditorView {
         if self.state.is_dirty() {
             return;
         }
-        let Ok(text) = std::fs::read_to_string(path) else {
+        let Ok(loaded) = text_file::read(path) else {
             return;
         };
         let version = self.state.version();
-        self.reload_text(&text, version, cx);
+        self.reload_text(&loaded.text, loaded.encoding, version, cx);
     }
 
     /// Takes text read from disk elsewhere, unless the document changed since then.
-    pub fn reload_text(&mut self, text: &str, version: u64, cx: &mut Context<Self>) {
+    pub fn reload_text(&mut self, text: &str, encoding: &'static Encoding, version: u64, cx: &mut Context<Self>) {
         if self.state.is_dirty() || self.state.version() != version {
             return;
         }
-        self.disk_hash = content_hash(text.as_bytes());
+        self.encoding = encoding;
+        self.set_disk_hash(text);
         if *self.state.buffer().rope() != text {
+            // Another program replaced the file, and this text is its old version.
+            self.keep_current_text();
             // A merge writes its conflicts to disk.
             self.may_conflict = text.contains(CONFLICT_START);
             self.state.reload(text);

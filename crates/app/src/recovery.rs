@@ -66,7 +66,7 @@ pub fn pending(directory: &Path, root: &Path) -> Vec<Snapshot> {
         if !snapshot.path.starts_with(root) || process_runs(snapshot.pid) {
             continue;
         }
-        if fs::read(&snapshot.path).is_ok_and(|disk| disk == snapshot.text.as_bytes()) {
+        if crate::text_file::read(&snapshot.path).is_ok_and(|disk| disk.text == snapshot.text) {
             fs::remove_file(&file).ok();
             continue;
         }

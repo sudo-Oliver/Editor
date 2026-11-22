@@ -226,6 +226,7 @@ dependencies = [
  "build",
  "collab",
  "editor_core",
+ "encoding_rs",
  "git",
  "gpui",
  "gpui_platform",
