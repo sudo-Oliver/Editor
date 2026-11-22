@@ -61,6 +61,7 @@ use crate::{
     snippets,
     status_bar::{self, StatusInfo},
     history,
+    texlive::{self, TexLive},
     text_file,
     theme,
     toolchain::{self, Tool, Toolchain, ToolchainEvent},
@@ -463,6 +464,9 @@ pub struct Workspace {
     _updater_observer: Subscription,
     mover: Entity<Mover>,
     _mover_subscriptions: [Subscription; 2],
+    /// Package updates and new years of MacTeX.
+    texlive: Entity<TexLive>,
+    _texlive_observer: Subscription,
     /// Opens the setup at the next frame, for actions without a window.
     setup_requested: bool,
     /// The draft export that waits for Pandoc to be installed.
@@ -613,6 +617,8 @@ impl Workspace {
         let toolchain = cx.new(|_| Toolchain::default());
         let updater = cx.new(Updater::new);
         let _updater_observer = cx.observe(&updater, |_, _, cx| cx.notify());
+        let texlive = cx.new(TexLive::new);
+        let _texlive_observer = cx.observe(&texlive, |_, _, cx| cx.notify());
         let toolchain_subscriptions = [
             cx.observe(&toolchain, |_, _, cx| cx.notify()),
             cx.subscribe(&toolchain, |this, _, event, cx| match event {
@@ -731,6 +737,8 @@ impl Workspace {
             _updater_observer,
             mover,
             _mover_subscriptions,
+            texlive,
+            _texlive_observer,
             setup_requested: false,
             export_after_pandoc: None,
             tour: None,
@@ -2405,6 +2413,12 @@ impl Workspace {
             self.dialog = Some(Dialog::Settings(SettingsPage::Tools));
             return cx.notify();
         }
+        if *fix == Fix::UpdateLatex {
+            // The settings say why macOS asks for the password, then ask.
+            self.texlive.update(cx, |texlive, cx| texlive.ask_update(cx));
+            self.dialog = Some(Dialog::Settings(SettingsPage::Tools));
+            return cx.notify();
+        }
         let Some(path) = path.map(Path::to_path_buf).or_else(|| self.last_main.clone()) else {
             return;
         };
@@ -2424,7 +2438,7 @@ impl Workspace {
         let done = match fix {
             Fix::AddPackage(package) => format!("Added {package}"),
             Fix::RemovePackage(package) => format!("Removed {package}"),
-            Fix::InstallTool(_) => return,
+            Fix::InstallTool(_) | Fix::UpdateLatex => return,
         };
         self.set_status(done, cx);
     }
@@ -2473,6 +2487,11 @@ impl Workspace {
         self.package_hints.iter().find(|hint| hint.message == message && view.path.as_ref() == Some(&hint.path))
     }
 
+    /// Whether `fix` can help on this Mac: updating packages needs MacTeX.
+    fn offers(&self, fix: &Fix, cx: &App) -> bool {
+        *fix != Fix::UpdateLatex || self.texlive.read(cx).installed()
+    }
+
     /// Applies the package fix on the line of the cursor.
     fn quick_fix(&mut self, cx: &mut Context<Self>) {
         let Some(view) = self.active_view() else {
@@ -2486,7 +2505,7 @@ impl Workspace {
             self.diagnostics
                 .iter()
                 .filter(|diagnostic| diagnostic.line == Some(line) && diagnostic.file == path)
-                .find_map(|diagnostic| Some((build::explain(diagnostic)?.fix?, None)))
+                .find_map(|diagnostic| Some((build::explain(diagnostic)?.fix.filter(|fix| self.offers(fix, cx))?, None)))
         });
         match fix {
             Some((fix, path)) => self.apply_fix(&fix, path.as_deref(), cx),
@@ -6587,7 +6606,7 @@ impl Workspace {
                     .flex()
                     .flex_wrap()
                     .gap(px(6.))
-                    .when_some(problem.fix.clone(), |element, fix| {
+                    .when_some(problem.fix.clone().filter(|fix| self.offers(fix, cx)), |element, fix| {
                         element.child(self.panel_button("apply-fix", fix.label(), true, cx, move |this, _, cx| this.apply_fix(&fix, None, cx)))
                     })
                     .when(problem.location.is_some(), |element| {
@@ -7667,6 +7686,7 @@ impl Workspace {
         ];
         elements.extend(toolchain::installer_choice(&self.toolchain, cx));
         elements.extend(toolchain::tool_rows(&self.toolchain, &Tool::ALL, true, cx));
+        elements.extend(texlive::section(&self.texlive, &self.toolchain, cx));
         elements.push(div().flex_none().pt(px(4.)).text_size(px(11.)).text_color(theme::color(theme::palette().ui_muted)).child(toolchain::promise(&self.toolchain, cx)).into_any_element());
         elements
     }
@@ -7942,6 +7962,10 @@ impl Workspace {
     /// A build that failed for want of this tool runs again.
     fn tool_installed(&mut self, tool: Tool, cx: &mut Context<Self>) {
         self.set_status(format!("{} is ready.", tool.language()), cx);
+        if tool == Tool::MacTex {
+            // A new year changes what there is to update, and what can go.
+            self.texlive.update(cx, |texlive, cx| texlive.look(cx));
+        }
         if self.root.is_some() && !self.last_build_succeeded {
             self.recompile(cx);
         }
