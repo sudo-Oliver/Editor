@@ -12,6 +12,7 @@ use std::{
 
 const PREFIX: &str = "preamble-";
 const BEGIN_DOCUMENT: &str = "\\begin{document}";
+const FORMAT_VERSION: &[u8] = b"2";
 /// Things that only work in a normal run, because a format keeps no open files and
 /// freezes the name of the job.
 const NOT_FOR_FORMATS: &[&str] = &["\\jobname", "\\openout", "\\write18"];
@@ -40,6 +41,8 @@ impl Preamble {
         let preamble = preamble_text(&String::from_utf8_lossy(&text))?.to_string();
         let mut hasher = DefaultHasher::new();
         hasher.write(preamble.as_bytes());
+        // A new way of building formats replaces the ones built the old way.
+        hasher.write(FORMAT_VERSION);
         Some(Self { key: hasher.finish(), directory: directory.to_path_buf() })
     }
 
