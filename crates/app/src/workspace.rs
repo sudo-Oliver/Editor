@@ -61,6 +61,7 @@ use crate::{
     status_bar::{self, StatusInfo},
     theme,
     toolchain::{self, Tool, Toolchain, ToolchainEvent},
+    updater::{self, Updater},
 };
 
 #[cfg(feature = "collab")]
@@ -453,6 +454,8 @@ pub struct Workspace {
     home: Entity<HomeView>,
     /// The setup of the first start, shown in place of everything else.
     setup: Option<(Entity<SetupView>, Subscription)>,
+    updater: Entity<Updater>,
+    _updater_observer: Subscription,
     /// Opens the setup at the next frame, for actions without a window.
     setup_requested: bool,
     /// The draft export that waits for Pandoc to be installed.
@@ -598,6 +601,8 @@ impl Workspace {
             key_handle.update(cx, |this, cx| this.intercept_key(event, window, cx)).ok();
         });
         let toolchain = cx.new(|_| Toolchain::default());
+        let updater = cx.new(Updater::new);
+        let _updater_observer = cx.observe(&updater, |_, _, cx| cx.notify());
         let toolchain_subscriptions = [
             cx.observe(&toolchain, |_, _, cx| cx.notify()),
             cx.subscribe(&toolchain, |this, _, event, cx| match event {
@@ -648,7 +653,9 @@ impl Workspace {
         });
         let settings_path = settings::default_path();
         let mut settings = settings_path.as_deref().map(Settings::load).unwrap_or_default();
-        let use_homebrew = settings.use_homebrew;
+        // Homebrew is only the way for people who have it. Anyone else installs
+        // into the app's folder, unless they choose to get Homebrew in the setup.
+        let use_homebrew = settings.use_homebrew && toolchain::homebrew().is_some();
         toolchain.update(cx, |toolchain, _| toolchain.use_homebrew = use_homebrew);
         // Nothing of the editor on disk means that it was just installed.
         let first_start = settings_path.as_deref().is_some_and(|path| !path.exists())
@@ -700,6 +707,8 @@ impl Workspace {
             focus_mode: false,
             home,
             setup: None,
+            updater,
+            _updater_observer,
             setup_requested: false,
             export_after_pandoc: None,
             tour: None,
@@ -8167,6 +8176,7 @@ impl Render for Workspace {
                 this.open_dialog(Dialog::Settings(SettingsPage::Editor), window, cx);
             }))
             .on_action(|_: &Quit, _, cx: &mut App| cx.quit())
+            .when(!presenting && setup.is_none(), |element| element.children(updater::banner(&self.updater, cx)))
             .when(hub, |element| {
                 let page = match setup {
                     Some(setup) => setup.into_any_element(),
