@@ -167,6 +167,65 @@ pub fn clear(path: &Path) -> io::Result<()> {
     }
 }
 
+/// What each part of the two folders takes, for the storage settings.
+#[derive(Clone, Default)]
+pub struct Usage {
+    pub history: u64,
+    pub recovery: u64,
+    pub tools: u64,
+    pub addons: u64,
+    pub templates: u64,
+    pub downloads: u64,
+    /// The cache folder but for the downloads.
+    pub caches: u64,
+    /// Both folders, also what no part names, such as the settings.
+    pub total: u64,
+    /// The build output of the open project.
+    pub build: Option<u64>,
+}
+
+/// Walks all the folders, which takes a while for gigabytes of tools, so
+/// never on the UI thread.
+pub fn measure(build: Option<&Path>) -> Usage {
+    let size = |path: Option<PathBuf>| path.as_deref().map_or(0, size_of);
+    let downloads = size(downloads_dir());
+    Usage {
+        history: crate::history::directory().as_deref().map_or(0, crate::history::size),
+        recovery: size(crate::recovery::directory()),
+        tools: size(crate::toolchain::tools_directory()),
+        addons: size(crate::addons::default_directory()),
+        templates: size(crate::projects::library_path()),
+        downloads,
+        caches: size(cache_dir()).saturating_sub(downloads),
+        total: size(data_dir()) + size(cache_dir()),
+        build: build.map(size_of),
+    }
+}
+
+/// Empties the cache folder but for the downloads, which are cleared on their own.
+pub fn clear_caches() -> io::Result<()> {
+    cache_dir().map_or(Ok(()), |cache| clear_but_downloads(&cache))
+}
+
+fn clear_but_downloads(cache: &Path) -> io::Result<()> {
+    let Ok(entries) = fs::read_dir(cache) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        if entry.file_name() == "downloads" {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            clear(&entry.path())?;
+        } else if let Err(error) = fs::remove_file(entry.path())
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 /// Short sizes for people: "0 KB", "820 KB", "12.4 MB", "6.9 GB".
 pub fn human(bytes: u64) -> String {
     const KB: f64 = 1024.0;
@@ -210,6 +269,23 @@ mod tests {
         assert!(!from.exists());
         assert_eq!(fs::read_to_string(to.join("x")).unwrap(), "x");
         assert_eq!(size_of(&to), 1);
+    }
+
+    #[test]
+    fn clearing_caches_keeps_the_downloads() {
+        let cache = tempfile::tempdir().unwrap();
+        fs::create_dir_all(cache.path().join("downloads")).unwrap();
+        fs::create_dir_all(cache.path().join("other")).unwrap();
+        fs::write(cache.path().join("downloads/MacTeX.pkg"), "half").unwrap();
+        fs::write(cache.path().join("other/x"), "x").unwrap();
+        fs::write(cache.path().join("themes.json"), "{}").unwrap();
+        clear_but_downloads(cache.path()).unwrap();
+        assert_eq!(size_of(cache.path()), 4);
+        assert!(!cache.path().join("other").exists());
+        assert!(!cache.path().join("themes.json").exists());
+        clear(&cache.path().join("downloads")).unwrap();
+        clear(&cache.path().join("downloads")).unwrap();
+        assert_eq!(size_of(cache.path()), 0);
     }
 
     #[test]
