@@ -48,10 +48,7 @@ vim.fn.writefile({ vim.json.encode(themes) }, vim.env.EDITOR_THEMES_OUT)
 pub type Themes = BTreeMap<String, Palette>;
 
 pub fn cache_path() -> Option<PathBuf> {
-    let cache = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
-    Some(cache.join("editor").join("themes.json"))
+    Some(crate::storage::cache_dir()?.join("themes.json"))
 }
 
 /// A missing or broken cache means no themes yet.

@@ -36,6 +36,7 @@ mod shortcuts;
 mod smear;
 mod snippets;
 mod status_bar;
+mod storage;
 mod text_file;
 mod theme;
 mod toolchain;
@@ -55,6 +56,9 @@ fn main() {
     git_login::answer_if_asked();
     // Old macOS versions add a process serial number when Finder starts the app.
     let root = std::env::args_os().skip(1).find(|argument| !argument.to_string_lossy().starts_with("-psn_")).map(PathBuf::from);
+    // Before anything reads its settings or tools from the old place.
+    storage::migrate();
+    std::thread::spawn(storage::sweep);
     toolchain::register_installed();
 
     // Files and folders from Finder, the Dock and the `editor` command arrive

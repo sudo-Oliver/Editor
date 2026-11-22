@@ -619,7 +619,7 @@ fn unpack_release(tool: Tool, release: &Release, archive: &Path, workspace: &Pat
 /// instead of starting over.
 fn install_package(tool: Tool, package: &Package, tools: &Path, received: &AtomicU64, stage: &Mutex<String>, cancel: &AtomicBool) -> Result<(), String> {
     let name = tool.name();
-    let downloads = tools.join("downloads");
+    let downloads = crate::storage::downloads_dir().unwrap_or_else(|| tools.join("downloads"));
     std::fs::create_dir_all(&downloads).map_err(|error| format!("Cannot make the folder for the download: {error}"))?;
     // Named as on its website, so that it reads right in Finder.
     let file = downloads.join(package.url.rsplit('/').next().unwrap_or("download.pkg"));

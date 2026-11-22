@@ -155,10 +155,7 @@ fn find_installed(files: &[&str]) -> Vec<PathBuf> {
 }
 
 fn cache_path() -> Option<PathBuf> {
-    let cache = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
-    Some(cache.join("editor").join("packages.json"))
+    Some(crate::storage::cache_dir()?.join("packages.json"))
 }
 
 fn load_cache(path: &Path) -> Cache {

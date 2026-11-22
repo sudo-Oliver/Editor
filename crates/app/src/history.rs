@@ -5,16 +5,26 @@
 //!
 //! Saves can come every second while compiling on type, so older versions thin
 //! out: every minute for the last hour, every hour for the last day, every day
-//! for a month.
+//! for a month. Versions are compressed, each file's versions have a size
+//! limit, and all of them together have one too, so the history never fills a
+//! disk. Folders of files that are gone for a month go away.
 
 use std::{
     fs, io,
-    hash::{DefaultHasher, Hash, Hasher},
+    hash::{DefaultHasher, Hasher},
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 const PATH_FILE: &str = "path";
+const COMPRESSED: &str = ".gz";
+/// What the versions of one file may take, compressed. A thesis chapter
+/// compresses to tens of KB, so this only bites for very large files.
+const FILE_LIMIT: u64 = 16 * 1024 * 1024;
+/// What the whole history may take.
+pub const TOTAL_LIMIT: u64 = 256 * 1024 * 1024;
+/// The newest versions of a file stay, whatever the limits say.
+const NEWEST_KEPT: usize = 3;
 /// Kept however old they are, so a file left alone for a year still has some.
 const ALWAYS_KEPT: usize = 10;
 const MINUTE: u64 = 60;
@@ -34,10 +44,15 @@ pub fn directory() -> Option<PathBuf> {
     Some(crate::settings::default_path()?.parent()?.join("history"))
 }
 
+/// Named by a hash that stays the same across versions of the app.
 fn folder_for(directory: &Path, path: &Path) -> PathBuf {
-    let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
-    directory.join(format!("{:016x}", hasher.finish()))
+    directory.join(stable_hash(path))
+}
+
+pub(crate) fn stable_hash(path: &Path) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(path.as_os_str().as_encoded_bytes());
+    digest[..8].iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn content_hash(bytes: &[u8]) -> u64 {
@@ -59,7 +74,7 @@ pub fn keep(directory: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
     create_private(&folder)?;
     let hash = format!("{:016x}", content_hash(bytes));
     let versions = names(&folder);
-    if versions.first().is_some_and(|(_, name)| name.ends_with(&hash)) {
+    if versions.first().is_some_and(|(_, name)| name.trim_end_matches(COMPRESSED).ends_with(&hash)) {
         return Ok(());
     }
     // The path is stored once, so a folder can be traced back to its file.
@@ -73,8 +88,10 @@ pub fn keep(directory: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
         millis += 1;
     }
     let temp = tempfile::NamedTempFile::new_in(&folder)?;
-    fs::write(temp.path(), bytes)?;
-    temp.persist(folder.join(format!("{millis:013}-{hash}"))).map_err(|error| error.error)?;
+    let mut encoder = flate2::write::GzEncoder::new(io::BufWriter::new(temp.as_file()), flate2::Compression::fast());
+    io::Write::write_all(&mut encoder, bytes)?;
+    encoder.finish()?.into_inner().map_err(io::IntoInnerError::into_error)?;
+    temp.persist(folder.join(format!("{millis:013}-{hash}{COMPRESSED}"))).map_err(|error| error.error)?;
     prune(&folder, (millis / 1000) as u64);
     Ok(())
 }
@@ -86,6 +103,17 @@ pub fn keep_disk(directory: &Path, path: &Path) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+/// The bytes of a version as the file had them.
+pub fn read(file: &Path) -> io::Result<Vec<u8>> {
+    let stored = fs::read(file)?;
+    if !file.to_string_lossy().ends_with(COMPRESSED) {
+        return Ok(stored);
+    }
+    let mut bytes = Vec::new();
+    io::Read::read_to_end(&mut flate2::read::GzDecoder::new(stored.as_slice()), &mut bytes)?;
+    Ok(bytes)
 }
 
 /// Every version of `path`, newest first.
@@ -160,8 +188,70 @@ fn bucket(time: u64, now: u64) -> (u8, u64) {
 fn prune(folder: &Path, now: u64) {
     let names = names(folder);
     let times: Vec<u64> = names.iter().map(|(millis, _)| (*millis / 1000) as u64).collect();
-    for index in to_drop(&times, now) {
+    let dropped = to_drop(&times, now);
+    for &index in &dropped {
         fs::remove_file(folder.join(&names[index].1)).ok();
+    }
+    // Then the oldest go until the rest fits.
+    let mut total = 0;
+    for (index, (_, name)) in names.iter().enumerate().filter(|(index, _)| !dropped.contains(index)) {
+        let file = folder.join(name);
+        total += fs::metadata(&file).map_or(0, |metadata| metadata.len());
+        if total > FILE_LIMIT && index >= NEWEST_KEPT {
+            fs::remove_file(file).ok();
+        }
+    }
+}
+
+/// What the history takes on disk.
+pub fn size(directory: &Path) -> u64 {
+    folders(directory).iter().flat_map(|folder| fs::read_dir(folder).into_iter().flatten().flatten()).filter_map(|entry| entry.metadata().ok()).map(|metadata| metadata.len()).sum()
+}
+
+fn folders(directory: &Path) -> Vec<PathBuf> {
+    fs::read_dir(directory).into_iter().flatten().flatten().map(|entry| entry.path()).filter(|path| path.is_dir()).collect()
+}
+
+/// Tidies the whole history, once per start and away from typing: thins out
+/// every file's versions, removes folders of files gone for a month, and then
+/// drops the oldest versions anywhere until the history fits its limit.
+pub fn sweep(directory: &Path) {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs();
+    let mut all = Vec::new();
+    for folder in folders(directory) {
+        prune(&folder, now);
+        let names = names(&folder);
+        let newest = names.first().map_or(0, |(millis, _)| (*millis / 1000) as u64);
+        let gone = fs::read(folder.join(PATH_FILE))
+            .ok()
+            .is_none_or(|path| !Path::new(&*String::from_utf8_lossy(&path)).exists());
+        if names.is_empty() || (gone && now.saturating_sub(newest) > MONTH) {
+            fs::remove_dir_all(&folder).ok();
+            continue;
+        }
+        for (index, (millis, name)) in names.into_iter().enumerate() {
+            let file = folder.join(name);
+            let size = fs::metadata(&file).map_or(0, |metadata| metadata.len());
+            all.push((millis, index, file, size));
+        }
+    }
+    let mut total: u64 = all.iter().map(|(.., size)| size).sum();
+    all.sort_by_key(|(millis, ..)| *millis);
+    for (_, index, file, size) in all {
+        if total <= TOTAL_LIMIT {
+            break;
+        }
+        if index >= NEWEST_KEPT && fs::remove_file(&file).is_ok() {
+            total -= size;
+        }
+    }
+}
+
+/// Removes the whole history, for the storage settings.
+pub fn clear(directory: &Path) -> io::Result<()> {
+    match fs::remove_dir_all(directory) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
     }
 }
 
@@ -183,7 +273,7 @@ mod tests {
         keep(directory.path(), path, b"two").unwrap();
         keep(directory.path(), path, b"").unwrap();
         let kept = versions(directory.path(), path);
-        let contents: Vec<Vec<u8>> = kept.iter().map(|version| fs::read(&version.file).unwrap()).collect();
+        let contents: Vec<Vec<u8>> = kept.iter().map(|version| read(&version.file).unwrap()).collect();
         assert_eq!(contents, [b"two".to_vec(), b"one".to_vec()]);
         assert!(versions(directory.path(), Path::new("/project/other.tex")).is_empty());
     }
@@ -198,6 +288,39 @@ mod tests {
         fs::write(&path, "text").unwrap();
         keep_disk(directory.path(), &path).unwrap();
         assert_eq!(versions(directory.path(), &path).len(), 1);
+    }
+
+    #[test]
+    fn versions_are_compressed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = Path::new("/project/chapter.tex");
+        let text = "Ein Absatz über Messungen. ".repeat(4000);
+        keep(directory.path(), path, text.as_bytes()).unwrap();
+        let version = &versions(directory.path(), path)[0];
+        assert!(version.size * 10 < text.len() as u64, "{} bytes on disk", version.size);
+        assert_eq!(read(&version.file).unwrap(), text.as_bytes());
+    }
+
+    #[test]
+    fn the_sweep_removes_gone_files_and_keeps_existing_ones() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let here = project.path().join("here.tex");
+        fs::write(&here, "x").unwrap();
+        let gone = project.path().join("gone.tex");
+        keep(directory.path(), &here, b"old").unwrap();
+        keep(directory.path(), &gone, b"old").unwrap();
+        // The version of the gone file is two months old.
+        let folder = folder_for(directory.path(), &gone);
+        let (_, name) = names(&folder).remove(0);
+        let old = now_millis() - u128::from(2 * MONTH) * 1000;
+        fs::rename(folder.join(&name), folder.join(format!("{old:013}-{}", name.split_once('-').unwrap().1))).unwrap();
+        sweep(directory.path());
+        assert_eq!(versions(directory.path(), &here).len(), 1);
+        assert!(!folder.exists());
+        assert!(size(directory.path()) > 0);
+        clear(directory.path()).unwrap();
+        assert_eq!(size(directory.path()), 0);
     }
 
     #[test]
