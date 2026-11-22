@@ -17,7 +17,18 @@ cask "editor" do
   app "Editor.app"
   binary "#{appdir}/Editor.app/Contents/Resources/bin/editor"
 
-  zap trash: "~/.config/editor"
+  # The Library folders hold everything the app keeps; the dot folders are
+  # where versions before them kept it. Editor Tools is a folder people drop
+  # their own downloads into, so it only goes when it is empty.
+  zap trash: [
+        "~/.cache/editor",
+        "~/.config/editor",
+        "~/Library/Application Support/io.github.sudo-oliver.editor",
+        "~/Library/Caches/io.github.sudo-oliver.editor",
+        "~/Library/Preferences/io.github.sudo-oliver.editor.plist",
+        "~/Library/Saved Application State/io.github.sudo-oliver.editor.savedState",
+      ],
+      rmdir: "~/Applications/Editor Tools"
 
   caveats <<~EOS
     The editor command opens files and folders: editor .

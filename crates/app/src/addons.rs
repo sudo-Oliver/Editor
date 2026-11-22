@@ -27,6 +27,10 @@ const MAX_MESSAGE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ERROR_LINE_BYTES: u64 = 16 * 1024;
 const EVENT_CAPACITY: usize = 256;
 const MAX_READ_BYTES: u64 = 8 << 20;
+/// As much as a download from the marketplace may be.
+const MAX_INSTALL_BYTES: u64 = 200 << 20;
+/// Development leftovers that an add-on folder may hold and never needs.
+const NOT_INSTALLED: [&str; 3] = [".git", "target", "node_modules"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Installed {
@@ -104,17 +108,39 @@ pub fn install_from(source: &Path, directory: &Path) -> Result<Manifest, String>
         return Err(format!("{} is already installed from this folder.", manifest.name));
     }
     let describe = |error: std::io::Error| format!("Cannot install {}: {error}", manifest.name);
+    let bytes = installed_size(source).map_err(describe)?;
+    if bytes > MAX_INSTALL_BYTES {
+        let (size, limit) = (crate::storage::human(bytes), crate::storage::human(MAX_INSTALL_BYTES));
+        return Err(format!("{} holds {size}, more than the {limit} an add-on may take.", manifest.name));
+    }
     fs::create_dir_all(directory).map_err(describe)?;
     let staging = directory.join(format!(".installing-{}", manifest.id));
     if staging.exists() {
         fs::remove_dir_all(&staging).map_err(describe)?;
     }
-    copy_directory(source, &staging).map_err(describe)?;
+    if let Err(error) = copy_directory(source, &staging) {
+        fs::remove_dir_all(&staging).ok();
+        return Err(describe(error));
+    }
     if target.exists() {
         fs::remove_dir_all(&target).map_err(describe)?;
     }
     fs::rename(&staging, &target).map_err(describe)?;
     Ok(manifest)
+}
+
+/// The bytes `copy_directory` would copy.
+fn installed_size(source: &Path) -> std::io::Result<u64> {
+    let mut bytes = 0;
+    for entry in fs::read_dir(source)?.flatten() {
+        let kind = entry.file_type()?;
+        if kind.is_dir() && !NOT_INSTALLED.iter().any(|name| entry.file_name() == *name) {
+            bytes += installed_size(&entry.path())?;
+        } else if kind.is_file() {
+            bytes += entry.metadata()?.len();
+        }
+    }
+    Ok(bytes)
 }
 
 /// Links stay behind, so that an add-on holds no reference to files outside.
@@ -123,6 +149,9 @@ fn copy_directory(source: &Path, target: &Path) -> std::io::Result<()> {
     for entry in fs::read_dir(source)?.flatten() {
         let kind = entry.file_type()?;
         let to = target.join(entry.file_name());
+        if kind.is_dir() && NOT_INSTALLED.iter().any(|name| entry.file_name() == *name) {
+            continue;
+        }
         if kind.is_dir() {
             copy_directory(&entry.path(), &to)?;
         } else if kind.is_file() && entry.file_name() != ENABLED_MARKER {
@@ -374,6 +403,41 @@ mod tests {
 
         remove(&load_all(&addons).0[0]).unwrap();
         assert!(load_all(&addons).0.is_empty());
+    }
+
+    #[test]
+    fn install_leaves_out_development_folders_and_refuses_large_ones() {
+        let directory = tempdir().unwrap();
+        let (source, addons) = (directory.path().join("source"), directory.path().join("addons"));
+        for dir in [".git/objects", "target/debug", "node_modules/x", "bin"] {
+            fs::create_dir_all(source.join(dir)).unwrap();
+        }
+        fs::write(source.join(MANIFEST), manifest_text("a", "bin/run")).unwrap();
+        fs::write(source.join("bin/run"), "1").unwrap();
+        // Sparse, so the test writes nothing. Left out, so it does not count.
+        fs::File::create(source.join("target/debug/big")).unwrap().set_len(MAX_INSTALL_BYTES + 1).unwrap();
+        install_from(&source, &addons).unwrap();
+        assert!(addons.join("a/bin/run").is_file());
+        for left_out in [".git", "target", "node_modules"] {
+            assert!(!addons.join("a").join(left_out).exists(), "{left_out}");
+        }
+
+        fs::File::create(source.join("bin/big")).unwrap().set_len(MAX_INSTALL_BYTES + 1).unwrap();
+        let error = install_from(&source, &addons).unwrap_err();
+        assert!(error.contains("more than the 200.0 MB"), "{error}");
+        assert_eq!(fs::read_to_string(addons.join("a/bin/run")).unwrap(), "1");
+    }
+
+    #[test]
+    fn a_failed_install_leaves_no_half_copy() {
+        let directory = tempdir().unwrap();
+        let (source, addons) = (directory.path().join("source"), directory.path().join("addons"));
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join(MANIFEST), manifest_text("a", "run")).unwrap();
+        fs::write(source.join("run"), "1").unwrap();
+        fs::set_permissions(source.join("run"), fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(install_from(&source, &addons).is_err());
+        assert_eq!(fs::read_dir(&addons).unwrap().count(), 0);
     }
 
     #[test]

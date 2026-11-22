@@ -20,7 +20,7 @@ use crate::{
     explain, fontmap,
     parse::{self, Diagnostic, Severity},
     preamble::{self, Preamble, State},
-    tools::{child_path, find_tool},
+    tools::{child_env, find_tool},
 };
 
 const OUTPUT_DIRECTORY: &str = ".build";
@@ -586,7 +586,7 @@ async fn run_process(
     command
         .args(&invocation.args)
         .current_dir(cwd)
-        .env("PATH", child_path())
+        .envs(child_env())
         .envs(invocation.env.iter().map(|(name, value)| (*name, value.as_str())))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
