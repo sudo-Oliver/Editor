@@ -1,5 +1,6 @@
 mod actions;
 mod addon_panel;
+mod addon_reports;
 mod addons;
 mod assets;
 mod atomic;

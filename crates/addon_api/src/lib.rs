@@ -14,7 +14,9 @@ pub const OLDEST_API_VERSION: u32 = 1;
 /// What this editor can do beyond `API_VERSION`, sent with `HostMessage::Init`.
 /// Add-ons check these rather than the version, so that they work on an
 /// editor that lacks one by doing without it.
-pub const FEATURES: &[&str] = &["markdown", "tree_edits", "notify", "events", "pdf", "bib", "insert", "files", "review", "outline", "status", "commands", "drag"];
+pub const FEATURES: &[&str] = &[
+    "markdown", "tree_edits", "notify", "events", "pdf", "bib", "insert", "files", "review", "outline", "status", "commands", "drag", "documents", "selection", "synctex", "fixes", "build_control", "git", "packages", "references", "word_count", "pdf_search", "edit_groups", "more_events", "external_access",
+];
 
 /// What an add-on may ask the editor for. Add-ons are not sandboxed, so this
 /// limits the requests below and not the program itself.
@@ -27,6 +29,10 @@ pub enum Permission {
     Secrets,
     Citations,
     LookupDoi,
+    /// Says that the add-on passes what it may do on to programs outside the
+    /// editor, such as Claude through a connector. It allows no request by
+    /// itself; the user sees it before turning the add-on on.
+    ExternalAccess,
 }
 
 impl Permission {
@@ -38,6 +44,7 @@ impl Permission {
             Self::Secrets => "Keep secrets in the system keychain",
             Self::Citations => "Offer citations",
             Self::LookupDoi => "Look up DOIs online",
+            Self::ExternalAccess => "Lets programs outside the editor, such as Claude, use what this add-on can",
         }
     }
 }
@@ -333,7 +340,7 @@ pub struct DropdownOption {
 }
 
 /// Lines from the add-on.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "message", rename_all = "snake_case")]
 pub enum AddonMessage {
     /// Replaces the panel.
@@ -401,6 +408,14 @@ pub enum EventKind {
     Saved,
     /// `HostMessage::BuildFinished`.
     Build,
+    /// `HostMessage::BuildStarted`.
+    BuildStart,
+    /// `HostMessage::DocumentChanged`, half a second after typing stops.
+    Document,
+    /// `HostMessage::ProjectOpened` and `HostMessage::ProjectClosed`.
+    Project,
+    /// `HostMessage::DiagnosticsChanged`.
+    Diagnostics,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -410,7 +425,7 @@ pub struct CitationEntry {
     pub detail: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "request", rename_all = "snake_case")]
 pub enum Request {
     /// The files of the project without those that Git ignores, relative to it.
@@ -421,18 +436,47 @@ pub enum Request {
     Diagnostics,
     ActiveFile,
     /// Replaces `old`, which must occur exactly once, in the document. Saves nothing.
-    EditFile { path: String, old: String, new: String },
+    /// `group` names the group of `BeginEdits` that it belongs to.
+    EditFile {
+        path: String,
+        old: String,
+        new: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<String>,
+    },
     /// Creates the file and opens it with this unsaved text.
-    CreateFile { path: String, text: String },
+    CreateFile {
+        path: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<String>,
+    },
     /// Replaces a whole file on disk, and its document if open. Fails when that
     /// document has unsaved changes.
     WriteFile { path: String, text: String },
     /// Saves all documents and compiles. The reply comes when the build ends.
-    Compile,
-    /// Starts a group of edits that `DiscardEdits` can take back.
-    BeginEdits,
-    /// Takes back the edits since `BeginEdits`.
-    DiscardEdits,
+    /// `clean` deletes what earlier builds left first, which is slower.
+    Compile {
+        #[serde(default, skip_serializing_if = "is_false")]
+        clean: bool,
+    },
+    /// Stops the running build, whose `Compile` replies fail.
+    CancelBuild,
+    /// Starts a group of edits that `DiscardEdits` can take back. Each `group`
+    /// is tracked on its own, so that several clients of one add-on, such as
+    /// two sessions of a connector, do not start or discard each other's edits.
+    /// Without a name, the group is the add-on's default one.
+    BeginEdits {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<String>,
+    },
+    /// Takes back the edits of the group since `BeginEdits`. In each file the
+    /// text from before the group's first edit returns, so later edits to that
+    /// file go with it, also those of other groups or the user.
+    DiscardEdits {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<String>,
+    },
     GetSecret { key: String },
     SetSecret { key: String, value: String },
     /// Writes a citation of this key at the cursor, in the form of the document.
@@ -499,6 +543,68 @@ pub enum Request {
     },
     /// Ends an open review of the file without changing it.
     CancelReview { path: String },
+    /// The open documents, in the order of their tabs.
+    OpenDocuments,
+    /// Saves one open document. A file that is not open has nothing to save.
+    SaveFile { path: String },
+    /// Renames or moves a file or folder in the project. Open documents follow
+    /// it with their unsaved text. The reply is the new path, as `Reply::File`.
+    RenameFile { from: String, to: String },
+    /// Moves a file or folder to the Trash, from where Finder can put it back.
+    /// Fails while one of its documents has unsaved changes.
+    DeleteFile { path: String },
+    /// The cursor, selection and visible lines of the active document.
+    Selection,
+    /// Where a source line lies in the PDF, from SyncTeX. Lines start at 1.
+    /// Fails with the reason when there is no SyncTeX data, such as for Typst.
+    SourceToPdf { path: String, line: usize },
+    /// The source line of a point on a page, from SyncTeX. Pages start at 1,
+    /// and `x` and `y` are PDF points from the top left of the page.
+    PdfToSource { page: usize, x: f32, y: f32 },
+    /// Makes the change of a `FixInfo` from `Diagnostics` or `PackageHints`.
+    ApplyFix { id: String },
+    /// The branch of the project's Git repository and its changed files.
+    GitStatus,
+    /// The changes of a file, or of all changed files without `path`, as a
+    /// unified diff without context lines.
+    GitDiff {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(default)]
+        against: DiffBase,
+    },
+    /// The last commits, newest first, 50 by default.
+    GitLog {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max: Option<usize>,
+    },
+    /// Missing and unused LaTeX packages in the whole project.
+    PackageHints,
+    /// Labels and citation keys with the places that use them, and what is
+    /// missing or unused.
+    References,
+    /// The words of the main document with what it includes, or of one file.
+    WordCount {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
+    /// The bookmarks of the PDF.
+    PdfOutline,
+    /// Where text occurs in the PDF, ignoring case. At most 200 hits.
+    PdfSearch { query: String },
+    /// The text selected in the PDF view, as `Reply::Text`, empty for none.
+    PdfSelection,
+}
+
+/// What `Request::GitDiff` compares the text of a document with.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffBase {
+    /// The last commit, with unsaved changes counting.
+    #[default]
+    Head,
+    /// The file on disk, so only unsaved changes show.
+    Working,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -522,18 +628,34 @@ impl Request {
             | Self::PdfText { .. }
             | Self::PdfPage { .. }
             | Self::BibEntries
-            | Self::Outline => Permission::ReadProject,
+            | Self::Outline
+            | Self::OpenDocuments
+            | Self::Selection
+            | Self::SourceToPdf { .. }
+            | Self::PdfToSource { .. }
+            | Self::GitStatus
+            | Self::GitDiff { .. }
+            | Self::GitLog { .. }
+            | Self::PackageHints
+            | Self::References
+            | Self::WordCount { .. }
+            | Self::PdfOutline
+            | Self::PdfSearch { .. }
+            | Self::PdfSelection => Permission::ReadProject,
             Self::EditFile { .. }
             | Self::CreateFile { .. }
             | Self::WriteFile { .. }
-            | Self::BeginEdits
-            | Self::DiscardEdits
+            | Self::BeginEdits { .. }
+            | Self::DiscardEdits { .. }
             | Self::InsertText { .. }
             | Self::InsertAt { .. }
             | Self::CopyIntoProject { .. }
             | Self::ProposeEdits { .. }
-            | Self::CancelReview { .. } => Permission::EditDocuments,
-            Self::Compile => Permission::Compile,
+            | Self::CancelReview { .. }
+            | Self::RenameFile { .. }
+            | Self::DeleteFile { .. }
+            | Self::ApplyFix { .. } => Permission::EditDocuments,
+            Self::Compile { .. } | Self::CancelBuild | Self::SaveFile { .. } => Permission::Compile,
             Self::GetSecret { .. } | Self::SetSecret { .. } => Permission::Secrets,
             Self::InsertCitation { .. } => Permission::Citations,
         }
@@ -548,12 +670,38 @@ pub struct SearchHit {
     pub text: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct DiagnosticInfo {
     pub path: Option<String>,
     pub line: Option<usize>,
     pub error: bool,
     pub message: String,
+    /// Starts at 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column: Option<usize>,
+    /// `error` or `warning`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub severity: String,
+    /// What the editor makes of `message`, in plain words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<String>,
+    /// Advice from the editor and the compiler, one per line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+    /// The source text TeX had read when it stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix: Option<FixInfo>,
+}
+
+/// A change the editor can make by itself, through `Request::ApplyFix`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct FixInfo {
+    /// Such as `add_package:amsmath`. It stays the same across builds.
+    pub id: String,
+    /// Such as `Add \usepackage{amsmath}`.
+    pub label: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -574,6 +722,13 @@ pub struct ProjectInfo {
     /// The program that compiles it, such as `pdflatex` or `typst`.
     pub compiler: Option<String>,
     pub compiler_ready: bool,
+    /// As `.editor.toml` names it: `pdflatex`, `lualatex`, `tectonic`,
+    /// `typst` or `pandoc`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+    /// Whether a build runs now.
+    #[serde(default)]
+    pub building: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -585,6 +740,202 @@ pub struct BibInfo {
     pub venue: String,
     /// The file it is in, relative to the project.
     pub file: String,
+    /// Such as `article`, in lowercase.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub entry_type: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub doi: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url: String,
+    /// The entry as written in the file, from `@` to its closing brace.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub raw: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct OpenDocument {
+    /// Relative to the project, or absolute for a file outside it.
+    pub path: String,
+    pub unsaved: bool,
+    pub active: bool,
+}
+
+/// A place in a document. Lines and columns start at 1, and columns count
+/// characters.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct TextPoint {
+    pub line: usize,
+    pub column: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct SelectionInfo {
+    pub path: String,
+    /// The cursor, which is one end of the selection.
+    pub cursor: TextPoint,
+    /// Both the cursor when nothing is selected.
+    pub start: TextPoint,
+    pub end: TextPoint,
+    pub text: String,
+    /// The first and last line on screen, `None` before the document was drawn.
+    #[serde(default)]
+    pub visible: Option<LineRange>,
+}
+
+/// Lines from `first` to `last`, both included, from 1.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct LineRange {
+    pub first: usize,
+    pub last: usize,
+}
+
+/// A rectangle on a page of the PDF, in points from its top left.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+pub struct PdfRect {
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct PdfHit {
+    /// Starts at 1.
+    pub page: usize,
+    /// One per line that the hit spans.
+    pub rects: Vec<PdfRect>,
+    /// The line around the hit.
+    pub context: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PdfOutlineEntry {
+    pub title: String,
+    /// 0 for the top level.
+    pub level: usize,
+    /// Starts at 1.
+    pub page: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct GitStatusInfo {
+    /// `None` on a detached HEAD.
+    pub branch: Option<String>,
+    pub upstream: Option<String>,
+    pub ahead: usize,
+    pub behind: usize,
+    pub files: Vec<GitFileInfo>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct GitFileInfo {
+    /// Relative to the root of the repository, which can lie above the project.
+    pub path: String,
+    /// The earlier name of a renamed file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+    /// The letter of the change in the index, such as `M` or `A`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged: Option<String>,
+    /// The letter of the change in the working tree. `?` means untracked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unstaged: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub conflicted: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct GitCommitInfo {
+    pub hash: String,
+    pub author: String,
+    /// Such as `2 hours ago`.
+    pub age: String,
+    /// Such as `HEAD -> main` and `origin/main`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refs: Vec<String>,
+    pub subject: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PackageHintInfo {
+    /// Relative to the project.
+    pub path: String,
+    /// Starts at 1.
+    pub line: usize,
+    pub column: usize,
+    pub message: String,
+    pub fix: FixInfo,
+}
+
+/// A place in a source file, relative to the project. Lines start at 1.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct SourcePlace {
+    pub path: String,
+    pub line: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct LabelInfo {
+    pub name: String,
+    /// Where it is defined.
+    pub path: String,
+    pub line: usize,
+    /// The `\ref` and its kin, or `@` in Typst, that point to it.
+    pub uses: Vec<SourcePlace>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct CitationInfo {
+    pub key: String,
+    /// Whether a bibliography file of the project has the key.
+    pub defined: bool,
+    pub uses: Vec<SourcePlace>,
+}
+
+/// A use of a name that nothing defines.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct MissingName {
+    pub name: String,
+    pub path: String,
+    pub line: usize,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ReferenceReport {
+    /// By name.
+    pub labels: Vec<LabelInfo>,
+    /// Every key that the documents cite, by key.
+    pub citations: Vec<CitationInfo>,
+    pub undefined_refs: Vec<MissingName>,
+    pub undefined_citations: Vec<MissingName>,
+    /// Labels that nothing points to.
+    pub unused_labels: Vec<String>,
+    /// Bibliography keys that no document cites. Empty after `\nocite{*}`.
+    pub unused_entries: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct WordCountInfo {
+    /// The main document, or the file asked for, relative to the project.
+    pub path: String,
+    /// `body`, `headings` and `captions` together.
+    pub total: usize,
+    pub body: usize,
+    pub headings: usize,
+    pub captions: usize,
+    /// Formulas, which the total leaves out.
+    pub inline_math: usize,
+    pub display_math: usize,
+    pub sections: Vec<SectionWords>,
+    /// Included files that could not be read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct SectionWords {
+    pub title: String,
+    pub words: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -610,7 +961,7 @@ pub struct OutlineEntry {
     pub line: usize,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "reply", rename_all = "snake_case")]
 pub enum Reply {
     Done,
@@ -630,10 +981,23 @@ pub enum Reply {
     Outline { main: Option<String>, files: Vec<FileOutline> },
     /// The blocks of a review by their order in the file, from 0.
     Reviewed { accepted: Vec<usize>, rejected: Vec<usize> },
+    Documents { documents: Vec<OpenDocument> },
+    /// `None` when no document is active.
+    Selection { selection: Option<SelectionInfo> },
+    /// Where a source line lies in the PDF. `page` starts at 1.
+    PdfPlace { page: usize, rect: PdfRect },
+    SourcePlace { place: SourcePlace },
+    GitStatus { status: GitStatusInfo },
+    Commits { commits: Vec<GitCommitInfo> },
+    PackageHints { hints: Vec<PackageHintInfo> },
+    References { references: ReferenceReport },
+    WordCount { count: WordCountInfo },
+    PdfOutline { entries: Vec<PdfOutlineEntry> },
+    PdfHits { hits: Vec<PdfHit> },
 }
 
 /// Lines to the add-on.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "message", rename_all = "snake_case")]
 pub enum HostMessage {
     /// The first message. Without a project, requests about files fail.
@@ -670,6 +1034,17 @@ pub enum HostMessage {
     /// Where the cursor rests. Lines and columns start at 1.
     SelectionChanged { path: String, line: usize, column: usize, selected_chars: usize },
     BuildFinished { success: bool, errors: usize, warnings: usize },
+    BuildStarted,
+    /// The text of a document changed, by typing or otherwise. Comes half a
+    /// second after the changes stop, once per document.
+    DocumentChanged { path: String },
+    /// The project the add-on works on. The program starts again for each
+    /// project, so this comes once, right after it subscribes.
+    ProjectOpened { root: String },
+    /// The project closes, and stdin with it.
+    ProjectClosed,
+    /// A build brought new diagnostics, which `Request::Diagnostics` lists.
+    DiagnosticsChanged { errors: usize, warnings: usize },
     /// Files dropped on the panel. Absolute paths.
     FilesDropped { paths: Vec<String> },
     /// A picture pasted into an input of the panel, saved as a PNG file.
@@ -782,8 +1157,49 @@ mod tests {
     #[test]
     fn requests_name_their_permission() {
         assert_eq!(Request::ListFiles.permission(), Permission::ReadProject);
-        assert_eq!(Request::Compile.permission(), Permission::Compile);
+        assert_eq!(Request::Compile { clean: false }.permission(), Permission::Compile);
+        assert_eq!(Request::DeleteFile { path: "a.tex".to_string() }.permission(), Permission::EditDocuments);
+        assert_eq!(Request::RenameFile { from: "a".to_string(), to: "b".to_string() }.permission(), Permission::EditDocuments);
+        assert_eq!(Request::GitDiff { path: None, against: DiffBase::Head }.permission(), Permission::ReadProject);
         assert_eq!(Request::InsertCitation { key: "k".to_string() }.permission(), Permission::Citations);
         assert_eq!(Request::GetSecret { key: "k".to_string() }.permission(), Permission::Secrets);
+    }
+
+    /// Requests of an older add-on still read after their variants grew fields.
+    #[test]
+    fn grown_requests_read_as_before() {
+        let compile: Request = serde_json::from_str(r#"{"request":"compile"}"#).unwrap();
+        assert_eq!(compile, Request::Compile { clean: false });
+        assert_eq!(serde_json::to_string(&compile).unwrap(), r#"{"request":"compile"}"#);
+        let begin: Request = serde_json::from_str(r#"{"request":"begin_edits"}"#).unwrap();
+        assert_eq!(begin, Request::BeginEdits { group: None });
+        assert_eq!(serde_json::to_string(&begin).unwrap(), r#"{"request":"begin_edits"}"#);
+        let edit: Request = serde_json::from_str(r#"{"request":"edit_file","path":"a.tex","old":"x","new":"y"}"#).unwrap();
+        assert_eq!(edit, Request::EditFile { path: "a.tex".into(), old: "x".into(), new: "y".into(), group: None });
+        let diagnostic: DiagnosticInfo = serde_json::from_str(r#"{"path":null,"line":null,"error":true,"message":"m"}"#).unwrap();
+        assert_eq!(diagnostic, DiagnosticInfo { error: true, message: "m".into(), ..Default::default() });
+    }
+
+    /// The wire format of the connector requests, written out like version 2.
+    #[test]
+    fn connector_requests_read_as_written() {
+        let cases: &[(&str, Request)] = &[
+            (r#"{"request":"discard_edits","group":"s1"}"#, Request::DiscardEdits { group: Some("s1".into()) }),
+            (r#"{"request":"compile","clean":true}"#, Request::Compile { clean: true }),
+            (r#"{"request":"git_diff","path":"a.tex","against":"working"}"#, Request::GitDiff { path: Some("a.tex".into()), against: DiffBase::Working }),
+            (r#"{"request":"pdf_to_source","page":2,"x":10.5,"y":20.0}"#, Request::PdfToSource { page: 2, x: 10.5, y: 20.0 }),
+            (r#"{"request":"word_count"}"#, Request::WordCount { path: None }),
+            (r#"{"request":"apply_fix","id":"add_package:amsmath"}"#, Request::ApplyFix { id: "add_package:amsmath".into() }),
+        ];
+        for (json, request) in cases {
+            assert_eq!(&serde_json::from_str::<Request>(json).unwrap(), request, "{json}");
+            assert_eq!(serde_json::to_string(request).unwrap(), *json);
+        }
+        let reply = Reply::PdfPlace { page: 1, rect: PdfRect { left: 1.0, top: 2.0, right: 3.0, bottom: 4.0 } };
+        assert_eq!(serde_json::to_string(&reply).unwrap(), r#"{"reply":"pdf_place","page":1,"rect":{"left":1.0,"top":2.0,"right":3.0,"bottom":4.0}}"#);
+        let event = HostMessage::DocumentChanged { path: "a.tex".into() };
+        assert_eq!(serde_json::to_string(&event).unwrap(), r#"{"message":"document_changed","path":"a.tex"}"#);
+        assert_eq!(serde_json::to_string(&EventKind::BuildStart).unwrap(), r#""build_start""#);
+        assert_eq!(serde_json::to_string(&Permission::ExternalAccess).unwrap(), r#""external_access""#);
     }
 }
