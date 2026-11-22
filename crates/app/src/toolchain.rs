@@ -61,7 +61,7 @@ pub struct Package {
     bytes: u64,
 }
 
-const MACTEX_TEXBIN: &str = "/Library/TeX/texbin";
+pub const MACTEX_TEXBIN: &str = "/Library/TeX/texbin";
 
 impl Tool {
     /// The ones listed in the settings, in the order shown.
@@ -259,6 +259,17 @@ pub fn tools_directory() -> Option<PathBuf> {
     Some(settings::config_dir()?.join("tools"))
 }
 
+/// Where a compiler the app starts keeps the packages it downloads. Only
+/// Tectonic and Typst download any.
+pub fn cache_directory(tool: Tool) -> Option<PathBuf> {
+    let name = match tool {
+        Tool::Tectonic => "tectonic",
+        Tool::Typst => "typst",
+        _ => return None,
+    };
+    Some(crate::storage::cache_dir()?.join(name))
+}
+
 /// The folder for programs downloaded by hand. Finder shows it, unlike the
 /// app's own folder, so that people can drag files into it.
 pub fn manual_directory() -> Option<PathBuf> {
@@ -269,8 +280,12 @@ fn folder(tools: &Path, tool: Tool, release: &Release) -> PathBuf {
     tools.join(format!("{}-{}", tool.program(), release.version))
 }
 
-/// Makes the compiler search the folders of installed tools. Called once at start.
+/// Makes the compiler search the folders of installed tools, and keep its
+/// packages in the app's cache. Called once at start.
 pub fn register_installed() {
+    if let (Some(tectonic), Some(typst)) = (cache_directory(Tool::Tectonic), cache_directory(Tool::Typst)) {
+        build::set_cache_directories(tectonic, typst);
+    }
     if let Some(tools) = tools_directory() {
         for tool in Tool::ALL {
             if let Some(release) = tool.release() {
@@ -405,7 +420,7 @@ pub fn probe(language: Tool) -> Result<(), String> {
     std::fs::write(directory.path().join(file), text).map_err(|error| format!("Cannot prepare the test: {error}"))?;
     let output = command
         .current_dir(directory.path())
-        .env("PATH", build::child_path())
+        .envs(build::child_env())
         .stdin(Stdio::null())
         .output()
         .map_err(|error| format!("Cannot start the compiler: {error}"))?;
@@ -619,7 +634,7 @@ fn unpack_release(tool: Tool, release: &Release, archive: &Path, workspace: &Pat
 /// instead of starting over.
 fn install_package(tool: Tool, package: &Package, tools: &Path, received: &AtomicU64, stage: &Mutex<String>, cancel: &AtomicBool) -> Result<(), String> {
     let name = tool.name();
-    let downloads = tools.join("downloads");
+    let downloads = crate::storage::downloads_dir().unwrap_or_else(|| tools.join("downloads"));
     std::fs::create_dir_all(&downloads).map_err(|error| format!("Cannot make the folder for the download: {error}"))?;
     // Named as on its website, so that it reads right in Finder.
     let file = downloads.join(package.url.rsplit('/').next().unwrap_or("download.pkg"));
@@ -646,8 +661,11 @@ fn install_package(tool: Tool, package: &Package, tools: &Path, received: &Atomi
     if cancel.load(Ordering::Relaxed) {
         return Err("Stopped.".to_string());
     }
-    set_stage("Waiting for your password…");
-    let prompt = format!("Editor wants to install {name}.");
+    // Said before the dialog comes up, so that it does not come out of nowhere.
+    let place = if tool == Tool::MacTex { "/Library/TeX" } else { "a folder for the whole Mac" };
+    set_stage(&format!("macOS asks for your password next, since {name} goes into {place}. Editor never sees it."));
+    std::thread::sleep(Duration::from_secs(2));
+    let prompt = format!("Editor wants to install {name} into {place}, which needs your Mac password.");
     let output = Command::new("osascript")
         .args([
             "-e",
@@ -668,6 +686,48 @@ fn install_package(tool: Tool, package: &Package, tools: &Path, received: &Atomi
     }
     std::fs::remove_file(&file).ok();
     Ok(())
+}
+
+/// Why a command for an administrator did not run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AdminError {
+    /// The user closed the password dialog.
+    Closed,
+    Failed(String),
+}
+
+/// Runs `program` with `args` as an administrator, through the same password
+/// dialog of macOS as the installer packages, which shows `prompt`. Each part
+/// is quoted on its own, so no argument is read by a shell. Blocks.
+pub(crate) fn as_administrator(prompt: &str, program: &Path, args: &[&std::ffi::OsStr]) -> Result<(), AdminError> {
+    let output = Command::new("osascript")
+        .args([
+            "-e",
+            "on run argv",
+            "-e",
+            "set command to \"\"",
+            "-e",
+            "repeat with index from 2 to count of argv",
+            "-e",
+            "set command to command & quoted form of item index of argv & \" \"",
+            "-e",
+            "end repeat",
+            "-e",
+            "do shell script command with prompt (item 1 of argv) with administrator privileges",
+            "-e",
+            "end run",
+        ])
+        .arg(prompt)
+        .arg(program)
+        .args(args)
+        .output()
+        .map_err(|error| AdminError::Failed(format!("Cannot ask for the password: {error}")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let error = marketplace::failure(&output);
+    // -128 is the cancel button of the password dialog.
+    Err(if error.contains("-128") { AdminError::Closed } else { AdminError::Failed(error) })
 }
 
 fn check_package(package: &Package, file: &Path) -> Result<(), String> {
@@ -716,9 +776,35 @@ pub fn remove(tool: Tool, tools: &Path) -> Result<(), String> {
     };
     let folder = folder(tools, tool, &release);
     build::remove_directory(&folder);
-    match std::fs::remove_dir_all(&folder) {
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(format!("Cannot remove {}: {error}", tool.language())),
-        _ => Ok(()),
+    crate::storage::clear(&folder).map_err(|error| format!("Cannot remove {}: {error}", tool.language()))?;
+    // The packages it downloaded are no use without it.
+    if let Some(cache) = cache_directory(tool) {
+        crate::storage::clear(&cache).map_err(|error| format!("Cannot remove the packages of {}: {error}", tool.language()))?;
+    }
+    Ok(())
+}
+
+/// Removes the folders of versions the app no longer installs, which an update
+/// of the pinned version leaves behind. Only folders named after a program the
+/// app installs itself go, so downloads and anything else stay.
+pub fn remove_old_versions(tools: &Path) {
+    let pinned: Vec<(&str, &str)> = Tool::ALL.into_iter().filter_map(|tool| Some((tool.program(), tool.release()?.version))).collect();
+    remove_versions_except(tools, &pinned);
+}
+
+/// Removes `<program>-<version>` folders whose version is not the one in `pinned`.
+fn remove_versions_except(tools: &Path, pinned: &[(&str, &str)]) {
+    let Ok(entries) = std::fs::read_dir(tools) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let old = pinned.iter().any(|(program, version)| {
+            name.strip_prefix(program).and_then(|rest| rest.strip_prefix('-')).is_some_and(|found| found != *version && found.starts_with(|first: char| first.is_ascii_digit()))
+        });
+        if old && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            std::fs::remove_dir_all(entry.path()).ok();
+        }
     }
 }
 
@@ -1144,7 +1230,7 @@ fn install_homebrew(tools: &Path, job: &JobHandle) -> Result<(), String> {
     homebrew().map(|_| ()).ok_or_else(|| "Homebrew's installer ended, but Homebrew is not there.".to_string())
 }
 
-fn small_button(id: (&'static str, usize), label: &'static str, primary: bool, on_click: impl Fn(&mut App) + 'static) -> impl IntoElement {
+pub(crate) fn small_button(id: (&'static str, usize), label: impl Into<SharedString>, primary: bool, on_click: impl Fn(&mut App) + 'static) -> impl IntoElement {
     let palette = theme::palette();
     div()
         .id(id)
@@ -1158,7 +1244,7 @@ fn small_button(id: (&'static str, usize), label: &'static str, primary: bool, o
         .when(primary, |style| style.text_color(theme::color(palette.on_accent)))
         .hover(|style| style.opacity(0.85))
         .on_click(move |_, _, cx| on_click(cx))
-        .child(label)
+        .child(label.into())
 }
 
 /// One row per tool: what it is for, where it comes from, and a button to
@@ -1495,6 +1581,20 @@ mod tests {
         assert_eq!(Tool::MacTex.formula(), None);
         assert!(Tool::MacTex.package().is_some_and(|package| package.signer.is_some() && package.sha512_url.is_some()));
         assert!(Tool::Homebrew.package().is_some_and(|package| package.sha256.is_some_and(|sha256| sha256.len() == 64)));
+    }
+
+    #[test]
+    fn only_old_versions_of_known_programs_go() {
+        let directory = tempdir().unwrap();
+        let tools = directory.path();
+        for name in ["typst-0.14.0", "typst-0.15.1", "tectonic-0.16.0", "pandoc-3.14", "downloads", "typst-notes", "other-1.0", ".unpack-x"] {
+            fs::create_dir(tools.join(name)).unwrap();
+        }
+        fs::write(tools.join("typst-0.13.0"), "a file, not an install").unwrap();
+        remove_versions_except(tools, &[("typst", "0.15.1"), ("tectonic", "0.17.0")]);
+        let mut left: Vec<_> = fs::read_dir(tools).unwrap().map(|entry| entry.unwrap().file_name().into_string().unwrap()).collect();
+        left.sort();
+        assert_eq!(left, [".unpack-x", "downloads", "other-1.0", "pandoc-3.14", "typst-0.13.0", "typst-0.15.1", "typst-notes"]);
     }
 
     #[test]

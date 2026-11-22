@@ -13,4 +13,4 @@ pub mod syntax;
 pub use buffer::Buffer;
 pub use selection::{Selection, SelectionSet};
 pub use state::{Decoration, DecorationKind, EditorState, LineChange, Mark, MarkSeverity, Motion, TextChange};
-pub use syntax::{Heading, HeadingKind, HighlightKind, HighlightSpan, Language, ParseJob, ParseResult, Symbol, SymbolKind, Syntax};
+pub use syntax::{Heading, HeadingKind, HighlightKind, HighlightSpan, Language, ParseJob, ParseResult, ParseTimings, Symbol, SymbolKind, Syntax, outline_of};

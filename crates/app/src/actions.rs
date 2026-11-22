@@ -1,6 +1,21 @@
 use gpui::{Action, App, KeyBinding, KeyBindingContextPredicate, actions};
 
-use crate::keymap::Keymap;
+use crate::keymap::{ADDON_PREFIX, Keymap};
+
+/// Runs a command that an add-on declared in its manifest.
+#[derive(Clone, Debug, PartialEq, Eq, Action)]
+#[action(namespace = editor, no_json)]
+pub struct RunAddonCommand {
+    pub addon: String,
+    pub command: String,
+}
+
+/// An add-on command with its default keys, for binding.
+pub struct AddonBinding {
+    pub addon: String,
+    pub command: String,
+    pub keys: Vec<String>,
+}
 
 actions!(
     editor,
@@ -88,12 +103,14 @@ actions!(
         LayoutPdfTab,
         ToggleFocusMode,
         ToggleHub,
+        CommandPalette,
         StartTour,
         OpenGitPanel,
         StartPresentation,
         ExitPresentation,
         PdfNextPage,
         PdfPreviousPage,
+        MoveToApplications,
     ]
 );
 
@@ -109,6 +126,12 @@ pub struct Command {
 }
 
 impl Command {
+    /// Whether it makes sense to run from the palette, outside a special state
+    /// such as an open completion list or a presentation.
+    pub fn runs_anywhere(&self) -> bool {
+        self.id != "close_menu" && self.id != "command_palette" && self.context.is_none_or(|context| context == "Editor")
+    }
+
     pub fn action(&self) -> Box<dyn Action> {
         (self.action)()
     }
@@ -135,6 +158,7 @@ pub const COMMANDS: &[Command] = &[
     command!("new_file", "General", "New file", NewFile, None, &["secondary-n"]),
     command!("open_folder", "General", "Open folder", OpenFolder, None, &["secondary-o"]),
     command!("project_hub", "General", "Project hub", ToggleHub, None, &["secondary-shift-p"]),
+    command!("command_palette", "General", "Command palette", CommandPalette, None, &["secondary-k"]),
     command!("git_panel", "General", "Git panel", OpenGitPanel, None, &["secondary-shift-g"]),
     command!("close_tab", "General", "Close tab", CloseTab, None, &["secondary-w"]),
     command!("tab_1", "General", "Go to tab 1", GoToTab1, None, &["secondary-1"]),
@@ -219,7 +243,7 @@ pub const COMMANDS: &[Command] = &[
 
 /// Binds every command to its keys from `keymap`, in place of what was bound
 /// before. Returns the keys that gpui could not read.
-pub fn bind_keys(keymap: &Keymap, cx: &mut App) -> Vec<String> {
+pub fn bind_keys(keymap: &Keymap, addon_commands: &[AddonBinding], cx: &mut App) -> Vec<String> {
     let mut problems = Vec::new();
     let mut bindings = Vec::new();
     for command in COMMANDS {
@@ -229,6 +253,18 @@ pub fn bind_keys(keymap: &Keymap, cx: &mut App) -> Vec<String> {
             match KeyBinding::load(&keys, command.action(), predicate.clone(), false, None, cx) {
                 Ok(binding) => bindings.push(binding),
                 Err(_) => problems.push(format!("{}: cannot read the keys \"{keys}\"", command.id)),
+            }
+        }
+    }
+    // After the editor's own, so that an add-on's keys win where they overlap,
+    // as the user chose to turn it on.
+    for command in addon_commands {
+        let id = format!("{ADDON_PREFIX}{}.{}", command.addon, command.command);
+        for keys in keymap.addon_keys(&id, &command.keys) {
+            let action = RunAddonCommand { addon: command.addon.clone(), command: command.command.clone() };
+            match KeyBinding::load(&keys, Box::new(action), None, false, None, cx) {
+                Ok(binding) => bindings.push(binding),
+                Err(_) => problems.push(format!("{id}: cannot read the keys \"{keys}\"")),
             }
         }
     }

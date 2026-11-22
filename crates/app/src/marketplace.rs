@@ -78,7 +78,7 @@ pub fn parse_catalog(text: &str) -> Result<Vec<CatalogEntry>, String> {
         .addons
         .into_iter()
         .filter_map(|entry| serde_json::from_value::<CatalogEntry>(entry).ok())
-        .filter(|entry| entry.api == API_VERSION && entry.download().is_some())
+        .filter(|entry| (addon_api::OLDEST_API_VERSION..=API_VERSION).contains(&entry.api) && entry.download().is_some())
         .collect();
     entries.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(entries)

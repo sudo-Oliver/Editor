@@ -23,13 +23,12 @@ For LaTeX it offers the complete MacTeX (about 7 GB, every package offline) or t
 It shows the download and disk size of every part and checks the free space before anything starts. Then it installs in one of three ways:
 
 - **With Homebrew**, the default when Homebrew is already there: `brew install tectonic`, `typst` or `pandoc`.
-- **In the app's folder**, the default when it is not. Nobody without Homebrew has to know what it is. The official programs go into the app's own folder (`~/.config/editor/tools`), are checked against a fingerprint, and can be removed under Writing tools. No password.
+- **In the app's folder**, the default when it is not. Nobody without Homebrew has to know what it is. The official programs go into the app's own folder (`~/Library/Application Support/io.github.sudo-oliver.editor/tools`), are checked against a fingerprint, and can be removed under Writing tools. No password. The packages Tectonic and Typst download go to `~/Library/Caches/io.github.sudo-oliver.editor`, and removing either removes its packages too.
 - **Install Homebrew first**, under "Other ways to install". Apple's developer tools through Apple's own dialog, then Homebrew's official installer, which asks for your password once, then the formulas.
 - **By hand**, also under "Other ways to install". The setup lists each file with its download link and says where it goes: programs into `~/Applications/Editor Tools` (packed or unpacked), MacTeX through its own installer. It notices the files on its own, checks them and makes them runnable.
 
 MacTeX always comes from its official package, checked against CTAN's checksum and its author's signature, and installed to `/Library/TeX` after macOS asks for your password.
-With the complete LaTeX, the setup also installs the compact one first, so that you can start writing after about a minute; MacTeX takes over once its download is done.
-Big downloads run in the background: you can start writing at once, the status bar shows how far it is, and the first PDF follows once the compiler is there.
+MacTeX is the recommended LaTeX: you wait once for its download, about 15 minutes on a fast connection, and the setup shows how long it still takes. After that everything works offline.
 At the end, a test document compiles in each chosen language, so that the setup only says "all set" when it works.
 To add a language later, open the setup again from the project hub. Pandoc, which only the Word and HTML exports need, installs on the first such export.
 If you already have MacTeX, Typst or Homebrew, the setup sees them and the app uses them.
@@ -37,11 +36,42 @@ If you already have MacTeX, Typst or Homebrew, the setup sees them and the app u
 Git and GitHub are not part of the setup. The git panel sets them up when you want them: "Set up git" opens Apple's dialog for its developer tools, and "Put it on GitHub" signs you in through the browser, creates a private repository and pushes.
 Then a welcome document opens and a tour shows each part of the editor. Help, Editor tour plays it again.
 
+## First open
+
+Editor is free and not registered with Apple, so macOS warns the first time you open it. That is expected, and it asks only once.
+The dmg has the same steps in "First open.txt".
+
+1. Drag Editor onto the Applications folder in the dmg window, then open Editor from Applications.
+2. macOS says it cannot check Editor for malicious software. Click **Done**.
+   <!-- TODO: screenshot of the warning -->
+3. Open **System Settings**, then **Privacy & Security**, and scroll down to "Editor was blocked to protect your Mac". Click **Open Anyway** and confirm with your password or Touch ID.
+   <!-- TODO: screenshot of Privacy & Security with Open Anyway -->
+4. Confirm once more in the last question. From now on Editor opens like any other app.
+
+On macOS 14 and earlier, right-click Editor in Applications, choose **Open**, and click **Open** in the question instead.
+If you are at home in Terminal, this line does the same in one step:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Editor.app
+```
+
+If Editor starts from the dmg or from Downloads, a bar offers to move it to Applications. It copies itself there, starts again and ejects the dmg; from Applications it can update itself.
+
 ## Updates
 
-The app asks GitHub for the newest release a few seconds after it starts and then every six hours. When there is a newer one, a bar offers "Update and restart". The app downloads the dmg, checks it against the checksum GitHub lists for it, its bundle identifier, its version and its signature (the same Apple team as the running app), puts it in place of the old app and starts again. Open files are saved first. If anything fails, the old app stays as it was.
+The app asks GitHub for the newest release a few seconds after it starts and then every six hours. When there is a newer one, a bar offers "Update and restart". The app downloads the dmg, checks it against the checksum GitHub lists for it, its bundle identifier, its version and its signature (intact, and from the same Apple team as the running app when that one has a team; a release signed ad hoc has none), puts it in place of the old app and starts again. Open files are saved first. If anything fails, the old app stays as it was.
 An app installed with the Homebrew cask updates through `brew upgrade --cask` instead, so that Homebrew stays in step.
 Only an app bundle updates itself, never a build run with cargo. The only request is one to `api.github.com`, with nothing about you in it.
+
+### LaTeX updates
+
+MacTeX keeps itself current from inside the app, without Homebrew or the Terminal.
+
+- Once a week the app asks TeX Live's package manager, `tlmgr`, which packages have newer versions. Asking needs no password, and without internet it simply tries again later.
+- Settings, Writing tools shows the installed TeX Live year, when it last checked and how many updates there are. "Update LaTeX packages" first says why the password is needed, then macOS asks for it once, since MacTeX belongs to the system. `tlmgr` then updates itself and every package. Closing the password dialog changes nothing.
+- When a document stops because a package is missing or too old, the error offers the same update.
+- Each spring tug.org publishes the TeX Live of the new year, which the old one cannot update to. The weekly check notices, since `tlmgr` then names the new year. The app offers "Install MacTeX 2027" (or whichever year), the same download as in the setup. Your LaTeX keeps working until the new one is installed.
+- The old year stays on the disk until you remove it: the settings show how much space it takes and remove it after asking for confirmation and your password. Nothing is ever deleted on its own.
 
 ## Building a release
 
@@ -187,7 +217,7 @@ The crate `addon_api` describes the protocol: one JSON message per line over std
 
 ## Settings
 
-The gear at the bottom left opens the settings, the question mark above it lists the keyboard shortcuts. Cmd+, (macOS) or Ctrl+, (Linux) also opens the settings. They are stored in `~/.config/editor/settings.toml`, or under `XDG_CONFIG_HOME` if it is set. Project settings stay in `.editor.toml`.
+The gear at the bottom left opens the settings, the question mark above it lists the keyboard shortcuts. Cmd+, (macOS) or Ctrl+, (Linux) also opens the settings. They are stored in `~/Library/Application Support/io.github.sudo-oliver.editor/settings.toml` on macOS, next to everything else the app keeps, and in `~/.config/editor/settings.toml` on Linux, or under `XDG_CONFIG_HOME` if it is set. Caches and downloads go to `~/Library/Caches/io.github.sudo-oliver.editor`. Project settings stay in `.editor.toml`.
 
 ## Vim mode
 

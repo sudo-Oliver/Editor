@@ -29,6 +29,8 @@ use crate::{
     actions::*,
     completion::{self, Entry, Extra},
     smear::{self, Smear},
+    history,
+    text_file::{self, Encoding},
     theme,
 };
 
@@ -50,7 +52,44 @@ struct Completion {
     selected: usize,
 }
 
+/// Something dragged into a document: text from a panel, or a file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DragItem {
+    pub content: DragContent,
+    /// The add-on and the node it came from, to tell where it landed.
+    pub origin: Option<(String, String)>,
+    /// What the drag shows under the pointer.
+    pub label: SharedString,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DragContent {
+    Text(String),
+    File(PathBuf),
+}
+
+/// The small label that follows the pointer while dragging.
+pub struct DragPreview(pub SharedString);
+
+impl Render for DragPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let palette = theme::palette();
+        div()
+            .px(px(8.))
+            .py(px(3.))
+            .rounded(px(6.))
+            .bg(theme::color(palette.panel))
+            .border_1()
+            .border_color(theme::color(palette.accent))
+            .text_size(px(12.))
+            .text_color(theme::color(palette.ui_text))
+            .child(self.0.clone())
+    }
+}
+
 pub enum EditorEvent {
+    /// Something was dropped, and the cursor stands where it goes.
+    Dropped(DragItem),
     Edited,
     /// Someone else changed the text, in a shared session.
     #[cfg_attr(not(feature = "collab"), allow(dead_code))]
@@ -179,6 +218,8 @@ pub struct EditorView {
     pub path: Option<PathBuf>,
     /// The file as this document last read or wrote it.
     disk_hash: u64,
+    /// How the file stores its characters, kept when saving.
+    encoding: &'static Encoding,
     focus_handle: FocusHandle,
     scroll_y: Pixels,
     rows: Rows,
@@ -249,6 +290,14 @@ fn is_conflict(disk: &[u8], known: u64, mine: &[u8]) -> bool {
 }
 
 impl EditorView {
+    /// Text read in the current encoding always encodes back to the same bytes.
+    fn set_disk_hash(&mut self, text: &str) {
+        let bytes = text_file::encode(text, self.encoding).unwrap_or(std::borrow::Cow::Borrowed(text.as_bytes()));
+        self.disk_hash = content_hash(&bytes);
+    }
+}
+
+impl EditorView {
     pub fn new(text: &str, path: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
         let language = path
             .as_deref()
@@ -257,6 +306,7 @@ impl EditorView {
             state: EditorState::new(text, language),
             path,
             disk_hash: content_hash(text.as_bytes()),
+            encoding: text_file::UTF_8,
             focus_handle: cx.focus_handle(),
             scroll_y: px(0.),
             rows: Rows::default(),
@@ -313,10 +363,11 @@ impl EditorView {
         let Some(base) = self.diff_base.clone() else {
             return;
         };
-        let text = self.state.buffer().to_string();
+        // Cloning the buffer is cheap, and the text is built away from typing.
+        let buffer = self.state.buffer().clone();
         self.diff_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(delay).await;
-            let hunks = cx.background_spawn(async move { line_diff(&base, &text).unwrap_or_default() }).await;
+            let hunks = cx.background_spawn(async move { line_diff(&base, &buffer.to_string()).unwrap_or_default() }).await;
             this.update(cx, |this, cx| {
                 this.diff_task = None;
                 if this.diff_hunks != hunks {
@@ -395,26 +446,57 @@ impl EditorView {
             return Ok(false);
         }
         let text = self.state.buffer().to_string();
+        let bytes = self.bytes_of(&text)?;
+        let disk = std::fs::read(path).ok();
         // A file that went away or cannot be read has nothing to protect here.
-        if std::fs::read(path).is_ok_and(|disk| is_conflict(&disk, self.disk_hash, text.as_bytes())) {
+        if disk.as_deref().is_some_and(|disk| is_conflict(disk, self.disk_hash, &bytes)) {
             return Err(io::Error::other(SaveConflict));
         }
-        self.write_text(&text, cx)?;
+        self.keep_version(disk.as_deref(), &bytes);
+        self.write_bytes(&bytes, cx)?;
         Ok(true)
     }
 
     /// Replaces the file even though it changed on disk.
     pub fn save_anyway(&mut self, cx: &mut Context<Self>) -> io::Result<()> {
         let text = self.state.buffer().to_string();
-        self.write_text(&text, cx)
+        let bytes = self.bytes_of(&text)?;
+        let disk = self.path.as_deref().and_then(|path| std::fs::read(path).ok());
+        self.keep_version(disk.as_deref(), &bytes);
+        self.write_bytes(&bytes, cx)
     }
 
-    fn write_text(&mut self, text: &str, cx: &mut Context<Self>) -> io::Result<()> {
+    /// Puts what is about to be replaced into the file's history. The history
+    /// only adds safety, so a failure there never stops a save.
+    fn keep_version(&self, old: Option<&[u8]>, new: &[u8]) {
+        if let (Some(path), Some(directory), Some(old)) = (&self.path, history::directory(), old)
+            && old != new
+        {
+            history::keep(&directory, path, old).ok();
+        }
+    }
+
+    /// Keeps the text as it is now, before something replaces it.
+    pub fn keep_current_text(&self) {
+        let text = self.state.buffer().to_string();
+        let bytes = text_file::encode(&text, self.encoding).unwrap_or(std::borrow::Cow::Borrowed(text.as_bytes()));
+        self.keep_version(Some(&bytes), &[]);
+    }
+
+    /// The text in the file's own encoding. A character it lacks stops the save,
+    /// since writing a stand-in would change the text without a word.
+    fn bytes_of(&self, text: &str) -> io::Result<Vec<u8>> {
+        text_file::encode(text, self.encoding)
+            .map(std::borrow::Cow::into_owned)
+            .map_err(|character| text_file::unencodable(character, self.encoding))
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8], cx: &mut Context<Self>) -> io::Result<()> {
         let Some(path) = &self.path else {
             return Ok(());
         };
-        crate::atomic::write(path, text.as_bytes())?;
-        self.disk_hash = content_hash(text.as_bytes());
+        crate::atomic::write(path, bytes)?;
+        self.disk_hash = content_hash(bytes);
         self.state.mark_saved();
         cx.notify();
         Ok(())
@@ -422,7 +504,43 @@ impl EditorView {
 
     /// Writes this text somewhere else. The document and its file stay as they are.
     pub fn save_copy(&self, target: &Path) -> io::Result<()> {
-        crate::atomic::write(target, self.state.buffer().to_string().as_bytes())
+        crate::atomic::write(target, &self.bytes_of(&self.state.buffer().to_string())?)
+    }
+
+    /// The file went away on disk. Its text is now the only copy.
+    pub fn mark_file_gone(&mut self, cx: &mut Context<Self>) {
+        self.state.mark_unsaved();
+        cx.notify();
+    }
+
+    /// The encoding the file was read in. Anything but UTF-8 is worth a mention.
+    pub fn encoding(&self) -> &'static Encoding {
+        self.encoding
+    }
+
+    /// Takes the encoding of the file this text came from.
+    pub fn set_encoding(&mut self, encoding: &'static Encoding) {
+        self.encoding = encoding;
+        let text = self.state.buffer().to_string();
+        if let Ok(bytes) = text_file::encode(&text, encoding) {
+            self.disk_hash = content_hash(&bytes);
+        }
+    }
+
+    /// From now on saves as UTF-8. The text stays, and the next save rewrites the file.
+    pub fn convert_to_utf8(&mut self, cx: &mut Context<Self>) {
+        if self.encoding == text_file::UTF_8 {
+            return;
+        }
+        self.encoding = text_file::UTF_8;
+        // LaTeX has to read the file the new way too.
+        let text = self.state.buffer().to_string();
+        if let Some(range) = text_file::inputenc_option(&text) {
+            self.edit_from_outside(range, "utf8", cx);
+        }
+        // The file on disk is still the old encoding, so it counts as changed.
+        self.state.mark_unsaved();
+        cx.notify();
     }
 
     /// Takes the file from disk and drops local edits, which undo can bring back.
@@ -430,8 +548,14 @@ impl EditorView {
         let Some(path) = &self.path else {
             return Ok(());
         };
-        let text = std::fs::read_to_string(path)?;
-        self.disk_hash = content_hash(text.as_bytes());
+        let loaded = text_file::read(path)?;
+        // Local edits that the disk version replaces stay in the history.
+        if self.state.is_dirty() {
+            self.keep_current_text();
+        }
+        let text = loaded.text;
+        self.encoding = loaded.encoding;
+        self.set_disk_hash(&text);
         self.may_conflict = text.contains(CONFLICT_START);
         self.state.reload(&text);
         self.schedule_parse(cx);
@@ -447,20 +571,23 @@ impl EditorView {
         if self.state.is_dirty() {
             return;
         }
-        let Ok(text) = std::fs::read_to_string(path) else {
+        let Ok(loaded) = text_file::read(path) else {
             return;
         };
         let version = self.state.version();
-        self.reload_text(&text, version, cx);
+        self.reload_text(&loaded.text, loaded.encoding, version, cx);
     }
 
     /// Takes text read from disk elsewhere, unless the document changed since then.
-    pub fn reload_text(&mut self, text: &str, version: u64, cx: &mut Context<Self>) {
+    pub fn reload_text(&mut self, text: &str, encoding: &'static Encoding, version: u64, cx: &mut Context<Self>) {
         if self.state.is_dirty() || self.state.version() != version {
             return;
         }
-        self.disk_hash = content_hash(text.as_bytes());
+        self.encoding = encoding;
+        self.set_disk_hash(text);
         if *self.state.buffer().rope() != text {
+            // Another program replaced the file, and this text is its old version.
+            self.keep_current_text();
             // A merge writes its conflicts to disk.
             self.may_conflict = text.contains(CONFLICT_START);
             self.state.reload(text);
@@ -495,6 +622,16 @@ impl EditorView {
         self.autoscroll = true;
         self.center_on_scroll = true;
         self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    /// Puts the cursor at a zero-based line and column, without taking the focus.
+    pub fn place_cursor(&mut self, line: usize, column: usize, cx: &mut Context<Self>) {
+        let offset = self.state.buffer().point_to_offset(line, column);
+        self.state.set_selections(vec![Selection::cursor(offset)]);
+        self.vim_after_mouse();
+        self.autoscroll = true;
+        self.center_on_scroll = true;
         cx.notify();
     }
 
@@ -666,6 +803,25 @@ impl EditorView {
             vim.enter_insert(&self.state);
         }
         self.state.insert_snippet(template, math);
+        self.changed(cx);
+    }
+
+    /// Puts the cursor where the pointer let go, for the workspace to place the item.
+    fn drop_at(&mut self, item: DragItem, window: &mut Window, cx: &mut Context<Self>) {
+        let offset = self.position_to_offset(window.mouse_position(), window);
+        self.state.set_selections(vec![Selection::cursor(offset)]);
+        self.vim_after_mouse();
+        self.focus_handle.focus(window, cx);
+        cx.emit(EditorEvent::Dropped(item));
+        cx.notify();
+    }
+
+    /// Puts `text` in place of the selection, as pasting would.
+    pub fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        if let Some(vim) = &mut self.vim {
+            vim.enter_insert(&self.state);
+        }
+        self.state.paste(text);
         self.changed(cx);
     }
 
@@ -968,6 +1124,16 @@ impl EditorView {
         self.scroll_y = self.scroll_y.clamp(px(0.), max);
     }
 
+    /// The lines on screen, from zero, or `None` before the first paint.
+    pub fn visible_lines(&self) -> Option<Range<usize>> {
+        let bounds = self.bounds?;
+        let last_row = self.rows.count().checked_sub(1)?;
+        let line_height = Self::line_height();
+        let first_row = ((self.scroll_y / line_height) as usize).min(last_row);
+        let bottom_row = (first_row + (bounds.size.height / line_height) as usize).saturating_sub(1).clamp(first_row, last_row);
+        Some(self.rows.locate(first_row).0..self.rows.locate(bottom_row).0 + 1)
+    }
+
     fn visible_page_rows(&self) -> usize {
         self.bounds
             .map_or(30, |bounds| (bounds.size.height / Self::line_height()) as usize)
@@ -1181,7 +1347,18 @@ impl Render for EditorView {
             .track_focus(&self.focus_handle)
             .size_full()
             .bg(theme::color(theme::palette().bg))
-            .cursor(CursorStyle::IBeam);
+            .cursor(CursorStyle::IBeam)
+            .when(!self.state.is_read_only() && !self.plain, |root| {
+                root.drag_over::<DragItem>(|style, _, _, _| style.bg(theme::color(theme::palette().panel)))
+                    .drag_over::<gpui::ExternalPaths>(|style, _, _, _| style.bg(theme::color(theme::palette().panel)))
+                    .on_drop(cx.listener(|this, item: &DragItem, window, cx| this.drop_at(item.clone(), window, cx)))
+                    .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                        for path in paths.paths() {
+                            let label = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+                            this.drop_at(DragItem { content: DragContent::File(path.clone()), origin: None, label: label.into() }, window, cx);
+                        }
+                    }))
+            });
         motion_actions!(self, root, cx;
             MoveLeft => Left, false;
             MoveRight => Right, false;

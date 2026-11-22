@@ -34,6 +34,8 @@ pub struct Settings {
     pub first_run_done: bool,
     /// The editor tour ran or was skipped, so it does not start by itself again.
     pub tour_done: bool,
+    /// "Don't ask again" on the offer to move the app to Applications.
+    pub move_declined: bool,
     /// The hub shows projects as cards rather than rows.
     pub hub_cards: bool,
     /// Compilers come from Homebrew when it is installed, rather than into the
@@ -71,6 +73,7 @@ impl Default for Settings {
             compile_while_typing: false,
             first_run_done: false,
             tour_done: false,
+            move_declined: false,
             hub_cards: true,
             use_homebrew: true,
             paper_mode: false,
@@ -108,10 +111,7 @@ impl Settings {
 
 /// Where the editor keeps what belongs to the user and not to a project.
 pub fn config_dir() -> Option<PathBuf> {
-    let config = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-    Some(config.join("editor"))
+    crate::storage::data_dir()
 }
 
 pub fn default_path() -> Option<PathBuf> {
@@ -155,7 +155,7 @@ mod tests {
     fn settings_survive_a_restart() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("nested").join("settings.toml");
-        let settings = Settings { vim_mode: true, smooth_cursor: false, auto_scroll_pdf: true, auto_suggestions: false, package_hints: false, theme: Some("vesper".to_string()), show_breadcrumbs: false, show_tabs: false, collab_name: "Ada".to_string(), git_background_sync: false, trusted_git_roots: vec![PathBuf::from("/a")], compile_while_typing: true, first_run_done: true, tour_done: true, hub_cards: false, use_homebrew: false, paper_mode: true, ruled_lines: true, paper_dark: true, editor_font: Some("Fira Code".to_string()), ui_font: None, editor_font_size: Some(14) };
+        let settings = Settings { vim_mode: true, smooth_cursor: false, auto_scroll_pdf: true, auto_suggestions: false, package_hints: false, theme: Some("vesper".to_string()), show_breadcrumbs: false, show_tabs: false, collab_name: "Ada".to_string(), git_background_sync: false, trusted_git_roots: vec![PathBuf::from("/a")], compile_while_typing: true, first_run_done: true, tour_done: true, move_declined: true, hub_cards: false, use_homebrew: false, paper_mode: true, ruled_lines: true, paper_dark: true, editor_font: Some("Fira Code".to_string()), ui_font: None, editor_font_size: Some(14) };
         settings.save(&path).unwrap();
         assert_eq!(Settings::load(&path), settings);
     }
@@ -165,6 +165,6 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.toml");
         std::fs::write(&path, "vim_mode = true").unwrap();
-        assert_eq!(Settings::load(&path), Settings { vim_mode: true, smooth_cursor: true, auto_scroll_pdf: false, auto_suggestions: true, package_hints: true, theme: None, show_breadcrumbs: true, show_tabs: true, collab_name: String::new(), git_background_sync: true, trusted_git_roots: Vec::new(), compile_while_typing: false, first_run_done: false, tour_done: false, hub_cards: true, use_homebrew: true, paper_mode: false, ruled_lines: false, paper_dark: false, editor_font: None, ui_font: None, editor_font_size: None });
+        assert_eq!(Settings::load(&path), Settings { vim_mode: true, smooth_cursor: true, auto_scroll_pdf: false, auto_suggestions: true, package_hints: true, theme: None, show_breadcrumbs: true, show_tabs: true, collab_name: String::new(), git_background_sync: true, trusted_git_roots: Vec::new(), compile_while_typing: false, first_run_done: false, tour_done: false, move_declined: false, hub_cards: true, use_homebrew: true, paper_mode: false, ruled_lines: false, paper_dark: false, editor_font: None, ui_font: None, editor_font_size: None });
     }
 }

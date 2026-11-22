@@ -15,7 +15,7 @@ impl Program {
         if !output.status.success() {
             return Err(short_error(&output));
         }
-        ignore_build_output(directory).map_err(|error| format!("Cannot write .gitignore: {error}"))?;
+        ignore_build_output(&directory.join(".gitignore")).map_err(|error| format!("Cannot write .gitignore: {error}"))?;
         self.discover(directory)?.ok_or_else(|| "git init did not create a repository.".to_string())
     }
 
@@ -38,9 +38,9 @@ impl Program {
     }
 }
 
-fn ignore_build_output(directory: &Path) -> std::io::Result<()> {
-    let path = directory.join(".gitignore");
-    let existing = match fs::read_to_string(&path) {
+/// Adds the build folder to an ignore file, once.
+fn ignore_build_output(path: &Path) -> std::io::Result<()> {
+    let existing = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(error),
@@ -72,6 +72,21 @@ impl Repository {
 
     pub fn unstage_all(&self) -> Result<(), String> {
         self.run(["reset", "-q"]).map(drop)
+    }
+
+    /// Keeps build output out of other git programs too. It goes into the
+    /// repository's own exclude file, since a tracked `.gitignore` is the user's.
+    pub fn ignore_build_output_locally(&self) -> Result<(), String> {
+        let ignored = self.command().args(["check-ignore", "-q", BUILD_IGNORE]).output().map_err(|error| format!("Cannot start git: {error}"))?;
+        if ignored.status.success() {
+            return Ok(());
+        }
+        let exclude = self.root.join(self.run(["rev-parse", "--git-path", "info/exclude"])?.trim_end_matches(['\n', '\r']));
+        exclude
+            .parent()
+            .map_or(Ok(()), fs::create_dir_all)
+            .and_then(|()| ignore_build_output(&exclude))
+            .map_err(|error| format!("Cannot write {}: {error}", exclude.display()))
     }
 
     pub fn commit(&self, message: &str) -> Result<(), String> {
@@ -192,6 +207,26 @@ mod tests {
         program().init(directory.path()).unwrap();
         program().init(directory.path()).unwrap();
         assert_eq!(fs::read_to_string(directory.path().join(".gitignore")).unwrap(), "*.log\n.build/\n");
+    }
+
+    #[test]
+    fn build_output_is_ignored_locally_once() {
+        let directory = tempdir().unwrap();
+        let ignoring = repository(directory.path());
+        write(directory.path(), ".gitignore", "*.log");
+        ignoring.ignore_build_output_locally().unwrap();
+        ignoring.ignore_build_output_locally().unwrap();
+        let exclude = fs::read_to_string(directory.path().join(".git/info/exclude")).unwrap();
+        assert_eq!(exclude.lines().filter(|line| *line == BUILD_IGNORE).count(), 1);
+        assert_eq!(fs::read_to_string(directory.path().join(".gitignore")).unwrap(), "*.log");
+
+        // Ignored already, so the exclude file stays as it is.
+        let other = tempdir().unwrap();
+        let ignored = repository(other.path());
+        write(other.path(), ".gitignore", ".build/\n");
+        let before = fs::read_to_string(other.path().join(".git/info/exclude")).unwrap_or_default();
+        ignored.ignore_build_output_locally().unwrap();
+        assert_eq!(fs::read_to_string(other.path().join(".git/info/exclude")).unwrap_or_default(), before);
     }
 
     #[test]

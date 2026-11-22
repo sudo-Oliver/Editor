@@ -1,6 +1,8 @@
 mod actions;
 mod addon_panel;
+mod addon_reports;
 mod addons;
+mod app_location;
 mod assets;
 mod atomic;
 mod bib;
@@ -12,8 +14,10 @@ mod git_login;
 mod git_panel;
 mod github;
 mod home_view;
+mod history;
 mod image_view;
 mod keymap;
+mod markdown;
 mod marketplace;
 mod material_icons;
 mod nvim_themes;
@@ -35,6 +39,9 @@ mod shortcuts;
 mod smear;
 mod snippets;
 mod status_bar;
+mod storage;
+mod texlive;
+mod text_file;
 mod theme;
 mod toolchain;
 mod tour;
@@ -53,6 +60,9 @@ fn main() {
     git_login::answer_if_asked();
     // Old macOS versions add a process serial number when Finder starts the app.
     let root = std::env::args_os().skip(1).find(|argument| !argument.to_string_lossy().starts_with("-psn_")).map(PathBuf::from);
+    // Before anything reads its settings or tools from the old place.
+    storage::migrate();
+    std::thread::spawn(storage::sweep);
     toolchain::register_installed();
 
     // Files and folders from Finder, the Dock and the `editor` command arrive
@@ -69,7 +79,13 @@ fn main() {
                 .add_fonts(assets::FONTS.iter().map(|font| std::borrow::Cow::Borrowed(*font)).collect())
                 .expect("the bundled fonts load");
             cx.on_action(|_: &actions::Quit, cx| cx.quit());
-            cx.set_menus([Menu::new("Editor").items([MenuItem::action("Quit", actions::Quit)])]);
+            let mut items = Vec::new();
+            // For the keyboard too, through the menu bar, as the offer itself is a bar.
+            if app_location::running().is_some() {
+                items.push(MenuItem::action("Move to Applications…", actions::MoveToApplications));
+            }
+            items.push(MenuItem::action("Quit", actions::Quit));
+            cx.set_menus([Menu::new("Editor").items(items)]);
 
             let bounds = Bounds::centered(None, size(px(1400.), px(900.)), cx);
             let root = root.clone();

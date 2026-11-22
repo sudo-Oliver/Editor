@@ -1,8 +1,13 @@
-use std::{ops::Range, path::Path, sync::OnceLock};
+use std::{
+    ops::Range,
+    path::Path,
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
+};
 
 use ropey::Rope;
 use streaming_iterator::StreamingIterator;
-use tree_sitter::{InputEdit, Language as TsLanguage, Node, Parser, Query, QueryCursor, TextProvider, Tree};
+use tree_sitter::{InputEdit, Language as TsLanguage, Node, Parser, Query, QueryCursor, TextProvider, Tree, TreeCursor};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Language {
@@ -404,33 +409,239 @@ impl KindTable {
     }
 }
 
+/// The outline of a document, with the bytes of the node behind each entry, so
+/// that the next parse can keep the entries of the parts that an edit left alone.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Outline {
+    headings: Vec<Heading>,
+    heading_nodes: Vec<Range<usize>>,
+    symbols: Vec<Symbol>,
+    symbol_nodes: Vec<Range<usize>>,
+}
+
+/// What the previous outline says about the new tree: where the edits went, and
+/// the old entries moved to where their nodes are now.
+struct Reuse<'a> {
+    old_tree: &'a Tree,
+    /// The edited bytes, sorted and disjoint. A node that touches one is walked again.
+    dirty: Vec<Range<usize>>,
+    headings: Vec<(Range<usize>, Heading)>,
+    symbols: Vec<(Range<usize>, Symbol)>,
+}
+
+/// How much of a node the previous outline still knows.
+#[derive(PartialEq)]
+enum Kept {
+    /// The node and its old entries are as they were.
+    Yes,
+    /// The node is new or edited, though parts of it may be kept.
+    No,
+    /// The node is kept but sits elsewhere now, so all of it needs a walk.
+    Moved,
+}
+
+/// What an entry depends on outside of its node: whether headings count there,
+/// and the environment that gives a caption its kind.
+#[derive(PartialEq)]
+struct Context {
+    heading_free: bool,
+    caption: Option<HeadingKind>,
+}
+
+impl<'a> Reuse<'a> {
+    fn new(old: &Outline, edits: &[InputEdit], old_tree: &'a Tree) -> Self {
+        let mut dirty: Vec<Range<usize>> = Vec::with_capacity(edits.len());
+        for (index, edit) in edits.iter().enumerate() {
+            let mut range = edit.start_byte..edit.new_end_byte;
+            for later in &edits[index + 1..] {
+                range = edited_range(range, later);
+            }
+            dirty.push(range);
+        }
+        dirty.sort_by_key(|range| range.start);
+        let mut merged: Vec<Range<usize>> = Vec::with_capacity(dirty.len());
+        for range in dirty {
+            match merged.last_mut() {
+                Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+                _ => merged.push(range),
+            }
+        }
+        let headings = old
+            .heading_nodes
+            .iter()
+            .zip(&old.headings)
+            .filter_map(|(node, heading)| {
+                let (node, line) = moved(node.clone(), heading.line, edits)?;
+                Some((node, Heading { line, ..heading.clone() }))
+            })
+            .collect();
+        let symbols = old
+            .symbol_nodes
+            .iter()
+            .zip(&old.symbols)
+            .filter_map(|(node, symbol)| Some((moved(node.clone(), 0, edits)?.0, symbol.clone())))
+            .collect();
+        Self { old_tree, dirty: merged, headings, symbols }
+    }
+
+    /// Whether the node under `cursor` is a subtree of the old tree that the parser
+    /// kept, away from the edits and in the same context, so its old entries hold.
+    fn check(&self, config: &LanguageConfig, cursor: &TreeCursor, rope: &Rope) -> Kept {
+        let node = cursor.node();
+        let range = node.byte_range();
+        let index = self.dirty.partition_point(|dirty| dirty.end < range.start);
+        if self.dirty.get(index).is_some_and(|dirty| touches(dirty, &range)) {
+            return Kept::No;
+        }
+        // Old entries are told apart by their bytes, so a parent with the same bytes
+        // that the walk saw already would come twice.
+        let mut parent = cursor.clone();
+        if parent.goto_parent() && parent.node().byte_range() == range {
+            return Kept::No;
+        }
+        // The parser hands kept subtrees to the new tree as they are, so their ids match.
+        let mut old = self.old_tree.walk();
+        while old.node().id() != node.id() {
+            let current = old.node();
+            if current.start_byte() > range.start
+                || current.end_byte() < range.end
+                || old.goto_first_child_for_byte(range.start).is_none()
+            {
+                return Kept::No;
+            }
+        }
+        match context(config, cursor.clone(), rope, false) {
+            Some(new) if context(config, old, rope, true).as_ref() == Some(&new) => Kept::Yes,
+            _ => Kept::Moved,
+        }
+    }
+
+    /// Copies the old entries of the nodes inside `node`, which did not change.
+    fn copy(&self, node: &Range<usize>, outline: &mut Outline) {
+        fn inside<T: Clone>(entries: &[(Range<usize>, T)], node: &Range<usize>, nodes: &mut Vec<Range<usize>>, out: &mut Vec<T>) {
+            let first = entries.partition_point(|(range, _)| range.start < node.start);
+            for (range, entry) in &entries[first..] {
+                if range.start > node.end || (range.start == node.end && !node.is_empty()) {
+                    break;
+                }
+                if range.end <= node.end {
+                    nodes.push(range.clone());
+                    out.push(entry.clone());
+                }
+            }
+        }
+        inside(&self.headings, node, &mut outline.heading_nodes, &mut outline.headings);
+        inside(&self.symbols, node, &mut outline.symbol_nodes, &mut outline.symbols);
+    }
+}
+
+/// The context of the node under `cursor`, from its ancestors. In the old tree an
+/// environment whose name an edit touched has no answer, as its text is gone.
+fn context(config: &LanguageConfig, mut cursor: TreeCursor, rope: &Rope, old: bool) -> Option<Context> {
+    let mut context = Context { heading_free: false, caption: None };
+    while cursor.goto_parent() {
+        let node = cursor.node();
+        context.heading_free |= config.heading_skip.has(node);
+        if context.caption.is_none()
+            && node.kind() == "generic_environment"
+            && let Some(begin) = node.child_by_field_name("begin")
+        {
+            if old && begin.has_changes() {
+                return None;
+            }
+            if let Some(name) = begin.child_by_field_name("name") {
+                let name = rope.read(name.byte_range());
+                if name.contains("table") {
+                    context.caption = Some(HeadingKind::Table);
+                } else if name.contains("figure") {
+                    context.caption = Some(HeadingKind::Figure);
+                }
+            }
+        }
+    }
+    Some(context)
+}
+
+/// Whether two ranges overlap or meet, which also counts an empty one at either end.
+fn touches(a: &Range<usize>, b: &Range<usize>) -> bool {
+    a.start <= b.end && b.start <= a.end
+}
+
+/// Where `range` of the text before `edit` ends up, grown to hold the edit when they touch.
+fn edited_range(range: Range<usize>, edit: &InputEdit) -> Range<usize> {
+    let shift = |offset: usize| offset - edit.old_end_byte + edit.new_end_byte;
+    if range.end < edit.start_byte {
+        range
+    } else if range.start > edit.old_end_byte {
+        shift(range.start)..shift(range.end)
+    } else {
+        let end = if range.end > edit.old_end_byte { shift(range.end) } else { edit.new_end_byte };
+        range.start.min(edit.start_byte)..end
+    }
+}
+
+/// Moves the node of an old entry and its line past `edits`. A node that an edit
+/// touches is gone, as the walk visits it again.
+fn moved(mut node: Range<usize>, mut line: usize, edits: &[InputEdit]) -> Option<(Range<usize>, usize)> {
+    for edit in edits {
+        if node.end < edit.start_byte {
+            continue;
+        }
+        if node.start <= edit.old_end_byte {
+            return None;
+        }
+        node = node.start - edit.old_end_byte + edit.new_end_byte..node.end - edit.old_end_byte + edit.new_end_byte;
+        // Symbols have no line and pass 0, which must not underflow.
+        line = (line + edit.new_end_position.row).saturating_sub(edit.old_end_position.row);
+    }
+    Some((node, line))
+}
+
 /// Walks with one cursor instead of recursing, because deeply nested groups in a
-/// document must not overflow the stack of the parse thread.
-fn collect_outline(config: &LanguageConfig, tree: &Tree, rope: &Rope) -> (Vec<Heading>, Vec<Symbol>) {
-    let (mut headings, mut symbols) = (Vec::new(), Vec::new());
+/// document must not overflow the stack of the parse thread. With `reuse`, nodes
+/// away from the changes keep their old entries, so typing costs a short walk.
+fn collect_outline(config: &LanguageConfig, tree: &Tree, rope: &Rope, reuse: Option<&Reuse>) -> Outline {
+    let mut outline = Outline::default();
     let mut cursor = tree.walk();
     let mut depth = 0;
     // Below this depth headings don't count. Symbols still do, like a label in a heading.
     let mut heading_free_from: Option<usize> = None;
+    // Below this depth nothing is kept, which saves asking every node.
+    let mut moved_from: Option<usize> = None;
     loop {
         let node = cursor.node();
-        if let Some(rules) = config.headings
-            && heading_free_from.is_none()
-            && config.heading_kinds.has(node)
-            && let Some(found) = (rules.find)(node, rope)
-        {
-            headings.push(heading(node, found, rope));
+        let range = node.byte_range();
+        let mut walk_below = false;
+        let kept = match reuse {
+            Some(reuse) if moved_from.is_none() => reuse.check(config, &cursor, rope),
+            _ => Kept::No,
+        };
+        if kept == Kept::Moved {
+            moved_from = Some(depth);
         }
-        if let Some(rules) = config.symbols
-            && config.symbol_kinds.has(node)
-            && let Some((kind, name)) = (rules.find)(node)
-        {
-            symbols.push(Symbol { kind, name: rope.byte_slice(name).to_string() });
+        if let (Kept::Yes, Some(reuse)) = (&kept, reuse) {
+            reuse.copy(&range, &mut outline);
+        } else {
+            if let Some(rules) = config.headings
+                && heading_free_from.is_none()
+                && config.heading_kinds.has(node)
+                && let Some(found) = (rules.find)(node, rope)
+            {
+                outline.headings.push(heading(node, found, rope));
+                outline.heading_nodes.push(range.clone());
+            }
+            if let Some(rules) = config.symbols
+                && config.symbol_kinds.has(node)
+                && let Some((kind, name)) = (rules.find)(node)
+            {
+                outline.symbols.push(Symbol { kind, name: rope.byte_slice(name).to_string() });
+                outline.symbol_nodes.push(range);
+            }
+            if heading_free_from.is_none() && config.heading_skip.has(node) {
+                heading_free_from = Some(depth);
+            }
+            walk_below = config.symbols.is_some() || heading_free_from.is_none();
         }
-        if heading_free_from.is_none() && config.heading_skip.has(node) {
-            heading_free_from = Some(depth);
-        }
-        let walk_below = config.symbols.is_some() || heading_free_from.is_none();
         if walk_below && cursor.goto_first_child() {
             depth += 1;
             continue;
@@ -439,11 +650,14 @@ fn collect_outline(config: &LanguageConfig, tree: &Tree, rope: &Rope) -> (Vec<He
             if heading_free_from == Some(depth) {
                 heading_free_from = None;
             }
+            if moved_from == Some(depth) {
+                moved_from = None;
+            }
             if cursor.goto_next_sibling() {
                 break;
             }
             if !cursor.goto_parent() {
-                return (headings, symbols);
+                return outline;
             }
             depth -= 1;
         }
@@ -541,8 +755,9 @@ impl LanguageConfig {
 pub struct Syntax {
     config: Option<&'static LanguageConfig>,
     tree: Option<Tree>,
-    headings: Vec<Heading>,
-    symbols: Vec<Symbol>,
+    outline: Arc<Outline>,
+    /// Edits since the text that `outline` belongs to, which `tree` has seen.
+    edits: Vec<InputEdit>,
     applied_results: u64,
     applied_version: u64,
 }
@@ -552,14 +767,30 @@ pub struct ParseJob {
     config: &'static LanguageConfig,
     rope: Rope,
     old_tree: Option<Tree>,
+    /// The outline before `edits`, both of which go with `old_tree`.
+    old_outline: Arc<Outline>,
+    edits: Vec<InputEdit>,
     version: u64,
 }
 
 pub struct ParseResult {
     tree: Option<Tree>,
-    headings: Vec<Heading>,
-    symbols: Vec<Symbol>,
+    outline: Outline,
     version: u64,
+    timings: ParseTimings,
+}
+
+/// Where the time of a parse went, for benchmarks.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ParseTimings {
+    pub parse: Duration,
+    pub outline: Duration,
+}
+
+impl ParseResult {
+    pub fn timings(&self) -> ParseTimings {
+        self.timings
+    }
 }
 
 impl Syntax {
@@ -567,8 +798,8 @@ impl Syntax {
         Self {
             config: LanguageConfig::get(language),
             tree: None,
-            headings: Vec::new(),
-            symbols: Vec::new(),
+            outline: Arc::default(),
+            edits: Vec::new(),
             applied_results: 0,
             applied_version: 0,
         }
@@ -577,6 +808,7 @@ impl Syntax {
     pub fn edit(&mut self, edit: &InputEdit) {
         if let Some(tree) = &mut self.tree {
             tree.edit(edit);
+            self.edits.push(*edit);
         }
     }
 
@@ -585,6 +817,8 @@ impl Syntax {
             config: self.config?,
             rope: rope.clone(),
             old_tree: self.tree.clone(),
+            old_outline: self.outline.clone(),
+            edits: self.edits.clone(),
             version,
         })
     }
@@ -597,8 +831,8 @@ impl Syntax {
         }
         self.applied_version = result.version;
         self.tree = result.tree;
-        self.headings = result.headings;
-        self.symbols = result.symbols;
+        self.outline = Arc::new(result.outline);
+        self.edits.clear();
         self.applied_results += 1;
         for edit in edits_since {
             self.edit(edit);
@@ -630,12 +864,12 @@ impl Syntax {
 
     /// Headings of the last finished parse, so they can lag behind the latest edit.
     pub fn headings(&self) -> &[Heading] {
-        &self.headings
+        &self.outline.headings
     }
 
     /// Names that the document defines, as of the last finished parse.
     pub fn symbols(&self) -> &[Symbol] {
-        &self.symbols
+        &self.outline.symbols
     }
 
     /// Counts finished parses, which tells when `headings` may have changed.
@@ -723,6 +957,18 @@ fn collect_inline_spans(
     }
 }
 
+/// The headings and names of a whole text, read at once, as for a file that
+/// is not open.
+pub fn outline_of(language: Language, text: &str) -> (Vec<Heading>, Vec<Symbol>) {
+    let rope = Rope::from_str(text);
+    let mut syntax = Syntax::new(language);
+    let Some(job) = syntax.parse_job(&rope, 1) else {
+        return (Vec::new(), Vec::new());
+    };
+    syntax.apply(job.run(), &[]);
+    (syntax.headings().to_vec(), syntax.symbols().to_vec())
+}
+
 impl ParseJob {
     pub fn version(&self) -> u64 {
         self.version
@@ -733,22 +979,34 @@ impl ParseJob {
         parser
             .set_language(&self.config.language)
             .expect("grammar ABI matches tree-sitter");
+        let started = Instant::now();
         let tree = parse_rope(&mut parser, &self.rope, self.old_tree.as_ref());
+        let parsed = Instant::now();
 
-        let (headings, symbols) = match &tree {
-            Some(tree) => collect_outline(self.config, tree, &self.rope),
-            None => Default::default(),
+        let outline = match (&tree, &self.old_tree) {
+            (Some(tree), Some(old_tree)) => {
+                let reuse = Reuse::new(&self.old_outline, &self.edits, old_tree);
+                collect_outline(self.config, tree, &self.rope, Some(&reuse))
+            }
+            (Some(tree), None) => collect_outline(self.config, tree, &self.rope, None),
+            (None, _) => Outline::default(),
         };
 
         ParseResult {
             tree,
-            headings,
-            symbols,
+            outline,
             version: self.version,
+            timings: ParseTimings {
+                parse: parsed - started,
+                outline: parsed.elapsed(),
+            },
         }
     }
 }
 
+/// Hands tree-sitter the rope's own chunks of about 1 KB, without copying. With an
+/// old tree the parser keeps all but the edited part: 1 ms per key on 2 MB of LaTeX,
+/// against 1.1 s for the first parse, so the chunks are not what costs time.
 fn parse_rope(parser: &mut Parser, rope: &Rope, old_tree: Option<&Tree>) -> Option<Tree> {
     parser.parse_with_options(
         &mut |byte, _| {
@@ -1010,6 +1268,142 @@ mod tests {
     fn deep_nesting_does_not_overflow_the_stack() {
         let text = format!("\\section{{A}}\n{}{}", "{".repeat(50_000), "}".repeat(50_000));
         assert_eq!(headings_of(Language::Latex, &text)[0].1, "{A}");
+    }
+
+    /// Replaces `range` of `rope` and returns the edit for the trees.
+    fn replace(rope: &mut Rope, range: Range<usize>, text: &str) -> InputEdit {
+        let point = |rope: &Rope, offset: usize| {
+            let row = rope.byte_to_line(offset);
+            tree_sitter::Point::new(row, offset - rope.line_to_byte(row))
+        };
+        let (start_position, old_end_position) = (point(rope, range.start), point(rope, range.end));
+        let (start, end) = (rope.byte_to_char(range.start), rope.byte_to_char(range.end));
+        rope.remove(start..end);
+        rope.insert(start, text);
+        let new_end_byte = range.start + text.len();
+        InputEdit {
+            start_byte: range.start,
+            old_end_byte: range.end,
+            new_end_byte,
+            start_position,
+            old_end_position,
+            new_end_position: point(rope, new_end_byte),
+        }
+    }
+
+    /// Edits generated documents at random places, a few edits per parse, and
+    /// checks the outline of each parse against a walk of the whole tree.
+    fn incremental_outline_matches_a_full_walk(language: Language, pieces: &[&str], seed: u64) {
+        let mut state = seed;
+        let mut next = |below: usize| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as usize % below
+        };
+        let mut text = String::new();
+        while text.len() < 4_000 {
+            text.push_str(pieces[next(pieces.len())]);
+        }
+        let mut rope = Rope::from_str(&text);
+        let mut syntax = Syntax::new(language);
+        let config = syntax.config.unwrap();
+        let mut version = 0;
+        for round in 0..300 {
+            for _ in 0..1 + next(3) {
+                // The pieces are ASCII, so every byte starts a character.
+                let at = next(rope.len_bytes() + 1);
+                let mut end = (at + next(12)).min(rope.len_bytes());
+                if next(3) > 0 {
+                    end = at;
+                }
+                let inserted = if next(4) == 0 { "" } else { pieces[next(pieces.len())] };
+                let edit = replace(&mut rope, at..end, inserted);
+                syntax.edit(&edit);
+            }
+            version += 1;
+            let result = syntax.parse_job(&rope, version).unwrap().run();
+            let full = collect_outline(config, result.tree.as_ref().unwrap(), &rope, None);
+            assert!(result.outline == full, "{language:?}, seed {seed}, round {round}:\n{rope}");
+            assert!(syntax.apply(result, &[]));
+        }
+    }
+
+    #[test]
+    fn incremental_outline_matches_a_full_walk_in_latex() {
+        let pieces = [
+            "\\section{Intro}\\label{sec:a}\n",
+            "\\subsection*{B}\n",
+            "\\chapter{C}\n",
+            "Some words here. ",
+            "\n\n",
+            "$x^2$ ",
+            "\\[ y \\]",
+            "$",
+            "{",
+            "}",
+            "% comment \\section{no}\n",
+            "\\begin{figure}\n\\caption{Fig}\\label{fig:a}\n\\end{figure}\n",
+            "\\begin{table}\\caption{Tab}\\end{table}\n",
+            "\\begin{table}",
+            "\\end{table}",
+            "\\begin{figure}",
+            "table",
+            "figure",
+            "\\caption{Loose}",
+            "\\newcommand{\\foo}{\\section{macro}}\n",
+            "\\def\\bar{x}\n",
+            "\\usepackage{amsmath}\n",
+            "\\begin{verbatim}\n\\section{raw}\n\\end{verbatim}\n",
+            "\\printbibliography\n",
+            "\\begin{equation}\\label{eq:a} a \\end{equation}\n",
+            "\\section{",
+            "\\label{",
+            "\\",
+        ];
+        for seed in 1..=4 {
+            incremental_outline_matches_a_full_walk(Language::Latex, &pieces, seed);
+        }
+    }
+
+    #[test]
+    fn incremental_outline_matches_a_full_walk_in_typst_and_markdown() {
+        let typst = [
+            "= Title <a>\n",
+            "== Next\n",
+            "text and words ",
+            "\n",
+            "#let x = 1\n",
+            "#let f(a) = a\n",
+            "$ x $",
+            "$",
+            "[",
+            "]",
+            "```\n= raw\n```\n",
+            "#figure(table(columns: 2), caption: [Tab])\n",
+            "#figure(image(\"a.png\"), caption: [Fig], kind: table)\n",
+            "#bibliography(\"refs.bib\")\n",
+            "<label>",
+            "*bold* ",
+            "// note\n",
+        ];
+        let markdown = [
+            "# One\n",
+            "Two\n===\n",
+            "Three\n---\n",
+            "### Four\n",
+            "text and words ",
+            "\n",
+            "\n\n",
+            "```\n# code\n```\n",
+            "```",
+            "    indented\n",
+            "- item\n",
+            "> quote\n",
+            "*em* ",
+        ];
+        for seed in 1..=2 {
+            incremental_outline_matches_a_full_walk(Language::Typst, &typst, seed);
+            incremental_outline_matches_a_full_walk(Language::Markdown, &markdown, seed);
+        }
     }
 
     #[test]

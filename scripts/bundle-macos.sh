@@ -81,11 +81,51 @@ sign "$app/Contents/Frameworks/libpdfium.dylib"
 sign "$app"
 codesign --verify --strict --deep "$app"
 
+# The dmg window: Editor, an arrow, Applications, and what to do about the
+# warning macOS shows for an app that is not notarized.
 staging="$work/dmg"
-mkdir -p "$staging"
+mkdir -p "$staging/.background"
 cp -R "$app" "$staging/"
 ln -s /Applications "$staging/Applications"
-hdiutil create -volname "Editor" -srcfolder "$staging" -fs HFS+ -format UDZO -ov "$dmg" >/dev/null
+cp "packaging/macos/First open.txt" "$staging/First open.txt"
+# Quick Look draws the square SVG; the middle band is the 640 by 400 window.
+qlmanage -t -s 1280 -o "$work" packaging/macos/DmgBackground.svg >/dev/null 2>&1
+sips -c 800 1280 "$work/DmgBackground.svg.png" --out "$work/background@2x.png" >/dev/null
+sips -z 400 640 "$work/background@2x.png" --out "$work/background.png" >/dev/null
+tiffutil -cathidpicheck "$work/background.png" "$work/background@2x.png" -out "$staging/.background/background.tiff" >/dev/null 2>&1
+
+writable_dmg="$work/Editor-rw.dmg"
+hdiutil create -volname "Editor" -srcfolder "$staging" -fs HFS+ -format UDRW -ov "$writable_dmg" >/dev/null
+volume="$(hdiutil attach -readwrite -noverify -noautoopen "$writable_dmg" | sed -n 's|^/dev/.*\(/Volumes/.*\)$|\1|p' | head -n 1)"
+# Finder sets the layout. Without a desktop session (or the permission to
+# script Finder) the dmg keeps Finder's default layout, which still works.
+osascript - "$(basename "$volume")" <<'APPLESCRIPT' || echo "Cannot lay out the dmg window: it keeps Finder's default." >&2
+on run argv
+  tell application "Finder"
+    tell disk (item 1 of argv)
+      open
+      set current view of container window to icon view
+      set toolbar visible of container window to false
+      set statusbar visible of container window to false
+      set the bounds of container window to {200, 120, 840, 548}
+      set options to the icon view options of container window
+      set arrangement of options to not arranged
+      set icon size of options to 96
+      set text size of options to 13
+      set background picture of options to file ".background:background.tiff"
+      set position of item "Editor.app" of container window to {160, 170}
+      set position of item "Applications" of container window to {480, 170}
+      set position of item "First open.txt" of container window to {320, 290}
+      update without registering applications
+      delay 1
+      close
+    end tell
+  end tell
+end run
+APPLESCRIPT
+sync
+hdiutil detach -quiet "$volume" || hdiutil detach -force -quiet "$volume"
+hdiutil convert "$writable_dmg" -format UDZO -ov -o "$dmg" >/dev/null
 
 if [ "$identity" != "-" ]; then
   codesign --force --timestamp --sign "$identity" "$dmg"

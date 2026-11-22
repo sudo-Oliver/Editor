@@ -21,6 +21,9 @@ use serde_json::Value;
 
 use crate::actions::{COMMANDS, Command};
 
+/// keymap.json names an add-on's command `addon.<add-on id>.<command id>`.
+pub const ADDON_PREFIX: &str = "addon.";
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Keymap {
     /// By command id. An empty list unbinds the command.
@@ -41,7 +44,9 @@ impl Keymap {
             return (keymap, vec!["keymap.json must be an object of command ids and keys".to_string()]);
         };
         for (id, keys) in entries {
-            if !COMMANDS.iter().any(|command| command.id == id) {
+            // Add-on commands are known only once their add-on loads, so their
+            // entries stay, and do nothing while it is off.
+            if !COMMANDS.iter().any(|command| command.id == id) && !id.starts_with(ADDON_PREFIX) {
                 problems.push(format!("{id}: no such command"));
                 continue;
             }
@@ -104,6 +109,11 @@ impl Keymap {
             Some(keys) => keys.clone(),
             None => command.keys.iter().map(|keys| keys.to_string()).collect(),
         }
+    }
+
+    /// The keys of an add-on's command, by its id in keymap.json.
+    pub fn addon_keys(&self, id: &str, defaults: &[String]) -> Vec<String> {
+        self.overrides.get(id).cloned().unwrap_or_else(|| defaults.to_vec())
     }
 
     pub fn is_changed(&self, command: &Command) -> bool {

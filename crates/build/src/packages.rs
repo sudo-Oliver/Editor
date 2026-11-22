@@ -17,6 +17,8 @@ pub enum Fix {
     /// Opens the setup of a missing compiler, named as the user knows it, such
     /// as "LaTeX".
     InstallTool(String),
+    /// Updates the packages of MacTeX, for a package that is missing or too old.
+    UpdateLatex,
 }
 
 impl Fix {
@@ -25,6 +27,7 @@ impl Fix {
             Self::AddPackage(package) => format!("Add \\usepackage{{{package}}}"),
             Self::RemovePackage(package) => format!("Remove {package}"),
             Self::InstallTool(tool) => format!("Install {tool}…"),
+            Self::UpdateLatex => "Update LaTeX packages…".to_string(),
         }
     }
 }

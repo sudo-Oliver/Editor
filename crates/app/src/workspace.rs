@@ -33,6 +33,7 @@ use synctex::SyncTex;
 use crate::{
     actions::*,
     addon_panel::{AddonPanel, AddonPanelEvent, doi_suggestion},
+    addon_reports,
     addons::{self, Installed},
     bib,
     completion::Extra,
@@ -48,20 +49,25 @@ use crate::{
     keymap::{self, Keymap},
     pdf_view::{PdfView, PdfViewEvent, ZOOM_STEP},
     nvim_themes, package_commands,
-    picker::{self, FontSlot, Picker, PickerKind},
+    picker::{self, FontSlot, Picker, PickerItem, PickerKind},
     package_check::{self, PackageHint},
     problems::{self, Problem},
     recovery,
     settings::{self, Settings},
+    storage,
     setup::{SetupEvent, SetupView},
     projects::{self, TemplateLanguage},
     tour::{self, Tour, TourAnchor},
     shortcuts,
     snippets,
     status_bar::{self, StatusInfo},
+    history,
+    texlive::{self, TexLive},
+    text_file,
     theme,
     toolchain::{self, Tool, Toolchain, ToolchainEvent},
     updater::{self, Updater},
+    app_location::{self, Mover, MoverEvent},
 };
 
 #[cfg(feature = "collab")]
@@ -69,8 +75,12 @@ use crate::{
 mod collab_session;
 #[path = "git_sync.rs"]
 mod git_sync;
+#[path = "addon_host.rs"]
+mod addon_host;
+#[path = "review.rs"]
+mod review;
 
-const RECOVERY_DELAY: Duration = Duration::from_secs(3);
+const RECOVERY_DELAY: Duration = Duration::from_secs(1);
 const TOP_BAR_HEIGHT: f32 = 40.0;
 const RAIL_WIDTH: f32 = 40.0;
 const DIVIDER_WIDTH: f32 = 7.0;
@@ -154,6 +164,8 @@ enum Menu {
     Code,
     /// The right-click menu of a row in the file tree.
     Tree,
+    /// The right-click menu of the editor.
+    EditorContext,
 }
 
 /// How the editor and the PDF share the window.
@@ -183,6 +195,7 @@ enum SettingsPage {
     Compiler,
     Tools,
     Shortcuts,
+    Storage,
 }
 
 /// The name field for a new file or folder at the top of the file tree.
@@ -444,9 +457,21 @@ pub struct Workspace {
     catalog: CatalogState,
     /// The id of the add-on being downloaded.
     installing: Option<String>,
-    tracked_edits: HashMap<String, TrackedEdits>,
+    /// By add-on and group, the default group being the empty name.
+    tracked_edits: HashMap<(String, String), TrackedEdits>,
     /// Add-on requests that wait for the running build to end.
     compile_waiters: Vec<(Entity<AddonPanel>, u64)>,
+    /// Where the cursor rests, as last told to add-ons, and what waits to be told.
+    addon_context_sent: addon_host::AddonContext,
+    addon_context_pending: Option<addon_host::AddonContext>,
+    addon_context_task: Option<Task<()>>,
+    /// Documents whose change add-ons hear of when typing pauses.
+    addon_changed: HashSet<PathBuf>,
+    addon_changed_task: Option<Task<()>>,
+    /// Focuses the active document at the next frame, for actions without a window.
+    focus_requested: bool,
+    /// Changes from add-ons that wait for the user.
+    proposals: Vec<review::Review>,
     layout: PaneLayout,
     /// The PDF tab is the one on screen.
     pdf_tab_shown: bool,
@@ -456,6 +481,11 @@ pub struct Workspace {
     setup: Option<(Entity<SetupView>, Subscription)>,
     updater: Entity<Updater>,
     _updater_observer: Subscription,
+    mover: Entity<Mover>,
+    _mover_subscriptions: [Subscription; 2],
+    /// Package updates and new years of MacTeX.
+    texlive: Entity<TexLive>,
+    _texlive_observer: Subscription,
     /// Opens the setup at the next frame, for actions without a window.
     setup_requested: bool,
     /// The draft export that waits for Pandoc to be installed.
@@ -536,6 +566,9 @@ pub struct Workspace {
     recording_shortcut: Option<&'static str>,
     dialog: Option<Dialog>,
     dialog_focus: FocusHandle,
+    /// What the app's folders take, measured each time the storage settings open.
+    storage_usage: Option<storage::Usage>,
+    storage_task: Option<Task<()>>,
     picker: Option<Picker>,
     /// Where `\cite{` last opened the picker by itself.
     citation_trigger: Option<(EntityId, usize)>,
@@ -590,6 +623,7 @@ impl Workspace {
             for addon in &this.addon_panels {
                 addon.panel.update(cx, |panel, _| panel.shut_down());
             }
+            addons::remove_private_directory();
             async {}
         });
         let workspace_handle = cx.entity().downgrade();
@@ -603,6 +637,8 @@ impl Workspace {
         let toolchain = cx.new(|_| Toolchain::default());
         let updater = cx.new(Updater::new);
         let _updater_observer = cx.observe(&updater, |_, _, cx| cx.notify());
+        let texlive = cx.new(TexLive::new);
+        let _texlive_observer = cx.observe(&texlive, |_, _, cx| cx.notify());
         let toolchain_subscriptions = [
             cx.observe(&toolchain, |_, _, cx| cx.notify()),
             cx.subscribe(&toolchain, |this, _, event, cx| match event {
@@ -667,6 +703,16 @@ impl Workspace {
             settings.tour_done = true;
         }
         apply_look(&settings);
+        let mover = cx.new(|_| Mover::new(settings.move_declined));
+        let _mover_subscriptions = [
+            cx.observe(&mover, |_, _, cx| cx.notify()),
+            cx.subscribe(&mover, |this, _, event, cx| match event {
+                MoverEvent::Declined => {
+                    this.settings.move_declined = true;
+                    this.save_settings(cx);
+                }
+            }),
+        ];
         #[cfg(feature = "collab")]
         let collab = {
             let name = if settings.collab_name.is_empty() { collab_session::default_name() } else { settings.collab_name.clone() };
@@ -702,6 +748,13 @@ impl Workspace {
             installing: None,
             tracked_edits: HashMap::new(),
             compile_waiters: Vec::new(),
+            addon_context_sent: addon_host::AddonContext::default(),
+            addon_context_pending: None,
+            addon_context_task: None,
+            addon_changed: HashSet::new(),
+            addon_changed_task: None,
+            focus_requested: false,
+            proposals: Vec::new(),
             layout: PaneLayout::Split,
             pdf_tab_shown: false,
             focus_mode: false,
@@ -709,6 +762,10 @@ impl Workspace {
             setup: None,
             updater,
             _updater_observer,
+            mover,
+            _mover_subscriptions,
+            texlive,
+            _texlive_observer,
             setup_requested: false,
             export_after_pandoc: None,
             tour: None,
@@ -768,6 +825,8 @@ impl Workspace {
             recording_shortcut: None,
             dialog: None,
             dialog_focus: cx.focus_handle(),
+            storage_usage: None,
+            storage_task: None,
             picker: None,
             citation_trigger: None,
             citation_check_task: None,
@@ -933,6 +992,7 @@ impl Workspace {
         self.root = None;
         self.git_branch = None;
         self.git_panel.update(cx, |panel, cx| panel.set_root(None, cx));
+        self.addon_project_closed(cx);
         for entry in &self.addon_panels {
             entry.panel.update(cx, |panel, cx| panel.set_root(None, cx));
         }
@@ -959,6 +1019,10 @@ impl Workspace {
         self.shown_image = None;
         self.start_watching(&root, cx);
         self.git_branch = git_branch(&root);
+        // Before the add-ons restart for the new project, with the old one.
+        if self.root.is_some() {
+            self.addon_project_closed(cx);
+        }
         self.root = Some(root.clone());
         let (vim_mode, cards) = (self.settings.vim_mode, self.settings.hub_cards);
         self.home.update(cx, |home, cx| {
@@ -998,6 +1062,8 @@ impl Workspace {
             self.recompile(cx);
         }
         self.forget_saved_recovery(cx);
+        let swept = root.clone();
+        cx.background_spawn(async move { crate::atomic::sweep(&swept) }).detach();
         self.git_root_opened(cx);
         #[cfg(feature = "collab")]
         self.collab_root_opened(&root, cx);
@@ -1066,16 +1132,30 @@ impl Workspace {
         let paths: Vec<PathBuf> = documents.iter().map(|(_, path, _)| path.clone()).collect();
         self.refresh_task = Some(cx.spawn(async move |this, cx| {
             // Open files come first, since the walk can take much longer.
-            let texts: Vec<Option<String>> = cx
-                .background_spawn(async move { paths.iter().map(|path| std::fs::read_to_string(path).ok()).collect() })
-                .await;
+            let texts: Vec<std::io::Result<text_file::Loaded>> =
+                cx.background_spawn(async move { paths.iter().map(|path| text_file::read(path)).collect() }).await;
+            let mut gone = Vec::new();
             cx.update(|cx| {
-                for ((view, _, version), text) in documents.iter().zip(&texts) {
-                    if let Some(text) = text {
-                        view.update(cx, |view, cx| view.reload_text(text, *version, cx));
+                for ((view, path, version), loaded) in documents.iter().zip(&texts) {
+                    match loaded {
+                        Ok(loaded) => view.update(cx, |view, cx| view.reload_text(&loaded.text, loaded.encoding, *version, cx)),
+                        // Another program deleted or moved the file. The text stays
+                        // and counts as unsaved, so closing asks and a crash keeps it.
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            view.update(cx, |view, cx| view.mark_file_gone(cx));
+                            gone.push(path.file_name().unwrap_or_default().to_string_lossy().into_owned());
+                        }
+                        Err(_) => {}
                     }
                 }
             });
+            if !gone.is_empty() {
+                this.update(cx, |this, cx| {
+                    this.set_status(format!("{} was deleted outside the editor. The text is still here; save to keep it.", gone.join(", ")), cx);
+                    this.schedule_recovery(cx);
+                })
+                .ok();
+            }
             let entries = cx.background_spawn(async move { root.map(|root| file_tree::scan(&root, &collapsed)) }).await;
             this.update(cx, |this, cx| {
                 this.refresh_task = None;
@@ -1125,15 +1205,21 @@ impl Workspace {
             self.activate(index, window, cx);
             return;
         }
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
+        let loaded = match text_file::read(&path) {
+            Ok(loaded) => loaded,
             Err(error) => {
                 self.status = Some(format!("Cannot open {}: {error}", path.display()).into());
                 cx.notify();
                 return;
             }
         };
-        self.add_document(path, &text, cx);
+        if loaded.encoding != text_file::UTF_8 {
+            self.status = Some(format!("{} is stored as {} and is saved that way.", path.file_name().unwrap_or_default().to_string_lossy(), loaded.encoding.name()).into());
+        }
+        self.add_document(path, &loaded.text, cx);
+        if let Some(view) = self.documents.last().map(|document| document.view.clone()) {
+            view.update(cx, |view, _| view.set_encoding(loaded.encoding));
+        }
         self.activate(self.documents.len() - 1, window, cx);
         self.apply_marks(cx);
     }
@@ -1150,15 +1236,18 @@ impl Workspace {
             view
         });
         let subscription = cx.subscribe(&view, |this, view, event, cx| match event {
+            EditorEvent::Dropped(item) => this.drop_into(&view, item.clone(), cx),
             EditorEvent::Edited => {
                 #[cfg(feature = "collab")]
                 this.collab_edited(&view, cx);
                 this.schedule_recovery(cx);
                 this.schedule_type_build(cx);
                 this.check_citation_trigger(&view, cx);
+                this.addon_document_changed(&view, cx);
                 cx.notify();
             }
             EditorEvent::EditedByOthers => {
+                this.addon_document_changed(&view, cx);
                 this.schedule_recovery(cx);
                 this.schedule_type_build(cx);
                 cx.notify();
@@ -1322,7 +1411,7 @@ impl Workspace {
         match view.update(cx, |view, cx| view.save(cx)) {
             Ok(_) => self.remove_document(index, window, cx),
             Err(error) if is_save_conflict(&error) => self.ask_about_conflict(view, true, window, cx),
-            Err(error) => self.set_status(format!("Cannot save: {error}"), cx),
+            Err(error) => self.set_status(save_failed(&error), cx),
         }
         self.forget_saved_recovery(cx);
     }
@@ -1356,7 +1445,7 @@ impl Workspace {
                         }
                     }
                     Ok(false) => {}
-                    Err(error) => this.set_status(format!("Cannot save: {error}"), cx),
+                    Err(error) => this.set_status(save_failed(&error), cx),
                 }
                 this.forget_saved_recovery(cx);
             })
@@ -1481,7 +1570,12 @@ impl Workspace {
                     this.update_in(cx, |this, window, cx| this.restore_snapshots(snapshots, window, cx)).ok();
                 }
                 Some(1) => {
+                    let history = history::directory();
                     for snapshot in &snapshots {
+                        // Discarded here, still one click away in Earlier versions.
+                        if let Some(history) = &history {
+                            history::keep(history, &snapshot.path, snapshot.text.as_bytes()).ok();
+                        }
                         recovery::remove(&directory, &snapshot.path);
                     }
                 }
@@ -1566,7 +1660,7 @@ impl Workspace {
                 }
             }
             Err(error) if is_save_conflict(&error) => self.ask_about_conflict(view, false, window, cx),
-            Err(error) => self.set_status(format!("Cannot save: {error}"), cx),
+            Err(error) => self.set_status(save_failed(&error), cx),
         }
         self.forget_saved_recovery(cx);
     }
@@ -1576,7 +1670,7 @@ impl Workspace {
     /// Binds the shortcuts of `keymap.json`, or the defaults without it.
     fn reload_keymap(&mut self, cx: &mut Context<Self>) {
         let (keymap, mut problems) = keymap::default_path().map(|path| Keymap::load(&path)).unwrap_or_default();
-        problems.extend(crate::actions::bind_keys(&keymap, cx));
+        problems.extend(crate::actions::bind_keys(&keymap, &self.addon_bindings(cx), cx));
         self.keymap = keymap;
         if let Some(problem) = problems.first() {
             self.set_status(format!("keymap.json: {problem}"), cx);
@@ -1586,7 +1680,7 @@ impl Workspace {
 
     /// Saves and binds the shortcuts changed on the shortcuts page.
     fn apply_keymap(&mut self, keymap: Keymap, cx: &mut Context<Self>) {
-        let problems = crate::actions::bind_keys(&keymap, cx);
+        let problems = crate::actions::bind_keys(&keymap, &self.addon_bindings(cx), cx);
         self.keymap = keymap;
         if let Some(path) = keymap::default_path()
             && let Err(error) = self.keymap.save(&path)
@@ -1680,11 +1774,22 @@ impl Workspace {
             };
             self.addon_panels.push(entry);
         }
+        // Add-ons that were turned off or removed: their program ends with
+        // the panel, and nothing of them stays behind.
+        for entry in old {
+            self.end_proposals_of(&entry.panel, cx);
+            self.compile_waiters.retain(|(panel, _)| panel != &entry.panel);
+        }
         if matches!(self.left_panel, LeftPanel::Addon(_)) {
             let index = self.addon_panels.iter().position(|entry| Some(&entry.panel.read(cx).add_on.manifest.id) == shown.as_ref());
             self.left_panel = index.map_or(LeftPanel::Files, LeftPanel::Addon);
         }
         self.installed_addons = installed;
+        // The keys of add-ons that were turned on come, and of others go.
+        let problems = crate::actions::bind_keys(&self.keymap, &self.addon_bindings(cx), cx);
+        if let Some(problem) = problems.first() {
+            self.set_status(format!("keymap.json: {problem}"), cx);
+        }
         cx.notify();
     }
 
@@ -1699,6 +1804,15 @@ impl Workspace {
                     cx.notify();
                 }
                 AddonPanelEvent::LookupFailed(reason) => this.set_status(reason.clone(), cx),
+                AddonPanelEvent::Notify(text) => this.set_status(text.clone(), cx),
+                AddonPanelEvent::Stopped => this.end_proposals_of(&panel, cx),
+                AddonPanelEvent::InsertText(text) => {
+                    if this.active_view().is_some() {
+                        this.with_active(cx, |view, cx| view.insert_text(text, cx));
+                    } else {
+                        this.set_status("Open a document to insert into.", cx);
+                    }
+                }
             }
         });
         panel.update(cx, |panel, cx| panel.activate(cx));
@@ -1819,11 +1933,26 @@ impl Workspace {
     fn diagnostic_infos(&self) -> Vec<DiagnosticInfo> {
         self.diagnostics
             .iter()
-            .map(|diagnostic| DiagnosticInfo {
-                path: diagnostic.file.as_deref().map(|file| self.relative_to_project(file)),
-                line: diagnostic.line,
-                error: diagnostic.severity == Severity::Error,
-                message: diagnostic.message.clone(),
+            .map(|diagnostic| {
+                let explanation = build::explain(diagnostic);
+                let hint = [explanation.as_ref().map(|explanation| explanation.hint.clone()), diagnostic.hint.clone()]
+                    .into_iter()
+                    .flatten()
+                    .filter(|hint| !hint.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                DiagnosticInfo {
+                    path: diagnostic.file.as_deref().map(|file| self.relative_to_project(file)),
+                    line: diagnostic.line,
+                    error: diagnostic.severity == Severity::Error,
+                    message: diagnostic.message.clone(),
+                    column: diagnostic.column,
+                    severity: if diagnostic.severity == Severity::Error { "error" } else { "warning" }.to_string(),
+                    hint: (!hint.is_empty()).then_some(hint),
+                    context: diagnostic.context.clone(),
+                    fix: explanation.as_ref().and_then(|explanation| explanation.fix.as_ref()).map(addon_reports::fix_info),
+                    explanation: explanation.map(|explanation| explanation.title),
+                }
             })
             .collect()
     }
@@ -1848,8 +1977,12 @@ impl Workspace {
                     addons::set_secret(&add_on, &key, &value).map(|()| Reply::Done)
                 });
             }
-            Request::Compile => {
-                self.recompile(cx);
+            Request::Compile { clean } => {
+                if clean {
+                    self.recompile_from_scratch(cx);
+                } else {
+                    self.recompile(cx);
+                }
                 if self.building {
                     self.compile_waiters.push((panel, id));
                     return;
@@ -1860,18 +1993,57 @@ impl Workspace {
             Request::ReadFile { path } => self.addon_read(&path, cx).map(|text| Reply::Text { text }),
             Request::Diagnostics => Ok(Reply::Diagnostics { diagnostics: self.diagnostic_infos() }),
             Request::ActiveFile => Ok(Reply::Active { file: self.active_file_info(cx) }),
-            Request::EditFile { path, old, new } => self.addon_edit(&add_on, &path, &old, &new, cx).map(|()| Reply::Done),
-            Request::CreateFile { path, text } => self.addon_create(&add_on, &path, &text, cx).map(|()| Reply::Done),
+            Request::EditFile { path, old, new, group } => self.addon_edit(addon_host::edit_group(&add_on, group), &path, &old, &new, cx).map(|()| Reply::Done),
+            Request::CreateFile { path, text, group } => self.addon_create(addon_host::edit_group(&add_on, group), &path, &text, cx).map(|()| Reply::Done),
             Request::WriteFile { path, text } => self.addon_write(&path, &text, cx).map(|()| Reply::Done),
             Request::InsertCitation { key } => Ok(Reply::Text { text: self.insert_citation(&key, cx) }),
-            Request::BeginEdits => {
-                self.tracked_edits.insert(add_on, TrackedEdits::default());
+            Request::BeginEdits { group } => {
+                self.tracked_edits.insert(addon_host::edit_group(&add_on, group), TrackedEdits::default());
                 Ok(Reply::Done)
             }
-            Request::DiscardEdits => {
-                self.discard_addon_edits(&add_on, cx);
+            Request::Reveal { path, line, column } => self.addon_reveal(&path, line, column, cx),
+            Request::ProjectInfo => self.addon_project_info(cx),
+            Request::BuildLog { max_bytes } => Ok(self.addon_build_log(max_bytes)),
+            Request::PdfInfo => self.addon_pdf_info(cx),
+            Request::PdfText { page } => return self.answer_from_pdf(panel, id, page, None, cx),
+            Request::PdfPage { page, width } => return self.answer_from_pdf(panel, id, page, Some(addon_host::pdf_page_width(width)), cx),
+            Request::BibEntries => return self.answer_bib_entries(panel, id, cx),
+            Request::Outline => return self.answer_outline(panel, id, cx),
+            Request::InsertText { text } => self.addon_insert_text(&text, cx),
+            Request::InsertAt { path, line, column, text } => self.addon_insert_at(&path, line, column, &text, cx),
+            Request::CopyIntoProject { source, dest } => return self.answer_copy_into_project(panel, id, source, dest, cx),
+            Request::ProposeEdits { path, title, edits, text } => match self.start_proposal(panel.clone(), id, &path, title, edits, text, cx) {
+                Some(result) => result,
+                // The reply waits for the user.
+                None => return,
+            },
+            Request::CancelReview { path } => self.cancel_proposal(&path, cx),
+            Request::DiscardEdits { group } => {
+                self.discard_addon_edits(&addon_host::edit_group(&add_on, group), cx);
                 Ok(Reply::Done)
             }
+            Request::CancelBuild => {
+                if !self.building {
+                    return panel.update(cx, |panel, _| panel.reply(id, Err("No build runs.".to_string())));
+                }
+                self.build.cancel();
+                Ok(Reply::Done)
+            }
+            Request::OpenDocuments => Ok(self.addon_open_documents(cx)),
+            Request::SaveFile { path } => self.addon_save(&path, cx),
+            Request::RenameFile { from, to } => self.addon_rename(&from, &to, cx),
+            Request::DeleteFile { path } => return self.answer_delete(panel, id, &path, cx),
+            Request::Selection => Ok(self.addon_selection(cx)),
+            Request::SourceToPdf { path, line } => self.addon_source_to_pdf(&path, line),
+            Request::PdfToSource { page, x, y } => self.addon_pdf_to_source(page, x, y),
+            Request::ApplyFix { id: fix } => self.addon_apply_fix(&fix, cx),
+            Request::GitStatus | Request::GitDiff { .. } | Request::GitLog { .. } => return self.answer_from_git(panel, id, request, cx),
+            Request::PackageHints => return self.answer_package_hints(panel, id, cx),
+            Request::References => return self.answer_references(panel, id, cx),
+            Request::WordCount { path } => return self.answer_word_count(panel, id, path, cx),
+            Request::PdfOutline => return self.answer_pdf_outline(panel, id, cx),
+            Request::PdfSearch { query } => return self.answer_pdf_search(panel, id, query, cx),
+            Request::PdfSelection => Ok(Reply::Text { text: self.pdf.read(cx).selected_text().unwrap_or_default() }),
         };
         panel.update(cx, |panel, _| panel.reply(id, result));
     }
@@ -1936,7 +2108,7 @@ impl Workspace {
         })
     }
 
-    fn addon_edit(&mut self, add_on: &str, relative: &str, old: &str, new: &str, cx: &mut Context<Self>) -> Result<(), String> {
+    fn addon_edit(&mut self, group: (String, String), relative: &str, old: &str, new: &str, cx: &mut Context<Self>) -> Result<(), String> {
         let path = self.addon_file(relative)?;
         let index = match self.document_at(&path, cx) {
             Some(index) => index,
@@ -1952,13 +2124,13 @@ impl Workspace {
         let view = self.documents[index].view.clone();
         let text = view.read(cx).state.buffer().to_string();
         let range = addons::find_unique(&text, old)?;
-        self.tracked_edits.entry(add_on.to_string()).or_default().originals.entry(path).or_insert(text);
+        self.tracked_edits.entry(group).or_default().originals.entry(path).or_insert(text);
         view.update(cx, |view, cx| view.edit_from_outside(range, new, cx));
         cx.notify();
         Ok(())
     }
 
-    fn addon_create(&mut self, add_on: &str, relative: &str, text: &str, cx: &mut Context<Self>) -> Result<(), String> {
+    fn addon_create(&mut self, group: (String, String), relative: &str, text: &str, cx: &mut Context<Self>) -> Result<(), String> {
         let path = self.addon_file(relative)?;
         if path.exists() {
             return Err(format!("{relative} already exists."));
@@ -1967,7 +2139,7 @@ impl Workspace {
             std::fs::create_dir_all(parent).map_err(|error| format!("Cannot create {relative}: {error}"))?;
         }
         std::fs::write(&path, "").map_err(|error| format!("Cannot create {relative}: {error}"))?;
-        self.tracked_edits.entry(add_on.to_string()).or_default().created.push(path.clone());
+        self.tracked_edits.entry(group).or_default().created.push(path.clone());
         self.add_document(path, "", cx);
         let index = self.documents.len() - 1;
         if self.active.is_none() {
@@ -2006,8 +2178,8 @@ impl Workspace {
 
     /// Puts back the text from before the first edit, as one step that undo can
     /// reverse. Edits by the user in those files since then go with it.
-    fn discard_addon_edits(&mut self, add_on: &str, cx: &mut Context<Self>) {
-        let Some(tracked) = self.tracked_edits.remove(add_on) else {
+    fn discard_addon_edits(&mut self, group: &(String, String), cx: &mut Context<Self>) {
+        let Some(tracked) = self.tracked_edits.remove(group) else {
             return;
         };
         for (path, original) in tracked.originals {
@@ -2051,7 +2223,7 @@ impl Workspace {
                     all_saved = false;
                 }
                 Err(error) => {
-                    self.set_status(format!("Cannot save: {error}"), cx);
+                    self.set_status(save_failed(&error), cx);
                     all_saved = false;
                 }
             }
@@ -2099,6 +2271,7 @@ impl Workspace {
         self.build_log.clear();
         self.status = Some(format!("Compiling with {}…", engine.label()).into());
         let mut events = self.build.start(BuildRequest { root, main, engine, clean });
+        self.addon_build_started(cx);
         self.build_task = Some(cx.spawn(async move |this, cx| {
             while let Some(event) = events.recv().await {
                 if this.update(cx, |this, cx| this.handle_build_event(event, cx)).is_err() {
@@ -2186,6 +2359,9 @@ impl Workspace {
 
     fn finish_build(&mut self, outcome: BuildOutcome, cx: &mut Context<Self>) {
         self.building = false;
+        if self.dialog == Some(Dialog::Settings(SettingsPage::Storage)) {
+            self.measure_storage(cx);
+        }
         self.status = Some(
             format!(
                 "{} in {:.1} s",
@@ -2204,6 +2380,8 @@ impl Workspace {
         self.check_packages(cx);
         let (success, diagnostics) = (outcome.success, self.diagnostic_infos());
         self.reply_to_compile_waiters(|| Ok(Reply::Compiled { success, diagnostics: diagnostics.clone() }), cx);
+        self.addon_build_finished(success, cx);
+        self.addon_diagnostics_changed(cx);
         let same_document = self.pdf_main == self.last_main;
         self.preview_state = match (outcome.pdf, outcome.last_good_pdf) {
             (Some(pdf), _) => {
@@ -2290,7 +2468,7 @@ impl Workspace {
                         if let Some((_, text, _)) = open.iter().find(|(path, ..)| *path == entry.path) {
                             sources.push((entry.path, text.clone()));
                         } else if std::fs::metadata(&entry.path).is_ok_and(|metadata| metadata.len() <= PACKAGE_CHECK_FILE_LIMIT)
-                            && let Ok(text) = std::fs::read_to_string(&entry.path)
+                            && let Ok(text) = text_file::read(&entry.path).map(|loaded| loaded.text)
                         {
                             sources.push((entry.path, text));
                         }
@@ -2351,6 +2529,12 @@ impl Workspace {
             self.dialog = Some(Dialog::Settings(SettingsPage::Tools));
             return cx.notify();
         }
+        if *fix == Fix::UpdateLatex {
+            // The settings say why macOS asks for the password, then ask.
+            self.texlive.update(cx, |texlive, cx| texlive.ask_update(cx));
+            self.dialog = Some(Dialog::Settings(SettingsPage::Tools));
+            return cx.notify();
+        }
         let Some(path) = path.map(Path::to_path_buf).or_else(|| self.last_main.clone()) else {
             return;
         };
@@ -2370,7 +2554,7 @@ impl Workspace {
         let done = match fix {
             Fix::AddPackage(package) => format!("Added {package}"),
             Fix::RemovePackage(package) => format!("Removed {package}"),
-            Fix::InstallTool(_) => return,
+            Fix::InstallTool(_) | Fix::UpdateLatex => return,
         };
         self.set_status(done, cx);
     }
@@ -2378,11 +2562,14 @@ impl Workspace {
     /// The view of the file at `path`, opened in the background when needed.
     fn document_view(&mut self, path: &Path, cx: &mut Context<Self>) -> Option<Entity<EditorView>> {
         if !self.documents.iter().any(|document| document.view.read(cx).path.as_deref() == Some(path)) {
-            let Ok(text) = std::fs::read_to_string(path) else {
+            let Ok(loaded) = text_file::read(path) else {
                 self.set_status(format!("Cannot read {}.", path.display()), cx);
                 return None;
             };
-            self.add_document(path.to_path_buf(), &text, cx);
+            self.add_document(path.to_path_buf(), &loaded.text, cx);
+            if let Some(view) = self.documents.last().map(|document| document.view.clone()) {
+                view.update(cx, |view, _| view.set_encoding(loaded.encoding));
+            }
         }
         self.documents.iter().map(|document| document.view.clone()).find(|view| view.read(cx).path.as_deref() == Some(path))
     }
@@ -2416,6 +2603,11 @@ impl Workspace {
         self.package_hints.iter().find(|hint| hint.message == message && view.path.as_ref() == Some(&hint.path))
     }
 
+    /// Whether `fix` can help on this Mac: updating packages needs MacTeX.
+    fn offers(&self, fix: &Fix, cx: &App) -> bool {
+        *fix != Fix::UpdateLatex || self.texlive.read(cx).installed()
+    }
+
     /// Applies the package fix on the line of the cursor.
     fn quick_fix(&mut self, cx: &mut Context<Self>) {
         let Some(view) = self.active_view() else {
@@ -2429,7 +2621,7 @@ impl Workspace {
             self.diagnostics
                 .iter()
                 .filter(|diagnostic| diagnostic.line == Some(line) && diagnostic.file == path)
-                .find_map(|diagnostic| Some((build::explain(diagnostic)?.fix?, None)))
+                .find_map(|diagnostic| Some((build::explain(diagnostic)?.fix.filter(|fix| self.offers(fix, cx))?, None)))
         });
         match fix {
             Some((fix, path)) => self.apply_fix(&fix, path.as_deref(), cx),
@@ -2525,6 +2717,7 @@ impl Workspace {
     /// Runs whenever the document notifies, which covers every way of moving the
     /// cursor, so it has to stay cheap until the line changes.
     fn cursor_changed(&mut self, view: &Entity<EditorView>, cx: &mut Context<Self>) {
+        self.addon_context_changed(cx);
         if !self.settings.auto_scroll_pdf || self.active_view().as_ref() != Some(view) {
             return;
         }
@@ -2641,6 +2834,10 @@ impl Workspace {
         if matches!(dialog, Dialog::Settings(_)) {
             // Tools may have come or gone outside the app since the last look.
             self.toolchain.read(cx).forget_found();
+        }
+        if dialog == Dialog::Settings(SettingsPage::Storage) {
+            self.storage_usage = None;
+            self.measure_storage(cx);
         }
         self.open_menu = None;
         self.dialog = Some(dialog);
@@ -3119,7 +3316,7 @@ impl Workspace {
                     let mut read = |path: &Path| {
                         path.canonicalize()
                             .ok()
-                            .and_then(|path| open.get(&path).cloned().or_else(|| std::fs::read_to_string(&path).ok()))
+                            .and_then(|path| open.get(&path).cloned().or_else(|| text_file::read(&path).ok().map(|loaded| loaded.text)))
                     };
                     let text = read(&main).ok_or_else(|| format!("Cannot read {}", main.display()))?;
                     Ok(word_count::count_words(&main, &text, &base, &mut read))
@@ -3683,7 +3880,7 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let message = format!("Move “{name}” to the Trash?");
             let detail = if unsaved {
-                "Unsaved changes in its open files are lost. Finder can put it back from the Trash."
+                "Finder can put it back from the Trash. Unsaved changes stay in Earlier versions."
             } else {
                 "Finder can put it back from the Trash."
             };
@@ -3691,11 +3888,28 @@ impl Workspace {
                 return;
             }
             let target = path.clone();
-            let trashed = cx.background_spawn(async move { trash::delete(&target) }).await;
+            let trashed = cx
+                .background_spawn(async move {
+                    // Also safe from emptying the Trash. Writing is text, so a big
+                    // file such as a video has no place in the history.
+                    if std::fs::metadata(&target).is_ok_and(|metadata| metadata.is_file() && metadata.len() <= text_file::HISTORY_LIMIT)
+                        && let Some(directory) = history::directory()
+                    {
+                        history::keep_disk(&directory, &target).ok();
+                    }
+                    trash::delete(&target)
+                })
+                .await;
             this.update_in(cx, |this, window, cx| {
                 if let Err(error) = trashed {
                     this.set_status(format!("Cannot move {name} to the Trash: {error}"), cx);
                     return;
+                }
+                for document in &this.documents {
+                    let view = document.view.read(cx);
+                    if view.state.is_dirty() && view.path.as_deref().is_some_and(|open| open.starts_with(&path)) {
+                        view.keep_current_text();
+                    }
                 }
                 while let Some(index) =
                     this.documents.iter().rposition(|document| document.view.read(cx).path.as_deref().is_some_and(|open| open.starts_with(&path)))
@@ -3771,6 +3985,8 @@ impl Workspace {
             if !is_dir {
                 let target = path.clone();
                 entries.push(entry("Duplicate", "", move |this, _, cx| this.duplicate_tree_entry(&target, cx)));
+                let target = path.clone();
+                entries.push(entry("Earlier versions…", "", move |this, window, cx| this.open_history_picker(target.clone(), window, cx)));
             }
             let target = path.clone();
             entries.push(MenuEntry {
@@ -3924,7 +4140,8 @@ impl Workspace {
                         .filter(|entry| !entry.is_dir)
                         .map(|entry| entry.path)
                         .filter(|path| match kind {
-                            PickerKind::Files | PickerKind::Text | PickerKind::Branches | PickerKind::Themes | PickerKind::Fonts(_) => true,
+                            PickerKind::Files | PickerKind::Text | PickerKind::Branches | PickerKind::Themes | PickerKind::Fonts(_) | PickerKind::Commands => true,
+                            PickerKind::History => false,
                             PickerKind::Figures => language.is_some_and(|language| snippets::is_figure_file(language, path)),
                             PickerKind::Citations => path.extension().is_some_and(|extension| extension == "bib"),
                         })
@@ -3950,6 +4167,66 @@ impl Workspace {
             .ok();
         }));
         cx.notify();
+    }
+
+    /// Every command by name, with its keys. An item's path holds the
+    /// command's id, since commands have no file.
+    fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let os = keymap::host_os();
+        let mut entries: Vec<picker::PickerItem> = COMMANDS
+            .iter()
+            .filter(|command| command.runs_anywhere())
+            .map(|command| picker::PickerItem {
+                path: PathBuf::from(command.id),
+                label: format!("{}: {}", command.group, command.label),
+                position: None,
+                summary: None,
+                detail: Some(self.keymap.keys(command).first().map(|keys| keymap::display(keys, os)).unwrap_or_default()).filter(|keys| !keys.is_empty()),
+            })
+            .collect();
+        for entry in &self.addon_panels {
+            let manifest = &entry.panel.read(cx).add_on.manifest;
+            for command in &manifest.commands {
+                let id = format!("{}{}.{}", keymap::ADDON_PREFIX, manifest.id, command.id);
+                let keys = self.keymap.addon_keys(&id, &command.keys);
+                entries.push(picker::PickerItem {
+                    path: PathBuf::from(id),
+                    label: format!("{}: {}", manifest.name, command.label),
+                    position: None,
+                    summary: None,
+                    detail: keys.first().map(|keys| keymap::display(keys, os)),
+                });
+            }
+        }
+        self.picker = Some(Picker {
+            kind: PickerKind::Commands,
+            query: String::new(),
+            items: Vec::new(),
+            selected: 0,
+            root: PathBuf::new(),
+            files: Arc::new(Vec::new()),
+            entries: Arc::new(entries),
+            cancel: Arc::new(AtomicBool::new(false)),
+            task: None,
+            themes: Arc::default(),
+            original: None,
+        });
+        window.focus(&self.picker_focus, cx);
+        self.refresh_picker(cx);
+    }
+
+    fn run_palette_command(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((addon, command)) = id.strip_prefix(keymap::ADDON_PREFIX).and_then(|rest| rest.split_once('.')) {
+            return self.run_addon_command(&RunAddonCommand { addon: addon.to_string(), command: command.to_string() }, cx);
+        }
+        let Some(command) = COMMANDS.iter().find(|command| command.id == id) else {
+            return;
+        };
+        // Commands of the editor act on the document.
+        if command.context.is_some() {
+            self.focus_active(window, cx);
+        }
+        window.dispatch_action(command.action(), cx);
     }
 
     /// Lists the cached themes at once and asks Neovim for the current ones.
@@ -3994,6 +4271,71 @@ impl Workspace {
             .ok();
         }));
         cx.notify();
+    }
+
+    /// Lists the earlier versions of `path`, newest first, with how much each
+    /// differs from the text now.
+    fn open_history_picker(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(directory) = history::directory() else {
+            return;
+        };
+        let current = match self.document_at(&path, cx) {
+            Some(index) => Some(self.documents[index].view.read(cx).state.buffer().clone()),
+            None => None,
+        };
+        self.picker = Some(Picker {
+            kind: PickerKind::History,
+            query: String::new(),
+            items: Vec::new(),
+            selected: 0,
+            // The file whose versions these are.
+            root: path.clone(),
+            files: Arc::new(Vec::new()),
+            entries: Arc::new(Vec::new()),
+            cancel: Arc::new(AtomicBool::new(false)),
+            task: None,
+            themes: Arc::new(nvim_themes::Themes::new()),
+            original: None,
+        });
+        window.focus(&self.picker_focus, cx);
+        self.picker_files_task = Some(cx.spawn(async move |this, cx| {
+            let entries = cx
+                .background_spawn(async move {
+                    let current = match current {
+                        Some(buffer) => buffer.to_string(),
+                        None => text_file::read(&path).map(|loaded| loaded.text).unwrap_or_default(),
+                    };
+                    history_items(&history::versions(&directory, &path), &current)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if let Some(picker) = this.picker.as_mut().filter(|picker| picker.kind == PickerKind::History) {
+                    picker.entries = Arc::new(entries);
+                    this.refresh_picker(cx);
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Puts an earlier version in place as one edit, which undo takes back.
+    fn restore_version(&mut self, path: PathBuf, item: PickerItem, cx: &mut Context<Self>) {
+        let loaded = match history::read(&item.path).and_then(text_file::decode) {
+            Ok(loaded) => loaded,
+            Err(error) => return self.set_status(format!("Cannot read that version: {error}"), cx),
+        };
+        let Some(view) = self.document_view(&path, cx) else {
+            return;
+        };
+        if let Some(index) = self.document_at(&path, cx) {
+            self.active = Some(index);
+        }
+        view.update(cx, |view, cx| {
+            let everything = 0..view.state.buffer().len();
+            view.edit_from_outside(everything, &loaded.text, cx);
+        });
+        self.set_status(format!("Restored the version from {}. Undo brings the text back, and saving keeps it.", item.label.to_lowercase()), cx);
     }
 
     fn open_font_picker(&mut self, slot: FontSlot, window: &mut Window, cx: &mut Context<Self>) {
@@ -4093,7 +4435,7 @@ impl Workspace {
                 picker.items = picker::match_files(&picker.files, &picker.root, &picker.query);
                 picker.selected = 0;
             }
-            PickerKind::Citations => {
+            PickerKind::Citations | PickerKind::History | PickerKind::Commands => {
                 picker.items = picker::match_in_order(&picker.entries, &picker.query);
                 picker.selected = 0;
             }
@@ -4172,7 +4514,9 @@ impl Workspace {
     }
 
     fn accept_picker(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((kind, item)) = self.picker.as_ref().and_then(|picker| Some((picker.kind, picker.items.get(index).cloned()?))) else {
+        let Some((kind, item, target)) =
+            self.picker.as_ref().and_then(|picker| Some((picker.kind, picker.items.get(index).cloned()?, picker.root.clone())))
+        else {
             return;
         };
         if let Some(picker) = &mut self.picker {
@@ -4182,6 +4526,7 @@ impl Workspace {
         self.close_picker(window, cx);
         match kind {
             PickerKind::Files | PickerKind::Text => {}
+            PickerKind::Commands => return self.run_palette_command(&item.path.to_string_lossy(), window, cx),
             PickerKind::Themes => {
                 let name = (item.label != theme::DEFAULT_THEME).then_some(item.label);
                 // A theme is a choice against paper, which would cover it.
@@ -4199,6 +4544,7 @@ impl Workspace {
                 return self.update_settings(|settings| *settings = chosen, window, cx);
             }
             PickerKind::Figures => return self.insert_figure(&item.path, cx),
+            PickerKind::History => return self.restore_version(target, item, cx),
             PickerKind::Branches => {
                 if self.save_all(cx) {
                     let create = item.detail.as_deref() == Some(picker::CREATE_BRANCH);
@@ -4610,15 +4956,22 @@ impl Workspace {
         cx.notify();
     }
 
-    fn menu_entries(&self, menu: Menu) -> Vec<MenuEntry> {
-        #[allow(unused_mut)]
-        let mut entries = self.base_menu_entries(menu);
+    fn menu_entries(&self, menu: Menu, cx: &App) -> Vec<MenuEntry> {
+        let mut entries = self.base_menu_entries(menu, cx);
+        // Only a file in an older encoding needs a way out of it.
+        if menu == Menu::File
+            && let Some(view) = self.active_view()
+            && view.read(cx).encoding() != text_file::UTF_8
+        {
+            let save = entries.len() - 1;
+            entries.insert(save, entry("Convert to UTF-8", "", |this, _, cx| this.with_active(cx, |view, cx| view.convert_to_utf8(cx))));
+        }
         #[cfg(feature = "collab")]
         self.add_collab_entries(menu, &mut entries);
         entries
     }
 
-    fn base_menu_entries(&self, menu: Menu) -> Vec<MenuEntry> {
+    fn base_menu_entries(&self, menu: Menu, cx: &App) -> Vec<MenuEntry> {
         let check = |on: bool, label: &str| format!("{} {label}", if on { "✓" } else { "  " });
         match menu {
             Menu::File => vec![
@@ -4627,6 +4980,11 @@ impl Workspace {
                 entry("Add files…", "", |this, window, cx| this.prompt_add_files(window, cx)),
                 entry("Make a copy", "", |this, window, cx| this.make_copy(window, cx)),
                 menu_separator(),
+                entry("Earlier versions of this file…", "", |this, window, cx| {
+                    if let Some(path) = this.active_view().and_then(|view| view.read(cx).path.clone()) {
+                        this.open_history_picker(path, window, cx);
+                    }
+                }),
                 entry("Version history", "", |this, _, cx| this.show_version_history(cx)),
                 entry("Commit and sync…", self.shortcut("git_panel"), |this, window, cx| this.open_git_panel(window, cx)),
                 entry("Word count…", "", |this, window, cx| this.show_word_count(window, cx)),
@@ -4698,6 +5056,7 @@ impl Workspace {
                 }),
             ],
             Menu::Tree => self.tree_menu_entries(),
+            Menu::EditorContext => self.editor_menu_entries(cx),
             Menu::Symbols | Menu::Table | Menu::Code => Vec::new(),
             Menu::Help => vec![
                 entry("Editor tour", "", |this, window, cx| this.start_tour(window, cx)),
@@ -4816,9 +5175,9 @@ impl Workspace {
     /// The tree's menu is a sheet of the side panel: a raised tone without a
     /// frame, and a pill under the row in reach.
     fn render_menu(&self, menu: Menu, cx: &mut Context<Self>) -> impl IntoElement {
-        let items = self.menu_entries(menu);
+        let items = self.menu_entries(menu, cx);
         let palette = theme::palette();
-        let paper = menu == Menu::Tree;
+        let paper = matches!(menu, Menu::Tree | Menu::EditorContext);
         deferred(
             anchored()
                 .anchor(Anchor::TopLeft)
@@ -6103,6 +6462,7 @@ impl Workspace {
 
     fn render_editor_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let active = self.active_view();
+        let has_document = active.is_some();
         let pdf_tab = self.pdf_tab_shown && !self.focus_mode;
         let toolbar = if self.focus_mode {
             None
@@ -6116,6 +6476,7 @@ impl Workspace {
         } else {
             match (self.image_preview(), active) {
             (Some(preview), _) => preview.view.clone().into_any_element(),
+            (None, Some(_)) if let Some(index) = self.active_proposal(cx) => self.render_proposal(index, cx),
             (None, Some(view)) => view.into_any_element(),
             (None, None) => div()
                 .size_full()
@@ -6140,7 +6501,18 @@ impl Workspace {
             .when(self.show_tab_bar(), |element| element.child(self.render_tabs(cx)))
             .when(self.show_breadcrumbs(), |element| element.child(self.render_breadcrumbs(cx)))
             .children(toolbar)
-            .child(div().relative().flex_1().min_h_0().child(body).children(self.tour_anchor(TourAnchor::Editor)))
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .when(has_document && !pdf_tab, |element| {
+                        element.on_mouse_down(MouseButton::Right, cx.listener(|this, event: &MouseDownEvent, window, cx| this.open_editor_menu(event.position, window, cx)))
+                    })
+                    .child(body)
+                    .children(self.tour_anchor(TourAnchor::Editor))
+                    .when(self.open_menu == Some(Menu::EditorContext), |element| element.child(self.render_menu(Menu::EditorContext, cx))),
+            )
             .children(self.render_conflict_strip(cx))
             .when_some(self.cursor_hint(cx).cloned(), |element, hint| element.child(self.render_hint_strip(&hint, cx)))
             .when(self.error_count() > 0, |element| element.child(self.render_error_strip(cx)))
@@ -6426,7 +6798,7 @@ impl Workspace {
                     .flex()
                     .flex_wrap()
                     .gap(px(6.))
-                    .when_some(problem.fix.clone(), |element, fix| {
+                    .when_some(problem.fix.clone().filter(|fix| self.offers(fix, cx)), |element, fix| {
                         element.child(self.panel_button("apply-fix", fix.label(), true, cx, move |this, _, cx| this.apply_fix(&fix, None, cx)))
                     })
                     .when(problem.location.is_some(), |element| {
@@ -7313,6 +7685,188 @@ impl Workspace {
         elements
     }
 
+    /// Where the build of the open project writes, as `recompile` and the runner decide it.
+    fn build_directory(&self, cx: &App) -> Option<PathBuf> {
+        let root = self.root.clone()?;
+        let active = self.active_view().and_then(|view| view.read(cx).path.clone());
+        let main = self.last_main.clone().or_else(|| find_main(&root, &self.config, active.as_deref()));
+        let engine = self.config.engine.or_else(|| main.as_deref().and_then(Engine::for_path));
+        let folder = match main {
+            Some(main) if engine != Some(Engine::Typst) => main.parent().map_or_else(|| root.clone(), Path::to_path_buf),
+            _ => root,
+        };
+        Some(folder.join(build::OUTPUT_DIRECTORY))
+    }
+
+    /// Measures in the background, since walking gigabytes of tools takes a while.
+    fn measure_storage(&mut self, cx: &mut Context<Self>) {
+        let build = self.build_directory(cx);
+        self.storage_task = Some(cx.spawn(async move |this, cx| {
+            let usage = cx.background_spawn(async move { storage::measure(build.as_deref()) }).await;
+            this.update(cx, |this, cx| {
+                this.storage_usage = Some(usage);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Clears away from the UI thread, then measures again.
+    fn clear_storage(&mut self, part: &'static str, clear: impl FnOnce() -> std::io::Result<()> + Send + 'static, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let cleared = cx.background_spawn(async move { clear() }).await;
+            this.update(cx, |this, cx| {
+                match cleared {
+                    Ok(()) => this.set_status(format!("{part} cleared."), cx),
+                    Err(error) => this.set_status(format!("Cannot clear {}: {error}", part.to_lowercase()), cx),
+                }
+                this.measure_storage(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Nothing brings the versions back, so it asks first.
+    fn clear_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(directory) = history::directory() else {
+            return;
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let detail = "Earlier versions of every file go away, also of deleted files. The files themselves stay as they are.";
+            if ask(&this, cx, PromptLevel::Warning, "Clear the file history?", detail, &["Clear history", "Cancel"]).await != Some(0) {
+                return;
+            }
+            this.update(cx, |this, cx| this.clear_storage("File history", move || history::clear(&directory), cx)).ok();
+        })
+        .detach();
+    }
+
+    /// The colors of a Neovim theme in use stay, since the next start reads them from the cache.
+    fn clear_caches(&mut self, cx: &mut Context<Self>) {
+        let theme = self.settings.theme.clone().filter(|name| theme::built_in(name).is_none());
+        self.clear_storage(
+            "Caches",
+            move || {
+                let kept = theme.zip(nvim_themes::cache_path()).and_then(|(name, path)| {
+                    let palette = nvim_themes::load_cache(&path).remove(&name)?;
+                    Some((path, nvim_themes::Themes::from([(name, palette)])))
+                });
+                storage::clear_caches()?;
+                kept.map_or(Ok(()), |(path, themes)| nvim_themes::save_cache(&path, &themes))
+            },
+            cx,
+        );
+    }
+
+    fn render_storage_settings(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let palette = theme::palette();
+        let usage = self.storage_usage.as_ref();
+        // The sizes stand in one column at the right, with "…" while measuring.
+        let row = |button: Option<AnyElement>, bytes: Option<u64>| {
+            div().flex().flex_none().items_center().gap(px(12.)).children(button).child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .justify_end()
+                    .w(px(64.))
+                    .text_color(theme::color(palette.ui_muted))
+                    .child(bytes.map_or_else(|| "…".to_string(), storage::human)),
+            )
+        };
+        let size = |part: fn(&storage::Usage) -> u64| usage.map(part);
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let shown = |path: &Path| match home.as_deref().and_then(|home| path.strip_prefix(home).ok()) {
+            Some(rest) => format!("~/{}", rest.display()),
+            None => path.display().to_string(),
+        };
+        let installing = self.toolchain.read(cx).busy();
+        let limit = history::TOTAL_LIMIT / (1024 * 1024);
+        let mut elements = vec![
+            div()
+                .flex_none()
+                .pb(px(4.))
+                .text_color(theme::color(palette.ui_muted))
+                .child(match usage {
+                    Some(usage) => format!("The app keeps {} outside your projects.", storage::human(usage.total)),
+                    None => "Measuring what the app keeps outside your projects…".to_string(),
+                })
+                .into_any_element(),
+            Self::setting_row(
+                "File history",
+                format!("Earlier versions of your files. Compressed and at most {limit} MB in total, so older versions thin out over time."),
+                row(
+                    Some(self.settings_button("clear-history", "Clear history", cx, |this, window, cx| this.clear_history(window, cx)).into_any_element()),
+                    size(|usage| usage.history),
+                ),
+            )
+            .into_any_element(),
+            Self::setting_row(
+                "Crash recovery copies",
+                "Unsaved text, so that a crash loses at most a few seconds. Gone once saved.",
+                row(None, size(|usage| usage.recovery)),
+            )
+            .into_any_element(),
+            Self::setting_row("Installed tools", "Tectonic, Typst and Pandoc. Remove them under Writing tools.", row(None, size(|usage| usage.tools)))
+                .into_any_element(),
+            Self::setting_row("Add-ons", "Remove them in the Add-ons panel.", row(None, size(|usage| usage.addons))).into_any_element(),
+            Self::setting_row("Templates", "Your own templates. Remove them on the Home screen under Templates.", row(None, size(|usage| usage.templates)))
+                .into_any_element(),
+            Self::setting_row(
+                "Downloads",
+                if installing {
+                    "Installs that did not finish, so that a second try continues. In use while an install runs."
+                } else {
+                    "Installs that did not finish, so that a second try continues. Gone after two weeks."
+                },
+                row(
+                    (!installing).then(|| {
+                        self.settings_button("clear-downloads", "Clear", cx, |this, _, cx| {
+                            this.clear_storage("Downloads", || storage::downloads_dir().map_or(Ok(()), |downloads| storage::clear(&downloads)), cx);
+                        })
+                        .into_any_element()
+                    }),
+                    size(|usage| usage.downloads),
+                ),
+            )
+            .into_any_element(),
+            Self::setting_row(
+                "Caches",
+                "Lists of themes and LaTeX commands, made again when needed.",
+                row(Some(self.settings_button("clear-caches", "Clear", cx, |this, _, cx| this.clear_caches(cx)).into_any_element()), size(|usage| usage.caches)),
+            )
+            .into_any_element(),
+        ];
+        if let Some(root) = &self.root {
+            let name = root.file_name().map_or_else(|| shown(root), |name| name.to_string_lossy().into_owned());
+            elements.push(
+                Self::setting_row(
+                    "Build output",
+                    format!("The .build folder of {name}, which makes the next build fast. Recompiling from scratch starts it over."),
+                    row(
+                        Some(self.settings_button("storage-recompile", "Recompile from scratch", cx, |this, _, cx| this.recompile_from_scratch(cx)).into_any_element()),
+                        usage.and_then(|usage| usage.build),
+                    ),
+                )
+                .into_any_element(),
+            );
+        }
+        for (id, title, folder) in [("show-data", "App folder", storage::data_dir()), ("show-cache", "Cache folder", storage::cache_dir())] {
+            let Some(folder) = folder else {
+                continue;
+            };
+            elements.push(
+                Self::setting_row(
+                    title,
+                    shown(&folder),
+                    self.settings_button(id, "Show in Finder", cx, move |_, _, cx| cx.reveal_path(&folder)),
+                )
+                .into_any_element(),
+            );
+        }
+        elements
+    }
+
     fn render_tool_settings(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut elements = vec![
             div()
@@ -7324,6 +7878,7 @@ impl Workspace {
         ];
         elements.extend(toolchain::installer_choice(&self.toolchain, cx));
         elements.extend(toolchain::tool_rows(&self.toolchain, &Tool::ALL, true, cx));
+        elements.extend(texlive::section(&self.texlive, &self.toolchain, cx));
         elements.push(div().flex_none().pt(px(4.)).text_size(px(11.)).text_color(theme::color(theme::palette().ui_muted)).child(toolchain::promise(&self.toolchain, cx)).into_any_element());
         elements
     }
@@ -7599,6 +8154,10 @@ impl Workspace {
     /// A build that failed for want of this tool runs again.
     fn tool_installed(&mut self, tool: Tool, cx: &mut Context<Self>) {
         self.set_status(format!("{} is ready.", tool.language()), cx);
+        if tool == Tool::MacTex {
+            // A new year changes what there is to update, and what can go.
+            self.texlive.update(cx, |texlive, cx| texlive.look(cx));
+        }
         if self.root.is_some() && !self.last_build_succeeded {
             self.recompile(cx);
         }
@@ -7659,6 +8218,10 @@ impl Workspace {
             .when(page == current, |style| style.bg(theme::color(theme::palette().accent_soft)).font_weight(FontWeight::SEMIBOLD))
             .when(page != current, |style| style.hover(|style| style.bg(theme::color(theme::palette().divider))))
             .on_click(cx.listener(move |this, _, _, cx| {
+                if page == SettingsPage::Storage && this.dialog != Some(Dialog::Settings(page)) {
+                    this.storage_usage = None;
+                    this.measure_storage(cx);
+                }
                 this.dialog = Some(Dialog::Settings(page));
                 this.recording_shortcut = None;
                 cx.notify();
@@ -7681,6 +8244,7 @@ impl Workspace {
             Dialog::Settings(SettingsPage::Compiler) => self.render_compiler_settings(cx),
             Dialog::Settings(SettingsPage::Tools) => self.render_tool_settings(cx),
             Dialog::Settings(SettingsPage::Shortcuts) => self.render_shortcut_settings(cx),
+            Dialog::Settings(SettingsPage::Storage) => self.render_storage_settings(cx),
             Dialog::Shortcuts => self.render_shortcuts(),
             Dialog::WordCount => self.render_word_count(),
             #[cfg(feature = "collab")]
@@ -7754,7 +8318,8 @@ impl Workspace {
                                             .child(self.settings_tab(SettingsPage::Editor, page, "Editor", cx))
                                             .child(self.settings_tab(SettingsPage::Compiler, page, "Compiler", cx))
                                             .child(self.settings_tab(SettingsPage::Tools, page, "Writing tools", cx))
-                                            .child(self.settings_tab(SettingsPage::Shortcuts, page, "Shortcuts", cx)),
+                                            .child(self.settings_tab(SettingsPage::Shortcuts, page, "Shortcuts", cx))
+                                            .child(self.settings_tab(SettingsPage::Storage, page, "Storage", cx)),
                                     )
                                 },
                             )
@@ -7782,14 +8347,17 @@ impl Workspace {
             PickerKind::Citations => "Insert citation",
             PickerKind::Branches => "Switch branch",
             PickerKind::Themes => "Select theme",
+            PickerKind::History => "Earlier versions",
             PickerKind::Fonts(FontSlot::Editor) => "Editor font",
             PickerKind::Fonts(FontSlot::Interface) => "Interface font",
+            PickerKind::Commands => "Run a command",
         };
         let empty = match (picker.kind, picker.query.is_empty()) {
             (PickerKind::Text, true) => "Type to search the project.",
             (PickerKind::Figures, true) => "No images in this project.",
             (PickerKind::Citations, true) => "No .bib entries in this project.",
             (PickerKind::Branches, true) => "Type a name to create a branch.",
+            (PickerKind::History, true) => "No earlier versions yet. Each save keeps the one before.",
             _ => "No results.",
         };
         div()
@@ -8054,6 +8622,11 @@ impl Render for Workspace {
         if std::mem::take(&mut self.setup_requested) && self.setup.is_none() {
             self.run_setup(window, cx);
         }
+        if std::mem::take(&mut self.focus_requested) {
+            self.focus_active(window, cx);
+        }
+        // Another document may have become active.
+        self.addon_context_changed(cx);
         if let Some(format) = self.export_after_pandoc.filter(|_| !self.toolchain.read(cx).installing(Tool::Pandoc)) {
             self.export_after_pandoc = None;
             match self.toolchain.read(cx).errors.get(&Tool::Pandoc).cloned() {
@@ -8123,6 +8696,7 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &LookupDoi, _, cx| this.lookup_doi(cx)))
             .on_action(cx.listener(|this, _: &QuickFix, _, cx| this.quick_fix(cx)))
+            .on_action(cx.listener(|this, action: &RunAddonCommand, _, cx| this.run_addon_command(action, cx)))
             .on_action(cx.listener(|this, _: &InsertCitation, window, cx| {
                 if matches!(this.active_language(cx), Some(Language::Latex | Language::Typst)) && this.dialog_panel(cx).is_none() {
                     this.open_picker(PickerKind::Citations, window, cx);
@@ -8158,6 +8732,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &LayoutPdfTab, window, cx| this.set_layout(PaneLayout::PdfTab, window, cx)))
             .on_action(cx.listener(|this, _: &ToggleFocusMode, window, cx| this.toggle_focus_mode(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleHub, window, cx| this.toggle_hub(window, cx)))
+            .on_action(cx.listener(|this, _: &CommandPalette, window, cx| this.open_command_palette(window, cx)))
             .on_action(cx.listener(|this, _: &OpenGitPanel, window, cx| this.open_git_panel(window, cx)))
             .on_action(cx.listener(|this, _: &StartPresentation, window, cx| this.start_presentation(window, cx)))
             .on_action(cx.listener(|this, _: &ExitPresentation, window, cx| this.exit_presentation(window, cx)))
@@ -8176,6 +8751,9 @@ impl Render for Workspace {
                 this.open_dialog(Dialog::Settings(SettingsPage::Editor), window, cx);
             }))
             .on_action(|_: &Quit, _, cx: &mut App| cx.quit())
+            .on_action(cx.listener(|this, _: &MoveToApplications, _, cx| this.mover.update(cx, |mover, cx| mover.start(cx))))
+            // Before the setup too: moving first saves a second setup in the copy.
+            .when(!presenting, |element| element.children(app_location::banner(&self.mover, cx)))
             .when(!presenting && setup.is_none(), |element| element.children(updater::banner(&self.updater, cx)))
             .when(hub, |element| {
                 let page = match setup {
@@ -8360,4 +8938,43 @@ mod tests {
         assert!(tab_edges(0, 3, None).0);
         assert!(!tab_edges(2, 3, None).1);
     }
+}
+
+/// One picker row per version: when, and how much it differs from now.
+fn history_items(versions: &[history::Version], current: &str) -> Vec<PickerItem> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs());
+    versions
+        .iter()
+        .map(|version| {
+            let text = history::read(&version.file).ok().and_then(|bytes| text_file::decode(bytes).ok()).map(|loaded| loaded.text);
+            let changes = match text.as_deref().map(|text| editor_core::line_diff::line_diff(current, text)) {
+                Some(Some(hunks)) if hunks.is_empty() => "Same as now".to_string(),
+                Some(Some(hunks)) => {
+                    let lines: usize = hunks.iter().map(|hunk| hunk.lines.len().max(1)).sum();
+                    format!("{lines} line{} differ from now", if lines == 1 { "" } else { "s" })
+                }
+                _ => "Differs from now".to_string(),
+            };
+            PickerItem {
+                path: version.file.clone(),
+                label: projects::ago(now, version.time),
+                position: None,
+                summary: None,
+                detail: Some(changes),
+            }
+        })
+        .collect()
+}
+
+/// Why a save failed, in words that say what to do. The file on disk is
+/// always whole, since saves replace it in one step.
+fn save_failed(error: &std::io::Error) -> String {
+    use std::io::ErrorKind;
+    let advice = match error.kind() {
+        ErrorKind::StorageFull | ErrorKind::QuotaExceeded => "The disk is full. Free some space and save again",
+        ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem => "This file or folder cannot be changed. Save a copy somewhere else",
+        ErrorKind::NotFound => "Its folder is gone. Save a copy somewhere else",
+        _ => return format!("Cannot save: {error}. Your text is still here and kept safe."),
+    };
+    format!("Cannot save: {advice}. Your text is still here and kept safe.")
 }
