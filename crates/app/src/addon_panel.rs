@@ -383,7 +383,15 @@ impl AddonPanel {
             }
             ProcessEvent::Message(AddonMessage::Subscribe { events }) => {
                 if self.speaks_two() {
+                    let had_project = self.subscriptions.contains(&EventKind::Project);
                     self.subscriptions = events.into_iter().collect();
+                    // The program starts again with each project, so this is the one it works on.
+                    if !had_project
+                        && self.subscriptions.contains(&EventKind::Project)
+                        && let Some(root) = &self.root
+                    {
+                        self.send(HostMessage::ProjectOpened { root: root.display().to_string() });
+                    }
                 }
             }
             ProcessEvent::Message(AddonMessage::Request { id, request }) => {

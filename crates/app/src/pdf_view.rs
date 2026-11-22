@@ -686,6 +686,12 @@ impl PdfView {
         }
     }
 
+    /// The selected text of the pages whose text is loaded.
+    pub fn selected_text(&self) -> Option<String> {
+        let selection = self.selection.as_ref()?;
+        Some(pdf_text::selected_text(selection, |page| self.content.get(&page)))
+    }
+
     fn copy_selection(&mut self, cx: &mut Context<Self>) {
         if let Some(selection) = &self.selection {
             let text = pdf_text::selected_text(selection, |page| self.content.get(&page));

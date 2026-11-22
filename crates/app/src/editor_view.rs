@@ -1034,6 +1034,16 @@ impl EditorView {
         self.scroll_y = self.scroll_y.clamp(px(0.), max);
     }
 
+    /// The lines on screen, from zero, or `None` before the first paint.
+    pub fn visible_lines(&self) -> Option<Range<usize>> {
+        let bounds = self.bounds?;
+        let last_row = self.rows.count().checked_sub(1)?;
+        let line_height = Self::line_height();
+        let first_row = ((self.scroll_y / line_height) as usize).min(last_row);
+        let bottom_row = (first_row + (bounds.size.height / line_height) as usize).saturating_sub(1).clamp(first_row, last_row);
+        Some(self.rows.locate(first_row).0..self.rows.locate(bottom_row).0 + 1)
+    }
+
     fn visible_page_rows(&self) -> usize {
         self.bounds
             .map_or(30, |bounds| (bounds.size.height / Self::line_height()) as usize)
