@@ -48,7 +48,7 @@ use crate::{
     keymap::{self, Keymap},
     pdf_view::{PdfView, PdfViewEvent, ZOOM_STEP},
     nvim_themes, package_commands,
-    picker::{self, FontSlot, Picker, PickerKind},
+    picker::{self, FontSlot, Picker, PickerItem, PickerKind},
     package_check::{self, PackageHint},
     problems::{self, Problem},
     recovery,
@@ -59,6 +59,8 @@ use crate::{
     shortcuts,
     snippets,
     status_bar::{self, StatusInfo},
+    history,
+    text_file,
     theme,
     toolchain::{self, Tool, Toolchain, ToolchainEvent},
     updater::{self, Updater},
@@ -70,7 +72,7 @@ mod collab_session;
 #[path = "git_sync.rs"]
 mod git_sync;
 
-const RECOVERY_DELAY: Duration = Duration::from_secs(3);
+const RECOVERY_DELAY: Duration = Duration::from_secs(1);
 const TOP_BAR_HEIGHT: f32 = 40.0;
 const RAIL_WIDTH: f32 = 40.0;
 const DIVIDER_WIDTH: f32 = 7.0;
@@ -1066,16 +1068,30 @@ impl Workspace {
         let paths: Vec<PathBuf> = documents.iter().map(|(_, path, _)| path.clone()).collect();
         self.refresh_task = Some(cx.spawn(async move |this, cx| {
             // Open files come first, since the walk can take much longer.
-            let texts: Vec<Option<String>> = cx
-                .background_spawn(async move { paths.iter().map(|path| std::fs::read_to_string(path).ok()).collect() })
-                .await;
+            let texts: Vec<std::io::Result<text_file::Loaded>> =
+                cx.background_spawn(async move { paths.iter().map(|path| text_file::read(path)).collect() }).await;
+            let mut gone = Vec::new();
             cx.update(|cx| {
-                for ((view, _, version), text) in documents.iter().zip(&texts) {
-                    if let Some(text) = text {
-                        view.update(cx, |view, cx| view.reload_text(text, *version, cx));
+                for ((view, path, version), loaded) in documents.iter().zip(&texts) {
+                    match loaded {
+                        Ok(loaded) => view.update(cx, |view, cx| view.reload_text(&loaded.text, loaded.encoding, *version, cx)),
+                        // Another program deleted or moved the file. The text stays
+                        // and counts as unsaved, so closing asks and a crash keeps it.
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            view.update(cx, |view, cx| view.mark_file_gone(cx));
+                            gone.push(path.file_name().unwrap_or_default().to_string_lossy().into_owned());
+                        }
+                        Err(_) => {}
                     }
                 }
             });
+            if !gone.is_empty() {
+                this.update(cx, |this, cx| {
+                    this.set_status(format!("{} was deleted outside the editor. The text is still here; save to keep it.", gone.join(", ")), cx);
+                    this.schedule_recovery(cx);
+                })
+                .ok();
+            }
             let entries = cx.background_spawn(async move { root.map(|root| file_tree::scan(&root, &collapsed)) }).await;
             this.update(cx, |this, cx| {
                 this.refresh_task = None;
@@ -1125,15 +1141,21 @@ impl Workspace {
             self.activate(index, window, cx);
             return;
         }
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
+        let loaded = match text_file::read(&path) {
+            Ok(loaded) => loaded,
             Err(error) => {
                 self.status = Some(format!("Cannot open {}: {error}", path.display()).into());
                 cx.notify();
                 return;
             }
         };
-        self.add_document(path, &text, cx);
+        if loaded.encoding != text_file::UTF_8 {
+            self.status = Some(format!("{} is stored as {} and is saved that way.", path.file_name().unwrap_or_default().to_string_lossy(), loaded.encoding.name()).into());
+        }
+        self.add_document(path, &loaded.text, cx);
+        if let Some(view) = self.documents.last().map(|document| document.view.clone()) {
+            view.update(cx, |view, _| view.set_encoding(loaded.encoding));
+        }
         self.activate(self.documents.len() - 1, window, cx);
         self.apply_marks(cx);
     }
@@ -1322,7 +1344,7 @@ impl Workspace {
         match view.update(cx, |view, cx| view.save(cx)) {
             Ok(_) => self.remove_document(index, window, cx),
             Err(error) if is_save_conflict(&error) => self.ask_about_conflict(view, true, window, cx),
-            Err(error) => self.set_status(format!("Cannot save: {error}"), cx),
+            Err(error) => self.set_status(save_failed(&error), cx),
         }
         self.forget_saved_recovery(cx);
     }
@@ -1356,7 +1378,7 @@ impl Workspace {
                         }
                     }
                     Ok(false) => {}
-                    Err(error) => this.set_status(format!("Cannot save: {error}"), cx),
+                    Err(error) => this.set_status(save_failed(&error), cx),
                 }
                 this.forget_saved_recovery(cx);
             })
@@ -1481,7 +1503,12 @@ impl Workspace {
                     this.update_in(cx, |this, window, cx| this.restore_snapshots(snapshots, window, cx)).ok();
                 }
                 Some(1) => {
+                    let history = history::directory();
                     for snapshot in &snapshots {
+                        // Discarded here, still one click away in Earlier versions.
+                        if let Some(history) = &history {
+                            history::keep(history, &snapshot.path, snapshot.text.as_bytes()).ok();
+                        }
                         recovery::remove(&directory, &snapshot.path);
                     }
                 }
@@ -1566,7 +1593,7 @@ impl Workspace {
                 }
             }
             Err(error) if is_save_conflict(&error) => self.ask_about_conflict(view, false, window, cx),
-            Err(error) => self.set_status(format!("Cannot save: {error}"), cx),
+            Err(error) => self.set_status(save_failed(&error), cx),
         }
         self.forget_saved_recovery(cx);
     }
@@ -2051,7 +2078,7 @@ impl Workspace {
                     all_saved = false;
                 }
                 Err(error) => {
-                    self.set_status(format!("Cannot save: {error}"), cx);
+                    self.set_status(save_failed(&error), cx);
                     all_saved = false;
                 }
             }
@@ -2290,7 +2317,7 @@ impl Workspace {
                         if let Some((_, text, _)) = open.iter().find(|(path, ..)| *path == entry.path) {
                             sources.push((entry.path, text.clone()));
                         } else if std::fs::metadata(&entry.path).is_ok_and(|metadata| metadata.len() <= PACKAGE_CHECK_FILE_LIMIT)
-                            && let Ok(text) = std::fs::read_to_string(&entry.path)
+                            && let Ok(text) = text_file::read(&entry.path).map(|loaded| loaded.text)
                         {
                             sources.push((entry.path, text));
                         }
@@ -2378,11 +2405,14 @@ impl Workspace {
     /// The view of the file at `path`, opened in the background when needed.
     fn document_view(&mut self, path: &Path, cx: &mut Context<Self>) -> Option<Entity<EditorView>> {
         if !self.documents.iter().any(|document| document.view.read(cx).path.as_deref() == Some(path)) {
-            let Ok(text) = std::fs::read_to_string(path) else {
+            let Ok(loaded) = text_file::read(path) else {
                 self.set_status(format!("Cannot read {}.", path.display()), cx);
                 return None;
             };
-            self.add_document(path.to_path_buf(), &text, cx);
+            self.add_document(path.to_path_buf(), &loaded.text, cx);
+            if let Some(view) = self.documents.last().map(|document| document.view.clone()) {
+                view.update(cx, |view, _| view.set_encoding(loaded.encoding));
+            }
         }
         self.documents.iter().map(|document| document.view.clone()).find(|view| view.read(cx).path.as_deref() == Some(path))
     }
@@ -3119,7 +3149,7 @@ impl Workspace {
                     let mut read = |path: &Path| {
                         path.canonicalize()
                             .ok()
-                            .and_then(|path| open.get(&path).cloned().or_else(|| std::fs::read_to_string(&path).ok()))
+                            .and_then(|path| open.get(&path).cloned().or_else(|| text_file::read(&path).ok().map(|loaded| loaded.text)))
                     };
                     let text = read(&main).ok_or_else(|| format!("Cannot read {}", main.display()))?;
                     Ok(word_count::count_words(&main, &text, &base, &mut read))
@@ -3683,7 +3713,7 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let message = format!("Move “{name}” to the Trash?");
             let detail = if unsaved {
-                "Unsaved changes in its open files are lost. Finder can put it back from the Trash."
+                "Finder can put it back from the Trash. Unsaved changes stay in Earlier versions."
             } else {
                 "Finder can put it back from the Trash."
             };
@@ -3691,11 +3721,27 @@ impl Workspace {
                 return;
             }
             let target = path.clone();
-            let trashed = cx.background_spawn(async move { trash::delete(&target) }).await;
+            let trashed = cx
+                .background_spawn(async move {
+                    // Also safe from emptying the Trash.
+                    if target.is_file()
+                        && let Some(directory) = history::directory()
+                    {
+                        history::keep_disk(&directory, &target).ok();
+                    }
+                    trash::delete(&target)
+                })
+                .await;
             this.update_in(cx, |this, window, cx| {
                 if let Err(error) = trashed {
                     this.set_status(format!("Cannot move {name} to the Trash: {error}"), cx);
                     return;
+                }
+                for document in &this.documents {
+                    let view = document.view.read(cx);
+                    if view.state.is_dirty() && view.path.as_deref().is_some_and(|open| open.starts_with(&path)) {
+                        view.keep_current_text();
+                    }
                 }
                 while let Some(index) =
                     this.documents.iter().rposition(|document| document.view.read(cx).path.as_deref().is_some_and(|open| open.starts_with(&path)))
@@ -3771,6 +3817,8 @@ impl Workspace {
             if !is_dir {
                 let target = path.clone();
                 entries.push(entry("Duplicate", "", move |this, _, cx| this.duplicate_tree_entry(&target, cx)));
+                let target = path.clone();
+                entries.push(entry("Earlier versions…", "", move |this, window, cx| this.open_history_picker(target.clone(), window, cx)));
             }
             let target = path.clone();
             entries.push(MenuEntry {
@@ -3925,6 +3973,7 @@ impl Workspace {
                         .map(|entry| entry.path)
                         .filter(|path| match kind {
                             PickerKind::Files | PickerKind::Text | PickerKind::Branches | PickerKind::Themes | PickerKind::Fonts(_) => true,
+                            PickerKind::History => false,
                             PickerKind::Figures => language.is_some_and(|language| snippets::is_figure_file(language, path)),
                             PickerKind::Citations => path.extension().is_some_and(|extension| extension == "bib"),
                         })
@@ -3994,6 +4043,71 @@ impl Workspace {
             .ok();
         }));
         cx.notify();
+    }
+
+    /// Lists the earlier versions of `path`, newest first, with how much each
+    /// differs from the text now.
+    fn open_history_picker(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(directory) = history::directory() else {
+            return;
+        };
+        let current = match self.document_at(&path, cx) {
+            Some(index) => Some(self.documents[index].view.read(cx).state.buffer().clone()),
+            None => None,
+        };
+        self.picker = Some(Picker {
+            kind: PickerKind::History,
+            query: String::new(),
+            items: Vec::new(),
+            selected: 0,
+            // The file whose versions these are.
+            root: path.clone(),
+            files: Arc::new(Vec::new()),
+            entries: Arc::new(Vec::new()),
+            cancel: Arc::new(AtomicBool::new(false)),
+            task: None,
+            themes: Arc::new(nvim_themes::Themes::new()),
+            original: None,
+        });
+        window.focus(&self.picker_focus, cx);
+        self.picker_files_task = Some(cx.spawn(async move |this, cx| {
+            let entries = cx
+                .background_spawn(async move {
+                    let current = match current {
+                        Some(buffer) => buffer.to_string(),
+                        None => text_file::read(&path).map(|loaded| loaded.text).unwrap_or_default(),
+                    };
+                    history_items(&history::versions(&directory, &path), &current)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if let Some(picker) = this.picker.as_mut().filter(|picker| picker.kind == PickerKind::History) {
+                    picker.entries = Arc::new(entries);
+                    this.refresh_picker(cx);
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Puts an earlier version in place as one edit, which undo takes back.
+    fn restore_version(&mut self, path: PathBuf, item: PickerItem, cx: &mut Context<Self>) {
+        let loaded = match std::fs::read(&item.path).and_then(text_file::decode) {
+            Ok(loaded) => loaded,
+            Err(error) => return self.set_status(format!("Cannot read that version: {error}"), cx),
+        };
+        let Some(view) = self.document_view(&path, cx) else {
+            return;
+        };
+        if let Some(index) = self.document_at(&path, cx) {
+            self.active = Some(index);
+        }
+        view.update(cx, |view, cx| {
+            let everything = 0..view.state.buffer().len();
+            view.edit_from_outside(everything, &loaded.text, cx);
+        });
+        self.set_status(format!("Restored the version from {}. Undo brings the text back, and saving keeps it.", item.label.to_lowercase()), cx);
     }
 
     fn open_font_picker(&mut self, slot: FontSlot, window: &mut Window, cx: &mut Context<Self>) {
@@ -4093,7 +4207,7 @@ impl Workspace {
                 picker.items = picker::match_files(&picker.files, &picker.root, &picker.query);
                 picker.selected = 0;
             }
-            PickerKind::Citations => {
+            PickerKind::Citations | PickerKind::History => {
                 picker.items = picker::match_in_order(&picker.entries, &picker.query);
                 picker.selected = 0;
             }
@@ -4172,7 +4286,9 @@ impl Workspace {
     }
 
     fn accept_picker(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((kind, item)) = self.picker.as_ref().and_then(|picker| Some((picker.kind, picker.items.get(index).cloned()?))) else {
+        let Some((kind, item, target)) =
+            self.picker.as_ref().and_then(|picker| Some((picker.kind, picker.items.get(index).cloned()?, picker.root.clone())))
+        else {
             return;
         };
         if let Some(picker) = &mut self.picker {
@@ -4199,6 +4315,7 @@ impl Workspace {
                 return self.update_settings(|settings| *settings = chosen, window, cx);
             }
             PickerKind::Figures => return self.insert_figure(&item.path, cx),
+            PickerKind::History => return self.restore_version(target, item, cx),
             PickerKind::Branches => {
                 if self.save_all(cx) {
                     let create = item.detail.as_deref() == Some(picker::CREATE_BRANCH);
@@ -4610,9 +4727,16 @@ impl Workspace {
         cx.notify();
     }
 
-    fn menu_entries(&self, menu: Menu) -> Vec<MenuEntry> {
-        #[allow(unused_mut)]
+    fn menu_entries(&self, menu: Menu, cx: &App) -> Vec<MenuEntry> {
         let mut entries = self.base_menu_entries(menu);
+        // Only a file in an older encoding needs a way out of it.
+        if menu == Menu::File
+            && let Some(view) = self.active_view()
+            && view.read(cx).encoding() != text_file::UTF_8
+        {
+            let save = entries.len() - 1;
+            entries.insert(save, entry("Convert to UTF-8", "", |this, _, cx| this.with_active(cx, |view, cx| view.convert_to_utf8(cx))));
+        }
         #[cfg(feature = "collab")]
         self.add_collab_entries(menu, &mut entries);
         entries
@@ -4627,6 +4751,11 @@ impl Workspace {
                 entry("Add files…", "", |this, window, cx| this.prompt_add_files(window, cx)),
                 entry("Make a copy", "", |this, window, cx| this.make_copy(window, cx)),
                 menu_separator(),
+                entry("Earlier versions of this file…", "", |this, window, cx| {
+                    if let Some(path) = this.active_view().and_then(|view| view.read(cx).path.clone()) {
+                        this.open_history_picker(path, window, cx);
+                    }
+                }),
                 entry("Version history", "", |this, _, cx| this.show_version_history(cx)),
                 entry("Commit and sync…", self.shortcut("git_panel"), |this, window, cx| this.open_git_panel(window, cx)),
                 entry("Word count…", "", |this, window, cx| this.show_word_count(window, cx)),
@@ -4816,7 +4945,7 @@ impl Workspace {
     /// The tree's menu is a sheet of the side panel: a raised tone without a
     /// frame, and a pill under the row in reach.
     fn render_menu(&self, menu: Menu, cx: &mut Context<Self>) -> impl IntoElement {
-        let items = self.menu_entries(menu);
+        let items = self.menu_entries(menu, cx);
         let palette = theme::palette();
         let paper = menu == Menu::Tree;
         deferred(
@@ -7782,6 +7911,7 @@ impl Workspace {
             PickerKind::Citations => "Insert citation",
             PickerKind::Branches => "Switch branch",
             PickerKind::Themes => "Select theme",
+            PickerKind::History => "Earlier versions",
             PickerKind::Fonts(FontSlot::Editor) => "Editor font",
             PickerKind::Fonts(FontSlot::Interface) => "Interface font",
         };
@@ -7790,6 +7920,7 @@ impl Workspace {
             (PickerKind::Figures, true) => "No images in this project.",
             (PickerKind::Citations, true) => "No .bib entries in this project.",
             (PickerKind::Branches, true) => "Type a name to create a branch.",
+            (PickerKind::History, true) => "No earlier versions yet. Each save keeps the one before.",
             _ => "No results.",
         };
         div()
@@ -8360,4 +8491,43 @@ mod tests {
         assert!(tab_edges(0, 3, None).0);
         assert!(!tab_edges(2, 3, None).1);
     }
+}
+
+/// One picker row per version: when, and how much it differs from now.
+fn history_items(versions: &[history::Version], current: &str) -> Vec<PickerItem> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs());
+    versions
+        .iter()
+        .map(|version| {
+            let text = std::fs::read(&version.file).ok().and_then(|bytes| text_file::decode(bytes).ok()).map(|loaded| loaded.text);
+            let changes = match text.as_deref().map(|text| editor_core::line_diff::line_diff(current, text)) {
+                Some(Some(hunks)) if hunks.is_empty() => "Same as now".to_string(),
+                Some(Some(hunks)) => {
+                    let lines: usize = hunks.iter().map(|hunk| hunk.lines.len().max(1)).sum();
+                    format!("{lines} line{} differ from now", if lines == 1 { "" } else { "s" })
+                }
+                _ => "Differs from now".to_string(),
+            };
+            PickerItem {
+                path: version.file.clone(),
+                label: projects::ago(now, version.time),
+                position: None,
+                summary: None,
+                detail: Some(format!("{changes} · {} KB", version.size.div_ceil(1024))),
+            }
+        })
+        .collect()
+}
+
+/// Why a save failed, in words that say what to do. The file on disk is
+/// always whole, since saves replace it in one step.
+fn save_failed(error: &std::io::Error) -> String {
+    use std::io::ErrorKind;
+    let advice = match error.kind() {
+        ErrorKind::StorageFull | ErrorKind::QuotaExceeded => "The disk is full. Free some space and save again",
+        ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem => "This file or folder cannot be changed. Save a copy somewhere else",
+        ErrorKind::NotFound => "Its folder is gone. Save a copy somewhere else",
+        _ => return format!("Cannot save: {error}. Your text is still here and kept safe."),
+    };
+    format!("Cannot save: {advice}. Your text is still here and kept safe.")
 }

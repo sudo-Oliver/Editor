@@ -252,6 +252,12 @@ impl EditorState {
         self.saved_revision = self.revision;
     }
 
+    /// Counts the text as unsaved, for a file whose disk copy no longer matches.
+    pub fn mark_unsaved(&mut self) {
+        // No revision ever reaches this.
+        self.saved_revision = u64::MAX;
+    }
+
     pub fn marks(&self) -> &[Mark] {
         &self.marks
     }

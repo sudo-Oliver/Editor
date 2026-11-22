@@ -97,4 +97,28 @@ mod tests {
         assert_eq!(fs::read(&real).unwrap(), b"new");
         assert_eq!(fs::metadata(&real).unwrap().permissions().mode() & 0o777, 0o640);
     }
+
+    /// Needs a nearly full disk, such as a small RAM disk:
+    ///
+    ///   EDITOR_FULL_DISK=/Volumes/Tiny cargo test -p app full_disk -- --ignored
+    #[test]
+    #[ignore]
+    fn a_full_disk_keeps_the_old_file() {
+        let Some(folder) = std::env::var_os("EDITOR_FULL_DISK").map(std::path::PathBuf::from) else {
+            return;
+        };
+        let path = folder.join("thesis.tex");
+        write(&path, b"the old text").unwrap();
+        // Fill the rest of the disk.
+        let filler = folder.join("filler");
+        let mut file = File::create(&filler).unwrap();
+        let block = vec![b'x'; 64 * 1024];
+        while file.write_all(&block).is_ok() {}
+        drop(file);
+        let error = write(&path, &vec![b'y'; 4 * 1024 * 1024]).unwrap_err();
+        assert_eq!(fs::read(&path).unwrap(), b"the old text", "{error}");
+        assert_eq!(names(&folder).iter().filter(|name| name.starts_with(TEMP_PREFIX)).count(), 0, "no temp file stays behind");
+        fs::remove_file(&filler).unwrap();
+        fs::remove_file(&path).unwrap();
+    }
 }
