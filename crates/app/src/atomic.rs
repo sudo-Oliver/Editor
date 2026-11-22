@@ -5,12 +5,17 @@ use std::{
     fs::{self, File},
     io::{self, Write},
     path::Path,
+    time::{Duration, SystemTime},
 };
 
 use tempfile::NamedTempFile;
 
 /// Hidden from the file tree and from exports, also if a crash leaves one behind.
 pub const TEMP_PREFIX: &str = ".export-";
+/// The random part tempfile adds to the prefix.
+const TEMP_RANDOM_LENGTH: usize = 6;
+/// A temp file this old belongs to no write that is still running.
+const STALE_TEMP_AGE: Duration = Duration::from_secs(60 * 60);
 
 pub fn write(path: &Path, contents: &[u8]) -> io::Result<()> {
     // A link stays a link, and the file behind it changes.
@@ -50,6 +55,31 @@ pub fn finish(temp: NamedTempFile, target: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Removes temp files a crash left in `folder`. Only names exactly as `write`
+/// makes them go, and only when they are old enough to belong to no write.
+pub fn sweep(folder: &Path) {
+    let Ok(entries) = fs::read_dir(folder) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let is_temp = name.to_str().and_then(|name| name.strip_prefix(TEMP_PREFIX)).is_some_and(|random| {
+            random.len() == TEMP_RANDOM_LENGTH && random.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        });
+        let stale = entry
+            .metadata()
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= STALE_TEMP_AGE);
+        if is_temp && stale {
+            fs::remove_file(entry.path()).ok();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,6 +110,21 @@ mod tests {
         fs::set_permissions(&path, rights).unwrap();
         assert_eq!(write(&path, b"new").unwrap_err().kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(fs::read(&path).unwrap(), b"old");
+    }
+
+    #[test]
+    fn sweep_removes_only_old_temp_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let old = SystemTime::now() - STALE_TEMP_AGE - Duration::from_secs(1);
+        for name in [".export-a1B2c3", ".export-new123", ".export-toolong1", ".export-", "export-a1B2c3", "a.tex"] {
+            let file = File::create(directory.path().join(name)).unwrap();
+            if name != ".export-new123" {
+                file.set_modified(old).unwrap();
+            }
+        }
+        fs::create_dir(directory.path().join(".export-folder")).unwrap();
+        sweep(directory.path());
+        assert_eq!(names(directory.path()), [".export-", ".export-folder", ".export-new123", ".export-toolong1", "a.tex", "export-a1B2c3"]);
     }
 
     #[cfg(unix)]

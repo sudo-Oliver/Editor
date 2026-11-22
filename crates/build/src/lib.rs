@@ -7,6 +7,7 @@ mod packages;
 mod parse;
 mod preamble;
 mod runner;
+mod tidy;
 mod tools;
 
 pub use config::{Config, Engine, Trigger, find_main, write_main};
