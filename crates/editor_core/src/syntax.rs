@@ -957,6 +957,18 @@ fn collect_inline_spans(
     }
 }
 
+/// The headings and names of a whole text, read at once, as for a file that
+/// is not open.
+pub fn outline_of(language: Language, text: &str) -> (Vec<Heading>, Vec<Symbol>) {
+    let rope = Rope::from_str(text);
+    let mut syntax = Syntax::new(language);
+    let Some(job) = syntax.parse_job(&rope, 1) else {
+        return (Vec::new(), Vec::new());
+    };
+    syntax.apply(job.run(), &[]);
+    (syntax.headings().to_vec(), syntax.symbols().to_vec())
+}
+
 impl ParseJob {
     pub fn version(&self) -> u64 {
         self.version

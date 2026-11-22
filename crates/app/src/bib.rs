@@ -16,6 +16,12 @@ pub struct Entry {
     pub year: String,
     pub title: String,
     pub venue: String,
+    /// Such as `article`, in lowercase.
+    pub kind: String,
+    pub doi: String,
+    pub url: String,
+    /// The entry as written, from `@` to its closing brace.
+    pub raw: String,
 }
 
 /// The entries of `files` as picker rows, sorted by author, year and letter.
@@ -72,6 +78,7 @@ pub fn parse(text: &str) -> Vec<Entry> {
     let mut macros: HashMap<String, String> = HashMap::new();
     let mut rest = text;
     while let Some(at) = rest.find('@') {
+        let from = &rest[at..];
         rest = &rest[at + 1..];
         let Some(open) = rest.find(['{', '(']) else {
             break;
@@ -82,11 +89,14 @@ pub fn parse(text: &str) -> Vec<Entry> {
         }
         let body = &rest[open + 1..];
         let mut end = body_end(body, rest.as_bytes()[open] == b'(');
+        let raw;
         if end == body.len() {
             // Never closed: it ends where the next entry starts a line, as BibTeX recovers.
             end = body.find("\n@").map_or(end, |line| line + 1);
+            raw = &from[..open + end + 2];
             rest = &body[end..];
         } else {
+            raw = &from[..open + end + 3];
             rest = &body[end + 1..];
         }
         if kind == "string" {
@@ -116,6 +126,10 @@ pub fn parse(text: &str) -> Vec<Entry> {
             year,
             title: clean(field(&["title"])),
             venue: clean(field(&["journal", "journaltitle", "booktitle", "publisher", "school", "institution"])),
+            doi: field(&["doi"]).trim().to_string(),
+            url: field(&["url"]).trim().to_string(),
+            kind,
+            raw: raw.to_string(),
         });
     }
     entries
@@ -482,6 +496,15 @@ mod tests {
         assert_eq!(entries[2].authors, "van Rossum");
         assert_eq!(entries[3].authors, "van Beethoven and Barnes and Noble");
         assert_eq!(entries[3].title, "Op. 1 — Trios");
+        assert_eq!(entries[2].kind, "book");
+        assert_eq!(entries[2].raw, "@book{rossum, author = {Guido {van Rossum}}, title = {Python}, year = {1995}}");
+    }
+
+    #[test]
+    fn entries_keep_their_doi_and_url() {
+        let entries = parse("@article{a, doi = {10.1000/x1}, url = \"https://example.org/a\"}\n@misc(b, title = {B})");
+        assert_eq!((entries[0].doi.as_str(), entries[0].url.as_str()), ("10.1000/x1", "https://example.org/a"));
+        assert_eq!(entries[1].raw, "@misc(b, title = {B})");
     }
 
     #[test]

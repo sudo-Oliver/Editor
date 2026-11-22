@@ -33,6 +33,7 @@ use synctex::SyncTex;
 use crate::{
     actions::*,
     addon_panel::{AddonPanel, AddonPanelEvent, doi_suggestion},
+    addon_reports,
     addons::{self, Installed},
     bib,
     completion::Extra,
@@ -74,6 +75,10 @@ use crate::{
 mod collab_session;
 #[path = "git_sync.rs"]
 mod git_sync;
+#[path = "addon_host.rs"]
+mod addon_host;
+#[path = "review.rs"]
+mod review;
 
 const RECOVERY_DELAY: Duration = Duration::from_secs(1);
 const TOP_BAR_HEIGHT: f32 = 40.0;
@@ -159,6 +164,8 @@ enum Menu {
     Code,
     /// The right-click menu of a row in the file tree.
     Tree,
+    /// The right-click menu of the editor.
+    EditorContext,
 }
 
 /// How the editor and the PDF share the window.
@@ -450,9 +457,21 @@ pub struct Workspace {
     catalog: CatalogState,
     /// The id of the add-on being downloaded.
     installing: Option<String>,
-    tracked_edits: HashMap<String, TrackedEdits>,
+    /// By add-on and group, the default group being the empty name.
+    tracked_edits: HashMap<(String, String), TrackedEdits>,
     /// Add-on requests that wait for the running build to end.
     compile_waiters: Vec<(Entity<AddonPanel>, u64)>,
+    /// Where the cursor rests, as last told to add-ons, and what waits to be told.
+    addon_context_sent: addon_host::AddonContext,
+    addon_context_pending: Option<addon_host::AddonContext>,
+    addon_context_task: Option<Task<()>>,
+    /// Documents whose change add-ons hear of when typing pauses.
+    addon_changed: HashSet<PathBuf>,
+    addon_changed_task: Option<Task<()>>,
+    /// Focuses the active document at the next frame, for actions without a window.
+    focus_requested: bool,
+    /// Changes from add-ons that wait for the user.
+    proposals: Vec<review::Review>,
     layout: PaneLayout,
     /// The PDF tab is the one on screen.
     pdf_tab_shown: bool,
@@ -604,6 +623,7 @@ impl Workspace {
             for addon in &this.addon_panels {
                 addon.panel.update(cx, |panel, _| panel.shut_down());
             }
+            addons::remove_private_directory();
             async {}
         });
         let workspace_handle = cx.entity().downgrade();
@@ -728,6 +748,13 @@ impl Workspace {
             installing: None,
             tracked_edits: HashMap::new(),
             compile_waiters: Vec::new(),
+            addon_context_sent: addon_host::AddonContext::default(),
+            addon_context_pending: None,
+            addon_context_task: None,
+            addon_changed: HashSet::new(),
+            addon_changed_task: None,
+            focus_requested: false,
+            proposals: Vec::new(),
             layout: PaneLayout::Split,
             pdf_tab_shown: false,
             focus_mode: false,
@@ -965,6 +992,7 @@ impl Workspace {
         self.root = None;
         self.git_branch = None;
         self.git_panel.update(cx, |panel, cx| panel.set_root(None, cx));
+        self.addon_project_closed(cx);
         for entry in &self.addon_panels {
             entry.panel.update(cx, |panel, cx| panel.set_root(None, cx));
         }
@@ -991,6 +1019,10 @@ impl Workspace {
         self.shown_image = None;
         self.start_watching(&root, cx);
         self.git_branch = git_branch(&root);
+        // Before the add-ons restart for the new project, with the old one.
+        if self.root.is_some() {
+            self.addon_project_closed(cx);
+        }
         self.root = Some(root.clone());
         let (vim_mode, cards) = (self.settings.vim_mode, self.settings.hub_cards);
         self.home.update(cx, |home, cx| {
@@ -1204,15 +1236,18 @@ impl Workspace {
             view
         });
         let subscription = cx.subscribe(&view, |this, view, event, cx| match event {
+            EditorEvent::Dropped(item) => this.drop_into(&view, item.clone(), cx),
             EditorEvent::Edited => {
                 #[cfg(feature = "collab")]
                 this.collab_edited(&view, cx);
                 this.schedule_recovery(cx);
                 this.schedule_type_build(cx);
                 this.check_citation_trigger(&view, cx);
+                this.addon_document_changed(&view, cx);
                 cx.notify();
             }
             EditorEvent::EditedByOthers => {
+                this.addon_document_changed(&view, cx);
                 this.schedule_recovery(cx);
                 this.schedule_type_build(cx);
                 cx.notify();
@@ -1635,7 +1670,7 @@ impl Workspace {
     /// Binds the shortcuts of `keymap.json`, or the defaults without it.
     fn reload_keymap(&mut self, cx: &mut Context<Self>) {
         let (keymap, mut problems) = keymap::default_path().map(|path| Keymap::load(&path)).unwrap_or_default();
-        problems.extend(crate::actions::bind_keys(&keymap, cx));
+        problems.extend(crate::actions::bind_keys(&keymap, &self.addon_bindings(cx), cx));
         self.keymap = keymap;
         if let Some(problem) = problems.first() {
             self.set_status(format!("keymap.json: {problem}"), cx);
@@ -1645,7 +1680,7 @@ impl Workspace {
 
     /// Saves and binds the shortcuts changed on the shortcuts page.
     fn apply_keymap(&mut self, keymap: Keymap, cx: &mut Context<Self>) {
-        let problems = crate::actions::bind_keys(&keymap, cx);
+        let problems = crate::actions::bind_keys(&keymap, &self.addon_bindings(cx), cx);
         self.keymap = keymap;
         if let Some(path) = keymap::default_path()
             && let Err(error) = self.keymap.save(&path)
@@ -1739,11 +1774,22 @@ impl Workspace {
             };
             self.addon_panels.push(entry);
         }
+        // Add-ons that were turned off or removed: their program ends with
+        // the panel, and nothing of them stays behind.
+        for entry in old {
+            self.end_proposals_of(&entry.panel, cx);
+            self.compile_waiters.retain(|(panel, _)| panel != &entry.panel);
+        }
         if matches!(self.left_panel, LeftPanel::Addon(_)) {
             let index = self.addon_panels.iter().position(|entry| Some(&entry.panel.read(cx).add_on.manifest.id) == shown.as_ref());
             self.left_panel = index.map_or(LeftPanel::Files, LeftPanel::Addon);
         }
         self.installed_addons = installed;
+        // The keys of add-ons that were turned on come, and of others go.
+        let problems = crate::actions::bind_keys(&self.keymap, &self.addon_bindings(cx), cx);
+        if let Some(problem) = problems.first() {
+            self.set_status(format!("keymap.json: {problem}"), cx);
+        }
         cx.notify();
     }
 
@@ -1758,6 +1804,15 @@ impl Workspace {
                     cx.notify();
                 }
                 AddonPanelEvent::LookupFailed(reason) => this.set_status(reason.clone(), cx),
+                AddonPanelEvent::Notify(text) => this.set_status(text.clone(), cx),
+                AddonPanelEvent::Stopped => this.end_proposals_of(&panel, cx),
+                AddonPanelEvent::InsertText(text) => {
+                    if this.active_view().is_some() {
+                        this.with_active(cx, |view, cx| view.insert_text(text, cx));
+                    } else {
+                        this.set_status("Open a document to insert into.", cx);
+                    }
+                }
             }
         });
         panel.update(cx, |panel, cx| panel.activate(cx));
@@ -1878,11 +1933,26 @@ impl Workspace {
     fn diagnostic_infos(&self) -> Vec<DiagnosticInfo> {
         self.diagnostics
             .iter()
-            .map(|diagnostic| DiagnosticInfo {
-                path: diagnostic.file.as_deref().map(|file| self.relative_to_project(file)),
-                line: diagnostic.line,
-                error: diagnostic.severity == Severity::Error,
-                message: diagnostic.message.clone(),
+            .map(|diagnostic| {
+                let explanation = build::explain(diagnostic);
+                let hint = [explanation.as_ref().map(|explanation| explanation.hint.clone()), diagnostic.hint.clone()]
+                    .into_iter()
+                    .flatten()
+                    .filter(|hint| !hint.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                DiagnosticInfo {
+                    path: diagnostic.file.as_deref().map(|file| self.relative_to_project(file)),
+                    line: diagnostic.line,
+                    error: diagnostic.severity == Severity::Error,
+                    message: diagnostic.message.clone(),
+                    column: diagnostic.column,
+                    severity: if diagnostic.severity == Severity::Error { "error" } else { "warning" }.to_string(),
+                    hint: (!hint.is_empty()).then_some(hint),
+                    context: diagnostic.context.clone(),
+                    fix: explanation.as_ref().and_then(|explanation| explanation.fix.as_ref()).map(addon_reports::fix_info),
+                    explanation: explanation.map(|explanation| explanation.title),
+                }
             })
             .collect()
     }
@@ -1907,8 +1977,12 @@ impl Workspace {
                     addons::set_secret(&add_on, &key, &value).map(|()| Reply::Done)
                 });
             }
-            Request::Compile => {
-                self.recompile(cx);
+            Request::Compile { clean } => {
+                if clean {
+                    self.recompile_from_scratch(cx);
+                } else {
+                    self.recompile(cx);
+                }
                 if self.building {
                     self.compile_waiters.push((panel, id));
                     return;
@@ -1919,18 +1993,57 @@ impl Workspace {
             Request::ReadFile { path } => self.addon_read(&path, cx).map(|text| Reply::Text { text }),
             Request::Diagnostics => Ok(Reply::Diagnostics { diagnostics: self.diagnostic_infos() }),
             Request::ActiveFile => Ok(Reply::Active { file: self.active_file_info(cx) }),
-            Request::EditFile { path, old, new } => self.addon_edit(&add_on, &path, &old, &new, cx).map(|()| Reply::Done),
-            Request::CreateFile { path, text } => self.addon_create(&add_on, &path, &text, cx).map(|()| Reply::Done),
+            Request::EditFile { path, old, new, group } => self.addon_edit(addon_host::edit_group(&add_on, group), &path, &old, &new, cx).map(|()| Reply::Done),
+            Request::CreateFile { path, text, group } => self.addon_create(addon_host::edit_group(&add_on, group), &path, &text, cx).map(|()| Reply::Done),
             Request::WriteFile { path, text } => self.addon_write(&path, &text, cx).map(|()| Reply::Done),
             Request::InsertCitation { key } => Ok(Reply::Text { text: self.insert_citation(&key, cx) }),
-            Request::BeginEdits => {
-                self.tracked_edits.insert(add_on, TrackedEdits::default());
+            Request::BeginEdits { group } => {
+                self.tracked_edits.insert(addon_host::edit_group(&add_on, group), TrackedEdits::default());
                 Ok(Reply::Done)
             }
-            Request::DiscardEdits => {
-                self.discard_addon_edits(&add_on, cx);
+            Request::Reveal { path, line, column } => self.addon_reveal(&path, line, column, cx),
+            Request::ProjectInfo => self.addon_project_info(cx),
+            Request::BuildLog { max_bytes } => Ok(self.addon_build_log(max_bytes)),
+            Request::PdfInfo => self.addon_pdf_info(cx),
+            Request::PdfText { page } => return self.answer_from_pdf(panel, id, page, None, cx),
+            Request::PdfPage { page, width } => return self.answer_from_pdf(panel, id, page, Some(addon_host::pdf_page_width(width)), cx),
+            Request::BibEntries => return self.answer_bib_entries(panel, id, cx),
+            Request::Outline => return self.answer_outline(panel, id, cx),
+            Request::InsertText { text } => self.addon_insert_text(&text, cx),
+            Request::InsertAt { path, line, column, text } => self.addon_insert_at(&path, line, column, &text, cx),
+            Request::CopyIntoProject { source, dest } => return self.answer_copy_into_project(panel, id, source, dest, cx),
+            Request::ProposeEdits { path, title, edits, text } => match self.start_proposal(panel.clone(), id, &path, title, edits, text, cx) {
+                Some(result) => result,
+                // The reply waits for the user.
+                None => return,
+            },
+            Request::CancelReview { path } => self.cancel_proposal(&path, cx),
+            Request::DiscardEdits { group } => {
+                self.discard_addon_edits(&addon_host::edit_group(&add_on, group), cx);
                 Ok(Reply::Done)
             }
+            Request::CancelBuild => {
+                if !self.building {
+                    return panel.update(cx, |panel, _| panel.reply(id, Err("No build runs.".to_string())));
+                }
+                self.build.cancel();
+                Ok(Reply::Done)
+            }
+            Request::OpenDocuments => Ok(self.addon_open_documents(cx)),
+            Request::SaveFile { path } => self.addon_save(&path, cx),
+            Request::RenameFile { from, to } => self.addon_rename(&from, &to, cx),
+            Request::DeleteFile { path } => return self.answer_delete(panel, id, &path, cx),
+            Request::Selection => Ok(self.addon_selection(cx)),
+            Request::SourceToPdf { path, line } => self.addon_source_to_pdf(&path, line),
+            Request::PdfToSource { page, x, y } => self.addon_pdf_to_source(page, x, y),
+            Request::ApplyFix { id: fix } => self.addon_apply_fix(&fix, cx),
+            Request::GitStatus | Request::GitDiff { .. } | Request::GitLog { .. } => return self.answer_from_git(panel, id, request, cx),
+            Request::PackageHints => return self.answer_package_hints(panel, id, cx),
+            Request::References => return self.answer_references(panel, id, cx),
+            Request::WordCount { path } => return self.answer_word_count(panel, id, path, cx),
+            Request::PdfOutline => return self.answer_pdf_outline(panel, id, cx),
+            Request::PdfSearch { query } => return self.answer_pdf_search(panel, id, query, cx),
+            Request::PdfSelection => Ok(Reply::Text { text: self.pdf.read(cx).selected_text().unwrap_or_default() }),
         };
         panel.update(cx, |panel, _| panel.reply(id, result));
     }
@@ -1995,7 +2108,7 @@ impl Workspace {
         })
     }
 
-    fn addon_edit(&mut self, add_on: &str, relative: &str, old: &str, new: &str, cx: &mut Context<Self>) -> Result<(), String> {
+    fn addon_edit(&mut self, group: (String, String), relative: &str, old: &str, new: &str, cx: &mut Context<Self>) -> Result<(), String> {
         let path = self.addon_file(relative)?;
         let index = match self.document_at(&path, cx) {
             Some(index) => index,
@@ -2011,13 +2124,13 @@ impl Workspace {
         let view = self.documents[index].view.clone();
         let text = view.read(cx).state.buffer().to_string();
         let range = addons::find_unique(&text, old)?;
-        self.tracked_edits.entry(add_on.to_string()).or_default().originals.entry(path).or_insert(text);
+        self.tracked_edits.entry(group).or_default().originals.entry(path).or_insert(text);
         view.update(cx, |view, cx| view.edit_from_outside(range, new, cx));
         cx.notify();
         Ok(())
     }
 
-    fn addon_create(&mut self, add_on: &str, relative: &str, text: &str, cx: &mut Context<Self>) -> Result<(), String> {
+    fn addon_create(&mut self, group: (String, String), relative: &str, text: &str, cx: &mut Context<Self>) -> Result<(), String> {
         let path = self.addon_file(relative)?;
         if path.exists() {
             return Err(format!("{relative} already exists."));
@@ -2026,7 +2139,7 @@ impl Workspace {
             std::fs::create_dir_all(parent).map_err(|error| format!("Cannot create {relative}: {error}"))?;
         }
         std::fs::write(&path, "").map_err(|error| format!("Cannot create {relative}: {error}"))?;
-        self.tracked_edits.entry(add_on.to_string()).or_default().created.push(path.clone());
+        self.tracked_edits.entry(group).or_default().created.push(path.clone());
         self.add_document(path, "", cx);
         let index = self.documents.len() - 1;
         if self.active.is_none() {
@@ -2065,8 +2178,8 @@ impl Workspace {
 
     /// Puts back the text from before the first edit, as one step that undo can
     /// reverse. Edits by the user in those files since then go with it.
-    fn discard_addon_edits(&mut self, add_on: &str, cx: &mut Context<Self>) {
-        let Some(tracked) = self.tracked_edits.remove(add_on) else {
+    fn discard_addon_edits(&mut self, group: &(String, String), cx: &mut Context<Self>) {
+        let Some(tracked) = self.tracked_edits.remove(group) else {
             return;
         };
         for (path, original) in tracked.originals {
@@ -2158,6 +2271,7 @@ impl Workspace {
         self.build_log.clear();
         self.status = Some(format!("Compiling with {}…", engine.label()).into());
         let mut events = self.build.start(BuildRequest { root, main, engine, clean });
+        self.addon_build_started(cx);
         self.build_task = Some(cx.spawn(async move |this, cx| {
             while let Some(event) = events.recv().await {
                 if this.update(cx, |this, cx| this.handle_build_event(event, cx)).is_err() {
@@ -2266,6 +2380,8 @@ impl Workspace {
         self.check_packages(cx);
         let (success, diagnostics) = (outcome.success, self.diagnostic_infos());
         self.reply_to_compile_waiters(|| Ok(Reply::Compiled { success, diagnostics: diagnostics.clone() }), cx);
+        self.addon_build_finished(success, cx);
+        self.addon_diagnostics_changed(cx);
         let same_document = self.pdf_main == self.last_main;
         self.preview_state = match (outcome.pdf, outcome.last_good_pdf) {
             (Some(pdf), _) => {
@@ -2601,6 +2717,7 @@ impl Workspace {
     /// Runs whenever the document notifies, which covers every way of moving the
     /// cursor, so it has to stay cheap until the line changes.
     fn cursor_changed(&mut self, view: &Entity<EditorView>, cx: &mut Context<Self>) {
+        self.addon_context_changed(cx);
         if !self.settings.auto_scroll_pdf || self.active_view().as_ref() != Some(view) {
             return;
         }
@@ -4023,7 +4140,7 @@ impl Workspace {
                         .filter(|entry| !entry.is_dir)
                         .map(|entry| entry.path)
                         .filter(|path| match kind {
-                            PickerKind::Files | PickerKind::Text | PickerKind::Branches | PickerKind::Themes | PickerKind::Fonts(_) => true,
+                            PickerKind::Files | PickerKind::Text | PickerKind::Branches | PickerKind::Themes | PickerKind::Fonts(_) | PickerKind::Commands => true,
                             PickerKind::History => false,
                             PickerKind::Figures => language.is_some_and(|language| snippets::is_figure_file(language, path)),
                             PickerKind::Citations => path.extension().is_some_and(|extension| extension == "bib"),
@@ -4050,6 +4167,66 @@ impl Workspace {
             .ok();
         }));
         cx.notify();
+    }
+
+    /// Every command by name, with its keys. An item's path holds the
+    /// command's id, since commands have no file.
+    fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let os = keymap::host_os();
+        let mut entries: Vec<picker::PickerItem> = COMMANDS
+            .iter()
+            .filter(|command| command.runs_anywhere())
+            .map(|command| picker::PickerItem {
+                path: PathBuf::from(command.id),
+                label: format!("{}: {}", command.group, command.label),
+                position: None,
+                summary: None,
+                detail: Some(self.keymap.keys(command).first().map(|keys| keymap::display(keys, os)).unwrap_or_default()).filter(|keys| !keys.is_empty()),
+            })
+            .collect();
+        for entry in &self.addon_panels {
+            let manifest = &entry.panel.read(cx).add_on.manifest;
+            for command in &manifest.commands {
+                let id = format!("{}{}.{}", keymap::ADDON_PREFIX, manifest.id, command.id);
+                let keys = self.keymap.addon_keys(&id, &command.keys);
+                entries.push(picker::PickerItem {
+                    path: PathBuf::from(id),
+                    label: format!("{}: {}", manifest.name, command.label),
+                    position: None,
+                    summary: None,
+                    detail: keys.first().map(|keys| keymap::display(keys, os)),
+                });
+            }
+        }
+        self.picker = Some(Picker {
+            kind: PickerKind::Commands,
+            query: String::new(),
+            items: Vec::new(),
+            selected: 0,
+            root: PathBuf::new(),
+            files: Arc::new(Vec::new()),
+            entries: Arc::new(entries),
+            cancel: Arc::new(AtomicBool::new(false)),
+            task: None,
+            themes: Arc::default(),
+            original: None,
+        });
+        window.focus(&self.picker_focus, cx);
+        self.refresh_picker(cx);
+    }
+
+    fn run_palette_command(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((addon, command)) = id.strip_prefix(keymap::ADDON_PREFIX).and_then(|rest| rest.split_once('.')) {
+            return self.run_addon_command(&RunAddonCommand { addon: addon.to_string(), command: command.to_string() }, cx);
+        }
+        let Some(command) = COMMANDS.iter().find(|command| command.id == id) else {
+            return;
+        };
+        // Commands of the editor act on the document.
+        if command.context.is_some() {
+            self.focus_active(window, cx);
+        }
+        window.dispatch_action(command.action(), cx);
     }
 
     /// Lists the cached themes at once and asks Neovim for the current ones.
@@ -4258,7 +4435,7 @@ impl Workspace {
                 picker.items = picker::match_files(&picker.files, &picker.root, &picker.query);
                 picker.selected = 0;
             }
-            PickerKind::Citations | PickerKind::History => {
+            PickerKind::Citations | PickerKind::History | PickerKind::Commands => {
                 picker.items = picker::match_in_order(&picker.entries, &picker.query);
                 picker.selected = 0;
             }
@@ -4349,6 +4526,7 @@ impl Workspace {
         self.close_picker(window, cx);
         match kind {
             PickerKind::Files | PickerKind::Text => {}
+            PickerKind::Commands => return self.run_palette_command(&item.path.to_string_lossy(), window, cx),
             PickerKind::Themes => {
                 let name = (item.label != theme::DEFAULT_THEME).then_some(item.label);
                 // A theme is a choice against paper, which would cover it.
@@ -4779,7 +4957,7 @@ impl Workspace {
     }
 
     fn menu_entries(&self, menu: Menu, cx: &App) -> Vec<MenuEntry> {
-        let mut entries = self.base_menu_entries(menu);
+        let mut entries = self.base_menu_entries(menu, cx);
         // Only a file in an older encoding needs a way out of it.
         if menu == Menu::File
             && let Some(view) = self.active_view()
@@ -4793,7 +4971,7 @@ impl Workspace {
         entries
     }
 
-    fn base_menu_entries(&self, menu: Menu) -> Vec<MenuEntry> {
+    fn base_menu_entries(&self, menu: Menu, cx: &App) -> Vec<MenuEntry> {
         let check = |on: bool, label: &str| format!("{} {label}", if on { "✓" } else { "  " });
         match menu {
             Menu::File => vec![
@@ -4878,6 +5056,7 @@ impl Workspace {
                 }),
             ],
             Menu::Tree => self.tree_menu_entries(),
+            Menu::EditorContext => self.editor_menu_entries(cx),
             Menu::Symbols | Menu::Table | Menu::Code => Vec::new(),
             Menu::Help => vec![
                 entry("Editor tour", "", |this, window, cx| this.start_tour(window, cx)),
@@ -4998,7 +5177,7 @@ impl Workspace {
     fn render_menu(&self, menu: Menu, cx: &mut Context<Self>) -> impl IntoElement {
         let items = self.menu_entries(menu, cx);
         let palette = theme::palette();
-        let paper = menu == Menu::Tree;
+        let paper = matches!(menu, Menu::Tree | Menu::EditorContext);
         deferred(
             anchored()
                 .anchor(Anchor::TopLeft)
@@ -6283,6 +6462,7 @@ impl Workspace {
 
     fn render_editor_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let active = self.active_view();
+        let has_document = active.is_some();
         let pdf_tab = self.pdf_tab_shown && !self.focus_mode;
         let toolbar = if self.focus_mode {
             None
@@ -6296,6 +6476,7 @@ impl Workspace {
         } else {
             match (self.image_preview(), active) {
             (Some(preview), _) => preview.view.clone().into_any_element(),
+            (None, Some(_)) if let Some(index) = self.active_proposal(cx) => self.render_proposal(index, cx),
             (None, Some(view)) => view.into_any_element(),
             (None, None) => div()
                 .size_full()
@@ -6320,7 +6501,18 @@ impl Workspace {
             .when(self.show_tab_bar(), |element| element.child(self.render_tabs(cx)))
             .when(self.show_breadcrumbs(), |element| element.child(self.render_breadcrumbs(cx)))
             .children(toolbar)
-            .child(div().relative().flex_1().min_h_0().child(body).children(self.tour_anchor(TourAnchor::Editor)))
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .when(has_document && !pdf_tab, |element| {
+                        element.on_mouse_down(MouseButton::Right, cx.listener(|this, event: &MouseDownEvent, window, cx| this.open_editor_menu(event.position, window, cx)))
+                    })
+                    .child(body)
+                    .children(self.tour_anchor(TourAnchor::Editor))
+                    .when(self.open_menu == Some(Menu::EditorContext), |element| element.child(self.render_menu(Menu::EditorContext, cx))),
+            )
             .children(self.render_conflict_strip(cx))
             .when_some(self.cursor_hint(cx).cloned(), |element, hint| element.child(self.render_hint_strip(&hint, cx)))
             .when(self.error_count() > 0, |element| element.child(self.render_error_strip(cx)))
@@ -8158,6 +8350,7 @@ impl Workspace {
             PickerKind::History => "Earlier versions",
             PickerKind::Fonts(FontSlot::Editor) => "Editor font",
             PickerKind::Fonts(FontSlot::Interface) => "Interface font",
+            PickerKind::Commands => "Run a command",
         };
         let empty = match (picker.kind, picker.query.is_empty()) {
             (PickerKind::Text, true) => "Type to search the project.",
@@ -8429,6 +8622,11 @@ impl Render for Workspace {
         if std::mem::take(&mut self.setup_requested) && self.setup.is_none() {
             self.run_setup(window, cx);
         }
+        if std::mem::take(&mut self.focus_requested) {
+            self.focus_active(window, cx);
+        }
+        // Another document may have become active.
+        self.addon_context_changed(cx);
         if let Some(format) = self.export_after_pandoc.filter(|_| !self.toolchain.read(cx).installing(Tool::Pandoc)) {
             self.export_after_pandoc = None;
             match self.toolchain.read(cx).errors.get(&Tool::Pandoc).cloned() {
@@ -8498,6 +8696,7 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &LookupDoi, _, cx| this.lookup_doi(cx)))
             .on_action(cx.listener(|this, _: &QuickFix, _, cx| this.quick_fix(cx)))
+            .on_action(cx.listener(|this, action: &RunAddonCommand, _, cx| this.run_addon_command(action, cx)))
             .on_action(cx.listener(|this, _: &InsertCitation, window, cx| {
                 if matches!(this.active_language(cx), Some(Language::Latex | Language::Typst)) && this.dialog_panel(cx).is_none() {
                     this.open_picker(PickerKind::Citations, window, cx);
@@ -8533,6 +8732,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &LayoutPdfTab, window, cx| this.set_layout(PaneLayout::PdfTab, window, cx)))
             .on_action(cx.listener(|this, _: &ToggleFocusMode, window, cx| this.toggle_focus_mode(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleHub, window, cx| this.toggle_hub(window, cx)))
+            .on_action(cx.listener(|this, _: &CommandPalette, window, cx| this.open_command_palette(window, cx)))
             .on_action(cx.listener(|this, _: &OpenGitPanel, window, cx| this.open_git_panel(window, cx)))
             .on_action(cx.listener(|this, _: &StartPresentation, window, cx| this.start_presentation(window, cx)))
             .on_action(cx.listener(|this, _: &ExitPresentation, window, cx| this.exit_presentation(window, cx)))
