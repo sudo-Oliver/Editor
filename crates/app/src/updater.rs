@@ -22,7 +22,7 @@ use std::{
 use gpui::{AnyElement, App, Context, Entity, FontWeight, SharedString, Task, div, prelude::*, px};
 use serde::Deserialize;
 
-use crate::{marketplace, theme, toolchain};
+use crate::{app_location, marketplace, theme, toolchain};
 
 const LATEST: &str = "https://api.github.com/repos/sudo-Oliver/Editor/releases/latest";
 const BUNDLE_ID: &str = "io.github.sudo-oliver.editor";
@@ -174,11 +174,39 @@ impl Drop for Mounted {
     }
 }
 
-fn writable(path: &Path) -> bool {
+pub(crate) fn writable(path: &Path) -> bool {
     let Ok(path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
         return false;
     };
     unsafe { libc::access(path.as_ptr(), libc::W_OK) == 0 }
+}
+
+/// Copies `source` to `bundle` through `staged`, keeping the app that is
+/// there as `old` until the copy is in place, so that a failure leaves it
+/// working. Without the quarantine mark, since the app is not notarized and
+/// macOS would else stop it at the next start. Blocks.
+pub(crate) fn put_in_place(source: &Path, bundle: &Path, staged: &Path, old: &Path) -> Result<(), String> {
+    for leftover in [staged, old] {
+        if leftover.exists() {
+            std::fs::remove_dir_all(leftover).map_err(|error| format!("Cannot clean up an earlier try: {error}"))?;
+        }
+    }
+    let copy = Command::new("ditto").arg(source).arg(staged).output().map_err(|error| format!("Cannot copy the app: {error}"))?;
+    if !copy.status.success() {
+        std::fs::remove_dir_all(staged).ok();
+        return Err(format!("Cannot copy the app: {}", marketplace::failure(&copy)));
+    }
+    // Fails when there is no mark, which is fine.
+    Command::new("xattr").args(["-dr", "com.apple.quarantine"]).arg(staged).output().ok();
+    if bundle.exists() {
+        std::fs::rename(bundle, old).map_err(|error| format!("Cannot replace the app: {error}"))?;
+    }
+    if let Err(error) = std::fs::rename(staged, bundle) {
+        std::fs::rename(old, bundle).ok();
+        return Err(format!("Cannot replace the app: {error}"));
+    }
+    std::fs::remove_dir_all(old).ok();
+    Ok(())
 }
 
 /// Puts the Editor.app from `dmg` in place of `bundle`. The old app stays
@@ -205,26 +233,10 @@ pub fn install_from_dmg(dmg: &Path, bundle: &Path, version: &str) -> Result<(), 
     let staged = parent.join(".Editor-update.app");
     let old = parent.join(".Editor-old.app");
     if writable(parent) {
-        for leftover in [&staged, &old] {
-            if leftover.exists() {
-                std::fs::remove_dir_all(leftover).map_err(|error| format!("Cannot clean up an earlier update: {error}"))?;
-            }
-        }
-        let copy = Command::new("ditto").arg(&source).arg(&staged).output().map_err(|error| format!("Cannot copy the new version: {error}"))?;
-        if !copy.status.success() {
-            std::fs::remove_dir_all(&staged).ok();
-            return Err(format!("Cannot copy the new version: {}", marketplace::failure(&copy)));
-        }
-        std::fs::rename(bundle, &old).map_err(|error| format!("Cannot replace the app: {error}"))?;
-        if let Err(error) = std::fs::rename(&staged, bundle) {
-            std::fs::rename(&old, bundle).ok();
-            return Err(format!("Cannot replace the app: {error}"));
-        }
-        std::fs::remove_dir_all(&old).ok();
-        return Ok(());
+        return put_in_place(&source, bundle, &staged, &old);
     }
     // An app folder that belongs to another user: macOS asks for the password.
-    let script = "/bin/rm -rf \"$3\" \"$4\" && /usr/bin/ditto \"$1\" \"$3\" && /bin/mv \"$2\" \"$4\" && { /bin/mv \"$3\" \"$2\" || { /bin/mv \"$4\" \"$2\"; exit 1; }; } && /bin/rm -rf \"$4\"";
+    let script = "/bin/rm -rf \"$3\" \"$4\" && /usr/bin/ditto \"$1\" \"$3\" && { /usr/bin/xattr -dr com.apple.quarantine \"$3\" || true; } && /bin/mv \"$2\" \"$4\" && { /bin/mv \"$3\" \"$2\" || { /bin/mv \"$4\" \"$2\"; exit 1; }; } && /bin/rm -rf \"$4\"";
     let output = Command::new("osascript")
         .args([
             "-e",
@@ -285,7 +297,7 @@ fn upgrade_with_homebrew(brew: &Path, bundle: &Path, version: &str, cancel: &Ato
 }
 
 /// Starts the app at `bundle` once this process has ended.
-fn relaunch(bundle: &Path) {
+pub(crate) fn relaunch(bundle: &Path) {
     Command::new("/bin/sh")
         .args(["-c", "while kill -0 \"$1\" 2>/dev/null; do sleep 0.2; done; exec /usr/bin/open \"$2\"", "sh"])
         .arg(std::process::id().to_string())
@@ -323,7 +335,9 @@ pub struct Updater {
 
 impl Updater {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let bundle = running_bundle();
+        // From the dmg or a hidden copy it cannot replace itself: the offer
+        // to move it to Applications comes first.
+        let bundle = running_bundle().filter(|_| !app_location::read_only());
         let mut updater = Self { state: State::Idle, bundle, dismissed: None, _checking: None };
         if updater.bundle.is_some() {
             updater._checking = Some(cx.spawn(async move |this, cx| {
@@ -434,7 +448,7 @@ impl Updater {
     }
 }
 
-fn bar_button(id: &'static str, label: &'static str, primary: bool, on_click: impl Fn(&mut App) + 'static) -> impl IntoElement {
+pub(crate) fn bar_button(id: &'static str, label: &'static str, primary: bool, on_click: impl Fn(&mut App) + 'static) -> impl IntoElement {
     let palette = theme::palette();
     div()
         .id(id)
@@ -453,7 +467,6 @@ fn bar_button(id: &'static str, label: &'static str, primary: bool, on_click: im
 
 /// The bar that offers the update, or `None` when there is nothing to say.
 pub fn banner(updater: &Entity<Updater>, cx: &App) -> Option<AnyElement> {
-    let palette = theme::palette();
     let state = updater.read(cx);
     let (text, buttons): (SharedString, Vec<AnyElement>) = match &state.state {
         State::Idle => return None,
@@ -492,21 +505,25 @@ pub fn banner(updater: &Entity<Updater>, cx: &App) -> Option<AnyElement> {
             )
         }
     };
-    Some(
-        div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(px(8.))
-            .h(px(36.))
-            .px(px(12.))
-            .bg(theme::color(palette.accent_soft))
-            .text_color(theme::color(palette.ui_text))
-            .text_size(px(theme::UI_FONT_SIZE))
-            .child(div().flex_1().min_w_0().truncate().child(text))
-            .children(buttons)
-            .into_any_element(),
-    )
+    Some(bar(text, buttons))
+}
+
+/// A bar over the hub and the editor, with a line of text and buttons.
+pub(crate) fn bar(text: SharedString, buttons: Vec<AnyElement>) -> AnyElement {
+    let palette = theme::palette();
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(px(8.))
+        .h(px(36.))
+        .px(px(12.))
+        .bg(theme::color(palette.accent_soft))
+        .text_color(theme::color(palette.ui_text))
+        .text_size(px(theme::UI_FONT_SIZE))
+        .child(div().flex_1().min_w_0().truncate().child(text))
+        .children(buttons)
+        .into_any_element()
 }
 
 #[cfg(test)]
