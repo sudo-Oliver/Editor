@@ -94,6 +94,7 @@ actions!(
         ExitPresentation,
         PdfNextPage,
         PdfPreviousPage,
+        MoveToApplications,
     ]
 );
 

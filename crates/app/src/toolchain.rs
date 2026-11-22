@@ -661,8 +661,11 @@ fn install_package(tool: Tool, package: &Package, tools: &Path, received: &Atomi
     if cancel.load(Ordering::Relaxed) {
         return Err("Stopped.".to_string());
     }
-    set_stage("Waiting for your password…");
-    let prompt = format!("Editor wants to install {name}.");
+    // Said before the dialog comes up, so that it does not come out of nowhere.
+    let place = if tool == Tool::MacTex { "/Library/TeX" } else { "a folder for the whole Mac" };
+    set_stage(&format!("macOS asks for your password next, since {name} goes into {place}. Editor never sees it."));
+    std::thread::sleep(Duration::from_secs(2));
+    let prompt = format!("Editor wants to install {name} into {place}, which needs your Mac password.");
     let output = Command::new("osascript")
         .args([
             "-e",
