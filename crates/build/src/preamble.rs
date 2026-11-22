@@ -10,7 +10,7 @@ use std::{
     time::SystemTime,
 };
 
-const PREFIX: &str = "preamble-";
+pub(crate) const PREFIX: &str = "preamble-";
 const BEGIN_DOCUMENT: &str = "\\begin{document}";
 const FORMAT_VERSION: &[u8] = b"2";
 /// Things that only work in a normal run, because a format keeps no open files and
@@ -289,6 +289,31 @@ mod tests {
         assert_eq!(preamble.state(), State::Unsuitable);
         fs::write(&main, "\\documentclass{b}\n\\begin{document}\n").unwrap();
         assert_ne!(Preamble::of(&main, &root).unwrap().name(), preamble.name());
+    }
+
+    #[test]
+    fn only_the_current_format_stays() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let main = root.join("main.tex");
+        fs::write(&main, "\\documentclass{a}\n\\begin{document}\n").unwrap();
+        let preamble = Preamble::of(&main, root).unwrap();
+        let name = preamble.name();
+        let own = [format!("{name}.fmt"), format!("{name}.inputs")];
+        let others = ["preamble-00000000000000aa.fmt", "preamble-00000000000000aa.inputs", "preamble-00000000000000bb.log"];
+        for file in own.iter().map(String::as_str).chain(others).chain(["main.pdf", "main.aux"]) {
+            fs::write(root.join(file), "").unwrap();
+        }
+        preamble.remove_others();
+        let mut left: Vec<String> = fs::read_dir(root).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        let mut expected = vec!["main.aux".to_string(), "main.pdf".to_string(), "main.tex".to_string()];
+        expected.extend(own.iter().cloned());
+        expected.sort();
+        assert_eq!(left, expected);
+
+        remove_formats(root, None);
+        assert!(!root.join(&own[0]).exists() && root.join("main.pdf").exists());
     }
 
     #[test]

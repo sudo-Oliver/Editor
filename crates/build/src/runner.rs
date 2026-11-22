@@ -20,10 +20,11 @@ use crate::{
     explain, fontmap,
     parse::{self, Diagnostic, Severity},
     preamble::{self, Preamble, State},
+    tidy,
     tools::{child_path, find_tool},
 };
 
-const OUTPUT_DIRECTORY: &str = ".build";
+pub(crate) const OUTPUT_DIRECTORY: &str = ".build";
 const MAX_LATEX_RUNS: usize = 3;
 /// zlib's own default. pdfTeX's 9 spends a quarter of a build on compressing the
 /// PDF and its images, for a file only about 4% smaller.
@@ -37,7 +38,7 @@ const MAX_LINE_BYTES: u64 = 64 * 1024;
 const OUTPUT_TAIL_BYTES: usize = 1024 * 1024;
 /// Files LaTeX carries between runs. A failed or stopped run can leave them
 /// broken, and the next run then fails on them. The PDF is not in this list.
-const LATEX_STATE_EXTENSIONS: &[&str] = &[
+pub(crate) const LATEX_STATE_EXTENSIONS: &[&str] = &[
     "aux", "bbl", "bcf", "blg", "fdb_latexmk", "fls", "idx", "ilg", "ind", "lof", "log", "lot", "nav", "out",
     "run.xml", "snm", "toc", "vrb", "xdv",
 ];
@@ -176,7 +177,9 @@ async fn build(
     if let Err(error) = std::fs::create_dir_all(&output_directory) {
         return Some(failure(format!("Cannot create {}: {error}", output_directory.display()), started));
     }
+    tidy::keep_out_of_backups(&output_directory);
     let stem = request.main.file_stem().map_or_else(|| "main".into(), |stem| stem.to_string_lossy().into_owned());
+    tidy::remove_orphans(&cwd, &output_directory, &stem);
     let input = match request.engine {
         Engine::Typst => request.main.strip_prefix(&request.root).unwrap_or(&request.main),
         _ => Path::new(request.main.file_name().unwrap_or_default()),
@@ -196,7 +199,8 @@ async fn build(
     let is_latex = matches!(request.engine, Engine::PdfLatex | Engine::LuaLatex);
     let log_path = output_directory.join(format!("{stem}.log"));
     let mut cleaned = request.clean;
-    if request.clean {
+    // Only pdfLaTeX uses a format, so after a switch to another LaTeX the old one is of no use.
+    if request.clean || matches!(request.engine, Engine::LuaLatex | Engine::Tectonic) {
         preamble::remove_formats(&output_directory, None);
     }
     let mut format = if request.engine == Engine::PdfLatex && !request.clean {
@@ -448,7 +452,13 @@ async fn prepare_format(
     let (Some(preamble), Some(compiler)) = (Preamble::of(main, output_directory), find_tool("pdflatex")) else {
         return Some(None);
     };
-    match preamble.state() {
+    let state = preamble.state();
+    // Only this preamble's format is of use. A new preamble may still be undone,
+    // so the old format stays until the new one settles.
+    if state != State::New {
+        preamble.remove_others();
+    }
+    match state {
         State::New => {
             preamble.mark_seen();
             Some(None)
@@ -456,7 +466,6 @@ async fn prepare_format(
         State::Unsuitable => Some(None),
         State::Untested | State::Trusted => Some(Some(preamble)),
         State::Wanted => {
-            preamble.remove_others();
             let name = preamble.name();
             let args = [
                 "-ini",
