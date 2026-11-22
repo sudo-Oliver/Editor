@@ -1,0 +1,27 @@
+# Weekly updates in as few pull requests as possible: one for all Rust crates
+# that only change their minor or patch version, one for GitHub Actions.
+# Major versions come one pull request each, since they can break the build.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore(deps)
+    groups:
+      rust:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: ci
+    groups:
+      actions:
+        patterns: ["*"]
