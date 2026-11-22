@@ -69,6 +69,11 @@ pub struct SetupView {
     /// MacTeX instead of Tectonic.
     full_latex: bool,
     way: Way,
+    /// Whether the other ways to install are open. People without Homebrew
+    /// see only the app's folder unless they ask.
+    show_ways: bool,
+    /// What the last Install started, to show its rows while it runs.
+    started: Vec<Tool>,
     probes: HashMap<Tool, Probe>,
     /// Free space in megabytes, once measured.
     free: Option<u64>,
@@ -100,13 +105,17 @@ impl SetupView {
         });
         // What is there already is the best guess of what the user writes.
         let (has_latex, has_typst) = { let state = toolchain.read(cx); (state.ready(Tool::Tectonic), state.ready(Tool::Typst)) };
-        let way = if toolchain.read(cx).use_homebrew { Way::Homebrew } else { Way::AppFolder };
+        // Homebrew only for people who have it: everyone else would first get
+        // Apple's developer tools, gigabytes they never asked for.
+        let way = { let state = toolchain.read(cx); if state.use_homebrew && state.found(Tool::Homebrew) != Found::Missing { Way::Homebrew } else { Way::AppFolder } };
         Self {
             step: if again { Step::Choose } else { Step::Welcome },
             latex: has_latex || !has_typst,
             typst: has_typst,
             full_latex: true,
             way,
+            show_ways: false,
+            started: Vec::new(),
             probes: HashMap::new(),
             free: None,
             apple_tools: None,
@@ -131,10 +140,27 @@ impl SetupView {
 
     /// What has to be installed, smallest first, so that something works soon.
     fn to_install(&self, cx: &App) -> Vec<Tool> {
-        let state = self.toolchain.read(cx);
-        let mut tools: Vec<Tool> = self.chosen().into_iter().filter(|tool| !state.ready(*tool)).collect();
+        let mut tools: Vec<Tool> = self.chosen().into_iter().filter(|tool| !self.has(*tool, cx)).collect();
+        // MacTeX takes a while to download. Tectonic is small, so the user can
+        // start writing after a minute, and MacTeX takes over once it is there.
+        if tools.contains(&Tool::MacTex) && self.way != Way::Manual && !self.ready(Tool::Tectonic, cx) && Tool::Tectonic.installable() {
+            tools.push(Tool::Tectonic);
+        }
         tools.sort_by_key(|tool| tool.installed_megabytes());
         tools
+    }
+
+    /// Whether the tool itself is there. For MacTeX that is a complete TeX,
+    /// while `ready` already counts Tectonic as LaTeX.
+    fn has(&self, tool: Tool, cx: &App) -> bool {
+        let state = self.toolchain.read(cx);
+        if tool == Tool::MacTex { state.has_complete_latex() } else { state.ready(tool) }
+    }
+
+    /// Whether every chosen language can make a PDF, maybe with the quick
+    /// compiler while the complete one still downloads.
+    fn usable(&self, cx: &App) -> bool {
+        self.chosen().into_iter().all(|tool| self.ready(tool, cx))
     }
 
     /// Whether Homebrew itself comes first.
@@ -159,7 +185,7 @@ impl SetupView {
 
     fn all_installed(&self, cx: &App) -> bool {
         let state = self.toolchain.read(cx);
-        !state.busy() && self.chosen().into_iter().all(|tool| state.ready(tool))
+        !state.busy() && self.chosen().into_iter().all(|tool| self.has(tool, cx))
     }
 
     fn go(&mut self, step: Step, cx: &mut Context<Self>) {
@@ -208,6 +234,11 @@ impl SetupView {
 
     fn install_missing(&mut self, cx: &mut Context<Self>) {
         let tools = self.to_install(cx);
+        let mut started = tools.clone();
+        if self.needs_homebrew(cx) {
+            started.insert(0, Tool::Homebrew);
+        }
+        self.started = started;
         self.toolchain.update(cx, |toolchain, cx| {
             for tool in tools {
                 toolchain.start(tool, cx);
@@ -278,6 +309,7 @@ impl SetupView {
             self.toolchain.update(cx, |toolchain, cx| toolchain.remove(tool, cx));
         }
         self.toolchain.update(cx, |toolchain, cx| toolchain.start(tool, cx));
+        self.started = vec![tool];
         self.go(Step::Install, cx);
     }
 
@@ -441,8 +473,8 @@ impl SetupView {
                     .gap(px(8.))
                     .child(self.option(
                         "setup-mactex",
-                        "Complete: MacTeX (recommended)",
-                        format!("The usual LaTeX for the Mac. {mactex} download, every package there at once, also offline."),
+                        "Complete (recommended)",
+                        format!("Every package at once, also offline. A {mactex} download, but you can start writing after a minute."),
                         self.full_latex,
                         cx,
                         |this, cx| {
@@ -452,7 +484,7 @@ impl SetupView {
                     ))
                     .child(self.option(
                         "setup-tectonic",
-                        "Compact: Tectonic",
+                        "Small",
                         "About 20 MB, ready in a minute. Fetches each package from the internet the first time a document uses it.",
                         !self.full_latex,
                         cx,
@@ -475,51 +507,62 @@ impl SetupView {
         elements
     }
 
+    /// The ways to install, for people who have Homebrew or ask for them.
+    fn render_ways(&self, cx: &mut Context<Self>) -> AnyElement {
+        let has_homebrew = self.ready(Tool::Homebrew, cx);
+        let (homebrew_label, homebrew_text) = if has_homebrew {
+            ("With Homebrew (recommended)", "You have Homebrew. It installs and later updates everything.".to_string())
+        } else {
+            (
+                "Install Homebrew first",
+                format!(
+                    "For people who use the Terminal. Adds Homebrew ({}) and Apple's developer tools (about 2 GB), then installs everything through it.",
+                    toolchain::size(Tool::Homebrew.megabytes().unwrap_or(0))
+                ),
+            )
+        };
+        let app_label = if has_homebrew { "In the app's folder" } else { "In the app's folder (recommended)" };
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .child(self.option("setup-way-brew", homebrew_label, homebrew_text, self.way == Way::Homebrew, cx, |this, cx| this.choose_way(Way::Homebrew, cx)))
+            .child(self.option(
+                "setup-way-app",
+                app_label,
+                "The app downloads the official programs into its own folder. Removed with one click.",
+                self.way == Way::AppFolder,
+                cx,
+                |this, cx| this.choose_way(Way::AppFolder, cx),
+            ))
+            .child(self.option(
+                "setup-way-manual",
+                "I download the files myself",
+                "The setup shows each file, its download link and exactly where to put it, and checks it.",
+                self.way == Way::Manual,
+                cx,
+                |this, cx| this.choose_way(Way::Manual, cx),
+            ))
+            .into_any_element()
+    }
+
+    /// What will be installed, how big it is and what macOS will ask, before
+    /// anything happens. People without Homebrew are not asked how: the app's
+    /// folder needs nothing beforehand.
     fn render_way(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let palette = theme::palette();
         let muted = theme::color(palette.ui_muted);
-        let homebrew_text = if self.ready(Tool::Homebrew, cx) {
-            "You have Homebrew. It installs and later updates everything.".to_string()
-        } else {
-            format!(
-                "Installs Homebrew first ({}, plus Apple's developer tools), then everything through it. Updates later with one command.",
-                toolchain::size(Tool::Homebrew.megabytes().unwrap_or(0))
-            )
-        };
-        let mut elements = vec![
-            title("How should it be installed?"),
-            paragraph("All three end the same way. If you do not know Homebrew, take the first one."),
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(8.))
-                .child(self.option("setup-way-brew", "Automatically with Homebrew (recommended)", homebrew_text, self.way == Way::Homebrew, cx, |this, cx| this.choose_way(Way::Homebrew, cx)))
-                .child(self.option(
-                    "setup-way-app",
-                    "Automatically, without Homebrew",
-                    "The app downloads the official programs into its own folder. Removed with one click.",
-                    self.way == Way::AppFolder,
-                    cx,
-                    |this, cx| this.choose_way(Way::AppFolder, cx),
-                ))
-                .child(self.option(
-                    "setup-way-manual",
-                    "I download the files myself",
-                    "The setup shows each file, its download link and exactly where to put it, and checks it.",
-                    self.way == Way::Manual,
-                    cx,
-                    |this, cx| this.choose_way(Way::Manual, cx),
-                ))
-                .into_any_element(),
-        ];
-        // What it costs, before anything happens.
+        let has_homebrew = self.ready(Tool::Homebrew, cx);
+        let ways_open = has_homebrew || self.show_ways;
+        let mut elements = vec![title("Ready to install"), paragraph("Here is what your Mac gets. Nothing happens until you click Install.")];
+        if ways_open {
+            elements.push(self.render_ways(cx));
+        }
         let mut parts: Vec<(String, String)> = Vec::new();
         let to_install = self.to_install(cx);
         let needs_homebrew = self.needs_homebrew(cx);
-        if needs_homebrew {
-            if self.apple_tools == Some(false) {
-                parts.push(("Apple's developer tools".to_string(), "about 2 GB, Apple's own dialog".to_string()));
-            }
+        if needs_homebrew && self.apple_tools == Some(false) {
+            parts.push(("Apple's developer tools".to_string(), "about 2 GB, Apple's own dialog".to_string()));
         }
         for tool in needs_homebrew.then_some(Tool::Homebrew).into_iter().chain(to_install.iter().copied()) {
             let download = tool.megabytes().unwrap_or(0);
@@ -561,12 +604,16 @@ impl SetupView {
             elements.push(
                 div()
                     .text_color(theme::color(palette.error))
-                    .child(format!("Your Mac needs {} more free space for this. Free some up, or choose the compact LaTeX.", toolchain::size(missing)))
+                    .child(format!("Your Mac needs {} more free space for this. Free some up, or go back and choose the small LaTeX.", toolchain::size(missing)))
                     .into_any_element(),
             );
         }
-        if to_install.contains(&Tool::MacTex) {
-            elements.push(paragraph("MacTeX is a large download: on a fast connection about 15 minutes, on a slow one longer. The setup shows how long it still takes."));
+        if to_install.contains(&Tool::MacTex) && to_install.contains(&Tool::Tectonic) {
+            elements.push(paragraph(
+                "You can start writing after about a minute: the small LaTeX comes first. The complete one keeps downloading in the background, about 15 minutes on a fast connection, and takes over once it is there.",
+            ));
+        } else if to_install.contains(&Tool::MacTex) {
+            elements.push(paragraph("The complete LaTeX is a large download: on a fast connection about 15 minutes, on a slow one longer. The setup shows how long it still takes."));
         }
         if passwords > 0 && self.way != Way::Manual {
             elements.push(paragraph(if passwords == 1 {
@@ -574,6 +621,8 @@ impl SetupView {
             } else {
                 "macOS asks for your Mac password twice: for Homebrew now and for MacTeX after its download. Editor never sees it."
             }));
+        } else if self.way == Way::AppFolder {
+            elements.push(paragraph("No password needed. Everything stays in the app's own folder, and nothing else on your Mac changes."));
         }
         let next: Option<(&'static str, fn(&mut Self, &mut Context<Self>))> = match (enough, self.way) {
             (false, _) => None,
@@ -581,6 +630,18 @@ impl SetupView {
             (true, _) => Some(("Install", |this, cx| this.install_missing(cx))),
         };
         elements.push(self.nav(next, cx));
+        if !ways_open {
+            elements.push(
+                div()
+                    .flex()
+                    .justify_center()
+                    .child(quiet("setup-ways", "Other ways to install", cx, |this, cx| {
+                        this.show_ways = true;
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        }
         elements
     }
 
@@ -588,8 +649,8 @@ impl SetupView {
         if self.way == Way::Manual {
             return self.render_manual(cx);
         }
-        let mut tools = self.chosen();
-        if self.toolchain.read(cx).installing(Tool::Homebrew) || self.toolchain.read(cx).errors.contains_key(&Tool::Homebrew) {
+        let mut tools = if self.started.is_empty() { self.chosen() } else { self.started.clone() };
+        if !tools.contains(&Tool::Homebrew) && (self.toolchain.read(cx).installing(Tool::Homebrew) || self.toolchain.read(cx).errors.contains_key(&Tool::Homebrew)) {
             tools.insert(0, Tool::Homebrew);
         }
         let busy = self.toolchain.read(cx).busy();
@@ -619,7 +680,21 @@ impl SetupView {
             })
             .into_any_element());
         }
-        if busy {
+        if busy && self.usable(cx) {
+            // Only the complete LaTeX is left: the small one works already.
+            elements.push(paragraph(
+                "You can start now. The complete LaTeX keeps downloading in the background, and the status bar shows how far. macOS asks for your password once it is done.",
+            ));
+            elements.push(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .pt(px(8.))
+                    .child(primary("setup-start-now", "Start writing now", cx, |this, cx| this.go(Step::Done, cx)))
+                    .into_any_element(),
+            );
+        } else if busy {
             // Waiting here beats a document without a PDF that nobody can explain.
             let left = self.toolchain.read(cx).jobs.values().filter_map(toolchain::Job::remaining).max();
             elements.push(paragraph(match left {
@@ -722,6 +797,7 @@ impl SetupView {
             })
             .collect();
         let ready = missing.is_empty() && failed.is_empty() && !testing;
+        let background = chosen.contains(&Tool::MacTex) && self.toolchain.read(cx).installing(Tool::MacTex);
         let mut elements = vec![
             title(if ready {
                 "You are all set"
@@ -730,7 +806,9 @@ impl SetupView {
             } else {
                 "Almost there"
             }),
-            paragraph(if ready {
+            paragraph(if ready && background {
+                "A test document just became a PDF on your Mac. The complete LaTeX keeps downloading in the background and takes over on its own once it is there. Open the welcome document to see how it works."
+            } else if ready {
                 "A test document just became a PDF on your Mac. Open the welcome document to see how it works; a short tour shows each part of the editor."
             } else if testing {
                 "A small test document compiles with what was installed, so that your first PDF works. The first time takes a moment."

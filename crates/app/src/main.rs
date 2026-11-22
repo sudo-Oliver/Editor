@@ -38,6 +38,7 @@ mod status_bar;
 mod theme;
 mod toolchain;
 mod tour;
+mod updater;
 mod workspace;
 
 use std::{ffi::OsString, os::unix::ffi::OsStringExt, path::PathBuf};
