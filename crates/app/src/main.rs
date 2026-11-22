@@ -1,5 +1,6 @@
 mod actions;
 mod addon_panel;
+mod addon_reports;
 mod addons;
 mod app_location;
 mod assets;
@@ -16,6 +17,7 @@ mod home_view;
 mod history;
 mod image_view;
 mod keymap;
+mod markdown;
 mod marketplace;
 mod material_icons;
 mod nvim_themes;

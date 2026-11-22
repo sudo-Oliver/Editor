@@ -24,6 +24,8 @@ pub struct LineHunk {
     pub kind: HunkKind,
     /// Lines of the new text, counted from zero.
     pub lines: Range<usize>,
+    /// The lines of the old text they replace, empty for an addition.
+    pub old_lines: Range<usize>,
 }
 
 /// The changes from `old` to `new`, or `None` where they are too many to tell.
@@ -41,10 +43,11 @@ pub fn line_diff(old: &str, new: &str) -> Option<Vec<LineHunk>> {
 
     // Runs of deletions and insertions become one hunk each.
     let mut hunks = Vec::new();
-    let mut new_line = prefix;
+    let (mut new_line, mut old_line) = (prefix, prefix);
     let (mut deleted, mut inserted) = (0, 0);
-    let flush = |new_line: usize, deleted: &mut usize, inserted: &mut usize, hunks: &mut Vec<LineHunk>| {
+    let flush = |new_line: usize, old_line: usize, deleted: &mut usize, inserted: &mut usize, hunks: &mut Vec<LineHunk>| {
         let start = new_line - *inserted;
+        let old_lines = old_line - *deleted..old_line;
         let kind = match (*deleted > 0, *inserted > 0) {
             (true, true) => Some(HunkKind::Modified),
             (false, true) => Some(HunkKind::Added),
@@ -52,7 +55,7 @@ pub fn line_diff(old: &str, new: &str) -> Option<Vec<LineHunk>> {
             (false, false) => None,
         };
         if let Some(kind) = kind {
-            hunks.push(LineHunk { kind, lines: start..new_line });
+            hunks.push(LineHunk { kind, lines: start..new_line, old_lines });
         }
         *deleted = 0;
         *inserted = 0;
@@ -60,17 +63,21 @@ pub fn line_diff(old: &str, new: &str) -> Option<Vec<LineHunk>> {
     for edit in edits {
         match edit {
             Edit::Equal => {
-                flush(new_line, &mut deleted, &mut inserted, &mut hunks);
+                flush(new_line, old_line, &mut deleted, &mut inserted, &mut hunks);
                 new_line += 1;
+                old_line += 1;
             }
-            Edit::Delete => deleted += 1,
+            Edit::Delete => {
+                deleted += 1;
+                old_line += 1;
+            }
             Edit::Insert => {
                 inserted += 1;
                 new_line += 1;
             }
         }
     }
-    flush(new_line, &mut deleted, &mut inserted, &mut hunks);
+    flush(new_line, old_line, &mut deleted, &mut inserted, &mut hunks);
     Some(hunks)
 }
 

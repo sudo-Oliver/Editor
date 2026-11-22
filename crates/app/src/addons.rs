@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use addon_api::{API_VERSION, AddonMessage, HostMessage, Manifest};
+use addon_api::{API_VERSION, AddonMessage, HostMessage, Manifest, OLDEST_API_VERSION};
 use tokio::sync::mpsc;
 
 const MANIFEST: &str = "addon.toml";
@@ -49,6 +49,35 @@ impl Installed {
     }
 }
 
+/// A folder for files the editor hands to add-ons, such as pasted pictures and
+/// PDF pages. Only this user can open it, and it goes when the editor quits.
+pub fn private_directory() -> Result<PathBuf, String> {
+    static DIRECTORY: std::sync::OnceLock<Result<PathBuf, String>> = std::sync::OnceLock::new();
+    DIRECTORY
+        .get_or_init(|| {
+            use std::os::unix::fs::DirBuilderExt;
+            let path = std::env::temp_dir().join(format!("editor-addons-{}", std::process::id()));
+            match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => Ok(path),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(path),
+                Err(error) => Err(format!("Cannot make a folder for add-on files: {error}")),
+            }
+        })
+        .clone()
+}
+
+/// Removes that folder, at quit.
+pub fn remove_private_directory() {
+    std::fs::remove_dir_all(std::env::temp_dir().join(format!("editor-addons-{}", std::process::id()))).ok();
+}
+
+/// A new name in the private folder, such as `pasted-3.png`.
+pub fn private_file(stem: &str, extension: &str) -> Result<PathBuf, String> {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let number = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(private_directory()?.join(format!("{stem}-{number}.{extension}")))
+}
+
 pub fn default_directory() -> Option<PathBuf> {
     Some(crate::settings::default_path()?.parent()?.join("addons"))
 }
@@ -58,8 +87,12 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, String> {
     if manifest.id.is_empty() || !manifest.id.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-') {
         return Err(format!("\"{}\" is not a valid add-on id. Use a-z, 0-9 and -.", manifest.id));
     }
-    if manifest.api != API_VERSION {
-        return Err(format!("{} needs add-on API {}, and this editor has {API_VERSION}.", manifest.name, manifest.api));
+    if !(OLDEST_API_VERSION..=API_VERSION).contains(&manifest.api) {
+        return Err(format!("{} needs add-on API {}, and this editor has {OLDEST_API_VERSION} to {API_VERSION}.", manifest.name, manifest.api));
+    }
+    let valid_id = |id: &str| !id.is_empty() && id.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '_');
+    if let Some(command) = manifest.commands.iter().find(|command| !valid_id(&command.id)) {
+        return Err(format!("{}: \"{}\" is not a valid command id. Use a-z, 0-9, - and _.", manifest.name, command.id));
     }
     if !stays_inside(Path::new(&manifest.program)) || manifest.icon.as_deref().is_some_and(|icon| !stays_inside(Path::new(icon))) {
         return Err(format!("{}: files must stay inside the add-on folder.", manifest.name));
@@ -525,7 +558,7 @@ echo 'not json'
 echo 'last words' >&2"#,
         );
         let (process, mut receiver) = AddonProcess::start(&add_on).unwrap();
-        process.send(HostMessage::Init { api: API_VERSION, project: None });
+        process.send(HostMessage::Init { api: API_VERSION, project: None, host_version: String::new(), features: Vec::new() });
         assert!(matches!(next(&mut receiver), ProcessEvent::Message(AddonMessage::Append { text, .. }) if text == "hello"));
         assert!(matches!(next(&mut receiver), ProcessEvent::Invalid(_)));
         assert!(matches!(next(&mut receiver), ProcessEvent::Exited(reason) if reason.contains("last words")));
