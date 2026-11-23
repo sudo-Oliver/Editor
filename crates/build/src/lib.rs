@@ -1,5 +1,6 @@
 //! Runs external document compilers and turns their output into diagnostics.
 
+mod blg;
 mod config;
 mod explain;
 mod fontmap;
