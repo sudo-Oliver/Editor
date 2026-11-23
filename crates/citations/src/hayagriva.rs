@@ -19,7 +19,7 @@ pub fn parse(text: &str) -> Bib {
     let mut nested: Option<(String, usize)> = None;
     let mut parent_kind = String::new();
     let mut offset = 0;
-    for raw_line in text.split_inclusive('\n') {
+    for (number, raw_line) in text.split_inclusive('\n').enumerate() {
         let start = offset;
         offset += raw_line.len();
         let line = raw_line.trim_end_matches(['\n', '\r']);
@@ -50,7 +50,7 @@ pub fn parse(text: &str) -> Bib {
             } else {
                 seen.insert(key.to_string(), key_range.clone());
             }
-            entry = Some(Entry { kind: "misc".into(), key: key.to_string(), key_range, range: start..start + line.len(), fields: Vec::new() });
+            entry = Some(Entry { kind: "misc".into(), key: key.to_string(), key_range, range: start..start + line.len(), line: number, fields: Vec::new() });
             continue;
         }
         let Some(current) = entry.as_mut() else {

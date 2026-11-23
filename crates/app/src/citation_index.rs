@@ -25,6 +25,34 @@ pub(super) fn matters(path: &Path) -> bool {
     path.extension().and_then(|extension| extension.to_str()).is_some_and(|extension| matches!(extension, "tex" | "ltx" | "typ" | "bib" | "yml" | "yaml" | "aux" | "bbl"))
 }
 
+/// What each label is, for the suggestions: `figure 3.2: Results of the run`.
+pub(super) fn label_details(index: &CitationIndex) -> HashMap<String, String> {
+    index
+        .labels
+        .iter()
+        .filter_map(|(name, definitions)| {
+            let definition = definitions.first()?;
+            let mut detail = match definition.label.env.as_str() {
+                "" => "label".to_string(),
+                env => env.trim_end_matches('*').to_string(),
+            };
+            if let Some(number) = definition.number.as_deref().filter(|number| !number.is_empty()) {
+                detail.push(' ');
+                detail.push_str(number);
+            }
+            if let Some(caption) = definition.label.caption.as_deref().filter(|caption| !caption.is_empty()) {
+                detail.push_str(": ");
+                let short: String = caption.chars().take(48).collect();
+                detail.push_str(&short);
+                if short.len() < caption.len() {
+                    detail.push('…');
+                }
+            }
+            Some((name.clone(), detail))
+        })
+        .collect()
+}
+
 /// A bibliography of the TeX installation, such as `IEEEabrv.bib`, asked of
 /// `kpsewhich` once per name.
 fn system_bib(name: &str) -> Option<PathBuf> {
