@@ -16,6 +16,7 @@ use tokio::{
 };
 
 use crate::{
+    blg,
     config::Engine,
     explain, fontmap,
     parse::{self, Diagnostic, Severity},
@@ -277,7 +278,7 @@ async fn build(
         // document. A fresh PDF and a log without errors mean it worked.
         if by_latexmk && !run.success && !diagnostics.iter().any(|diagnostic| diagnostic.severity == Severity::Error) && written_since(&output_directory.join(format!("{stem}.pdf")), started_at) {
             run.success = true;
-            diagnostics.extend(bibliography_problems(&output_directory, &stem));
+            diagnostics.extend(bibliography_problems(&cwd, &output_directory, &stem, started_at));
         }
         // An untested format could be what is wrong, and one normal run decides that.
         if let Some(used) = format.take_if(|used| {
@@ -345,53 +346,49 @@ fn written_since(path: &Path, since: SystemTime) -> bool {
     std::fs::metadata(path).and_then(|metadata| metadata.modified()).is_ok_and(|modified| modified >= since)
 }
 
-/// A warning when BibTeX found problems in the bibliography that it worked around.
-fn bibliography_problems(output_directory: &Path, stem: &str) -> Option<Diagnostic> {
-    let blg = std::fs::read(output_directory.join(format!("{stem}.blg"))).ok()?;
-    let blg = String::from_utf8_lossy(&blg);
-    let count = blg.lines().find_map(|line| line.trim().strip_prefix("(There were ")?.strip_suffix(" error messages)")?.parse::<usize>().ok()).or_else(|| blg.contains("(There was 1 error message)").then_some(1))?;
-    let example = blg.lines().find(|line| line.contains("is a missing field") || line.starts_with("I was expecting") || line.starts_with("Repeated entry")).map(str::trim);
-    let mut message = format!("BibTeX found {count} problems in the bibliography and skipped over them, so the PDF is complete.");
-    if let Some(example) = example {
-        message.push_str(&format!(" The first: {example}"));
+/// What BibTeX or biber found in the bibliography and worked around, each
+/// problem at its entry, when the last run wrote a log.
+fn bibliography_problems(cwd: &Path, output_directory: &Path, stem: &str, since: SystemTime) -> Vec<Diagnostic> {
+    let path = output_directory.join(format!("{stem}.blg"));
+    if !written_since(&path, since) {
+        return Vec::new();
     }
-    Some(Diagnostic {
-        file: Some(output_directory.join(format!("{stem}.blg"))),
-        line: None,
-        column: None,
-        severity: Severity::Warning,
-        message,
-        ..Default::default()
-    })
+    let blg = std::fs::read(&path).map(|blg| String::from_utf8_lossy(&blg).into_owned()).unwrap_or_default();
+    blg::parse(&blg, cwd)
 }
 
 /// Whether the last LaTeX run left work that only latexmk does: BibTeX or
 /// Biber for the bibliography, or makeindex for an index, a glossary or a
 /// nomenclature.
 fn needs_latexmk(cwd: &Path, output_directory: &Path, stem: &str) -> bool {
-    let log = std::fs::read(output_directory.join(format!("{stem}.log"))).unwrap_or_default();
-    let log = String::from_utf8_lossy(&log);
+    let read = |extension: &str| std::fs::read(output_directory.join(format!("{stem}.{extension}"))).map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+    let log = read("log").unwrap_or_default();
     let asks = ["Please (re)run Biber", "Please (re)run BibTeX", "Please rerun BibTeX", "Please rerun Biber"];
-    // A new \cite that BibTeX has not seen yet shows up as undefined.
-    let new_citation = log.contains("Citation `") && log.contains("undefined") && log.contains(&format!("{stem}.bbl"));
-    if asks.iter().any(|ask| log.contains(ask)) || log.contains(&format!("No file {stem}.bbl")) || new_citation {
+    if asks.iter().any(|ask| log.contains(ask)) || log.contains(&format!("No file {stem}.bbl")) {
         return true;
     }
     if ["idx", "glo", "nlo"].iter().any(|extension| output_directory.join(format!("{stem}.{extension}")).is_file()) {
         return true;
     }
-    // An edited .bib file changes the bibliography without LaTeX noticing.
     let modified = |path: &Path| std::fs::metadata(path).and_then(|metadata| metadata.modified()).ok();
-    let Some(bbl) = modified(&output_directory.join(format!("{stem}.bbl"))) else {
+    let Some(bbl_time) = modified(&output_directory.join(format!("{stem}.bbl"))) else {
         return false;
     };
-    std::fs::read_dir(cwd)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "bib"))
-        .any(|bib| modified(&bib).is_some_and(|bib| bib > bbl))
+    // An edited .bib file changes the bibliography without LaTeX noticing,
+    // also one in a folder of its own, as the last run named them.
+    let mut bibs = blg::bibliographies(cwd, output_directory, stem);
+    if bibs.is_empty() {
+        bibs = std::fs::read_dir(cwd).into_iter().flatten().flatten().map(|entry| entry.path()).filter(|path| path.extension().is_some_and(|extension| extension == "bib")).collect();
+    }
+    if bibs.iter().any(|bib| modified(bib).is_some_and(|bib| bib > bbl_time)) {
+        return true;
+    }
+    // A new \cite that the bibliography does not have yet shows up as
+    // undefined. A key the last run could not find anywhere needs no new
+    // run until a bibliography changes, which the check above catches.
+    let bbl = read("bbl").unwrap_or_default();
+    let not_found = read("blg").map(|blg| blg::not_found(&blg)).unwrap_or_default();
+    blg::undefined_citations(&log).iter().any(|key| !not_found.contains(key) && !bbl.contains(&format!("{{{key}}}")))
 }
 
 /// Picks the most useful line. latexmk prints a summary after its other output.
@@ -794,17 +791,42 @@ mod tests {
     }
 
     #[test]
-    fn bibliography_problems_become_one_warning() {
+    fn bibliography_problems_come_one_by_one_from_a_fresh_log() {
         let directory = tempfile::tempdir().unwrap();
-        assert!(bibliography_problems(directory.path(), "main").is_none());
+        let before = SystemTime::now() - std::time::Duration::from_secs(5);
+        assert!(bibliography_problems(directory.path(), directory.path(), "main", before).is_empty());
+        std::fs::write(directory.path().join("references.bib"), "@article{a2020, title = {T}}\n").unwrap();
         let blg = "Database file #1: references.bib\n`journal' is a missing field, not a string, for entry a2020\nwhile executing---line 1733 of file style.bst\n(There were 44 error messages)\n";
         std::fs::write(directory.path().join("main.blg"), blg).unwrap();
-        let warning = bibliography_problems(directory.path(), "main").unwrap();
-        assert_eq!(warning.severity, Severity::Warning);
-        assert!(warning.message.starts_with("BibTeX found 44 problems"), "{}", warning.message);
-        assert!(warning.message.contains("for entry a2020"), "{}", warning.message);
-        std::fs::write(directory.path().join("main.blg"), "Database file #1: references.bib\n").unwrap();
-        assert!(bibliography_problems(directory.path(), "main").is_none());
+        let problems = bibliography_problems(directory.path(), directory.path(), "main", before);
+        assert_eq!(problems.len(), 1);
+        assert_eq!((problems[0].severity, problems[0].line), (Severity::Warning, Some(1)));
+        assert!(problems[0].message.contains("for entry a2020"), "{}", problems[0].message);
+        // A log from before this build says nothing about it.
+        assert!(bibliography_problems(directory.path(), directory.path(), "main", SystemTime::now() + std::time::Duration::from_secs(60)).is_empty());
+    }
+
+    #[test]
+    fn a_new_citation_or_an_edited_bib_in_a_folder_needs_latexmk() {
+        let directory = tempfile::tempdir().unwrap();
+        let (cwd, build) = (directory.path(), directory.path().join(".build"));
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::create_dir(cwd.join("refs")).unwrap();
+        std::fs::write(cwd.join("refs/main.bib"), "@misc{old}").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(build.join("main.aux"), "\\bibdata{refs/main}\n").unwrap();
+        std::fs::write(build.join("main.bbl"), "\\bibitem{old}\n").unwrap();
+        std::fs::write(build.join("main.blg"), "Warning--I didn't find a database entry for \"typo\"\n").unwrap();
+        std::fs::write(build.join("main.log"), "LaTeX Warning: Citation `typo' on page 1 undefined on input line 3.\n").unwrap();
+        // A key no bibliography had last time needs no new run.
+        assert!(!needs_latexmk(cwd, &build, "main"));
+        std::fs::write(build.join("main.log"), "LaTeX Warning: Citation `new' on page 1 undefined on input line 3.\n").unwrap();
+        assert!(needs_latexmk(cwd, &build, "main"));
+        std::fs::write(build.join("main.log"), "").unwrap();
+        assert!(!needs_latexmk(cwd, &build, "main"));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(cwd.join("refs/main.bib"), "@misc{old}\n@misc{new}").unwrap();
+        assert!(needs_latexmk(cwd, &build, "main"));
     }
 
     #[test]
