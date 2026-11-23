@@ -91,7 +91,7 @@ pub fn edit_for(fix: &Fix, text: &str) -> Option<(Range<usize>, String)> {
             Some((offset..offset, line))
         }
         Fix::RemovePackage(package) => Some((usage.package_removal(text, package)?, String::new())),
-        Fix::InstallTool(_) | Fix::UpdateLatex => None,
+        Fix::InstallTool(_) | Fix::InstallLatexPackage(_) | Fix::UpdateLatex => None,
     }
 }
 
