@@ -68,6 +68,17 @@ to neither the error count nor the badge. The error card shows a primary button 
 the log panel lists all hints in a Packages section, each with its button. With the cursor on a
 hinted line, a strip below the editor says what the underline means and applies the fix on click.
 
+## Citation and reference marks
+
+The editor checks keys, labels and bibliographies as one types, a moment after a pause, before
+LaTeX runs. A cited key no bibliography has and a label defined twice get the error underline; a
+reference to a missing label and a `\label` before its `\caption` get the warning underline. In
+`.bib` files, syntax mistakes, unknown `@string`s, duplicate keys and broken `crossref`s mark the
+exact place; missing fields warn; the same work under two keys, capitals a BibTeX style would
+lowercase and encodings the backend reads badly are muted hints. No key is called unknown while a
+declared bibliography is missing or on the web. These marks follow edits, add to neither the error
+count nor the badge, and the strip below the editor says what the one at the cursor means.
+
 ## File tree header
 
 Clicking the header folds the tree, and the outline takes its space. To the right sit four 22 px
@@ -80,7 +91,7 @@ are left out and named in the same place.
 ## Suggestion popup
 
 A small list opens below the start of the replaced text, at most 8 rows of name and detail on the
-panel color. It appears only at a trigger (`\\`, `\\begin{`, `\\ref{`, `#`, `@`), not in prose. Its
+panel color. It appears only at a trigger (`\\`, `\\begin{`, `\\ref{` and its kin, after a comma in `\\cref{a,`, `#`, `@`), not in prose. Labels come from the whole document and show their kind, number and caption. Its
 keys apply only while it shows, so `Tab` keeps its other meanings otherwise: indent or next field
 while inserting, and file tree in Vim's Normal mode.
 
