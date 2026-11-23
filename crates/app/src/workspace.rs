@@ -589,6 +589,8 @@ pub struct Workspace {
     citations_stale: bool,
     /// The picker needs a window, so the next render opens it.
     open_citations_soon: bool,
+    /// A definition to open, which needs the window of the next render.
+    definition_soon: Option<(PathBuf, std::ops::Range<usize>, usize)>,
     picker_focus: FocusHandle,
     picker_scroll: ScrollHandle,
     picker_files_task: Option<Task<()>>,
@@ -858,6 +860,7 @@ impl Workspace {
             citations_task: None,
             citations_stale: false,
             open_citations_soon: false,
+            definition_soon: None,
             picker_focus: cx.focus_handle(),
             picker_scroll: ScrollHandle::new(),
             picker_files_task: None,
@@ -1292,6 +1295,7 @@ impl Workspace {
                     this.forward_search(*line, false, cx);
                 }
             }
+            EditorEvent::GoToDefinition { path, range, line } => this.go_to_definition(path.clone(), range.clone(), *line, cx),
         });
         let observer = cx.observe(&view, |this, view, cx| {
             this.cursor_changed(&view, cx);
@@ -4803,6 +4807,12 @@ impl Workspace {
         let view = self.active_view()?;
         let (_, before, after) = Self::around_cursor(view.read(cx))?;
         snippets::cite_slot(&before, &after)
+    }
+
+    /// Opens the entry or label a Cmd+click named, with its name selected.
+    fn go_to_definition(&mut self, path: PathBuf, range: std::ops::Range<usize>, line: usize, cx: &mut Context<Self>) {
+        self.definition_soon = Some((path, range, line));
+        cx.notify();
     }
 
     /// Cites the chosen entry and keeps the list open for the next key.
@@ -8853,6 +8863,14 @@ impl Render for Workspace {
         }
         if std::mem::take(&mut self.open_citations_soon) {
             cx.defer_in(window, |this, window, cx| this.open_picker(PickerKind::Citations, window, cx));
+        }
+        if let Some((path, range, line)) = self.definition_soon.take() {
+            cx.defer_in(window, move |this, window, cx| {
+                this.open_file(path, window, cx);
+                if let Some(view) = this.active_view() {
+                    view.update(cx, |view, cx| view.select_definition(range, line, window, cx));
+                }
+            });
         }
         for index in 0..self.addon_panels.len() {
             let visible = show_file_panel && self.left_panel == LeftPanel::Addon(index);

@@ -113,6 +113,7 @@ impl Workspace {
             let index = self.citations.clone();
             let texts = &self.citation_texts;
             document.view.update(cx, |view, cx| {
+                view.set_citation_index(index.clone());
                 let Some(path) = view.path.clone() else {
                     return;
                 };
