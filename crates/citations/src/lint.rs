@@ -8,7 +8,7 @@ use std::{collections::HashMap, ops::Range, path::Path};
 use crate::{
     Diagnostic, Severity,
     bib::{self, Part},
-    index::{CitationIndex, IndexedEntry},
+    index::{CitationIndex, Entries, IndexedEntry},
     project::Backend,
     text::fold,
 };
@@ -98,7 +98,7 @@ fn required(kind: &str, biblatex: bool) -> &'static [&'static [&'static str]] {
 
 /// Fields a style prints that an entry lacks, the same work under two keys.
 /// For BibTeX and biber; Typst prints what there is.
-pub(crate) fn entries(index: &CitationIndex, backend: Backend, biblatex: bool, line_of: &dyn Fn(&IndexedEntry) -> String) -> Vec<(std::path::PathBuf, Diagnostic)> {
+pub(crate) fn entries(index: &Entries, backend: Backend, biblatex: bool, line_of: &dyn Fn(&IndexedEntry) -> String) -> Vec<(std::path::PathBuf, Diagnostic)> {
     let mut out = Vec::new();
     if backend == Backend::Typst {
         return out;
