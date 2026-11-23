@@ -22,6 +22,8 @@ pub struct Entry {
     pub key_range: Range<usize>,
     /// From `@` to the closing brace, or to where an unclosed entry stops.
     pub range: Range<usize>,
+    /// The line of the `@`, from 0.
+    pub line: usize,
     pub fields: Vec<Field>,
 }
 
@@ -100,7 +102,7 @@ impl Entry {
 const VERBATIM_FIELDS: &[&str] = &["url", "doi", "eprint", "file", "pdf", "urldate", "verba", "verbb", "verbc", "uri", "urlraw"];
 
 pub fn parse(text: &str) -> Bib {
-    let mut parser = Parser { text, bytes: text.as_bytes(), pos: 0, bib: Bib::default() };
+    let mut parser = Parser { text, bytes: text.as_bytes(), pos: 0, bib: Bib::default(), counted: (0, 0) };
     parser.run();
     parser.bib
 }
@@ -110,6 +112,8 @@ struct Parser<'a> {
     bytes: &'a [u8],
     pos: usize,
     bib: Bib,
+    /// A position and its line, from which the next line is counted on.
+    counted: (usize, usize),
 }
 
 /// How a value ended.
@@ -130,6 +134,14 @@ impl Parser<'_> {
 
     fn peek(&self) -> Option<u8> {
         self.bytes.get(self.pos).copied()
+    }
+
+    /// The line of `at`, counted on from the last one asked, since entries come in order.
+    fn line_of(&mut self, at: usize) -> usize {
+        let (from, line) = self.counted;
+        let line = if at >= from { line + self.bytes[from..at].iter().filter(|byte| **byte == b'\n').count() } else { self.bytes[..at].iter().filter(|byte| **byte == b'\n').count() };
+        self.counted = (at, line);
+        line
     }
 
     fn skip_whitespace(&mut self) {
@@ -304,7 +316,8 @@ impl Parser<'_> {
         if key_range.is_empty() {
             self.error(at..key_start.max(at + 1), format!("This @{kind} has no key."));
         }
-        let mut entry = Entry { kind, key: self.text[key_range.clone()].to_string(), key_range, range: at..at, fields: Vec::new() };
+        let line = self.line_of(at);
+        let mut entry = Entry { kind, key: self.text[key_range.clone()].to_string(), key_range, range: at..at, line, fields: Vec::new() };
         loop {
             self.skip_whitespace();
             let Some(byte) = self.peek() else {
@@ -528,6 +541,7 @@ mod tests {
         assert_eq!(text_of(&bib, "a", "month"), "March");
         assert_eq!(text_of(&bib, "b", "title"), "With (parens)");
         let a = &bib.entries[0];
+        assert_eq!((a.line, bib.entries[1].line, bib.entries[2].line), (3, 10, 11));
         assert_eq!(&text[a.key_range.clone()], "a");
         assert!(text[a.range.clone()].starts_with("@article{a,") && text[a.range.clone()].ends_with("}"));
     }

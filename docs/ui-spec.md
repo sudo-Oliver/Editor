@@ -119,9 +119,19 @@ An add-on with the `lookup_doi` permission draws a dialog over the top of the wi
 
 ## Citation picker
 
-`\cite{` and its relatives open the picker in LaTeX when entries exist. Backspace after a pick does not
-open it again at that place. A pick inserts the key, adds `}` if none follows, and leaves the cursor
-after the brace. An open picker takes the keyboard in every mode.
+`\cite{` and its relatives open the picker in LaTeX when entries exist, and so does a comma in the
+key list, a further group of `\cites{a}{`, and `@` or `#cite(<` in Typst. Backspace after a pick does
+not open it again at that place. Keys the citation already has are left out of the list. A pick
+inserts the key, adds `}` if none follows, and leaves the cursor after the brace; Cmd+Enter inserts
+the key and a comma and keeps the picker open for the next one. Without a query the list shows the
+first 200 entries by author and year, and the header says how many there are.
+
+Beside the list, a panel shows the chosen entry in full: all authors, title in semibold, venue and
+year, DOI or URL, the start of the abstract, the entry type and file:line. It uses the palette, so
+paper mode looks like the editor. The entries come from the citation index, which reads only the
+bibliographies the document declares and rebuilds off the main thread after changes.
+
+An open picker takes the keyboard in every mode.
 
 ## Vim status bar
 
