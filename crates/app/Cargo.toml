@@ -12,6 +12,7 @@ path = "src/main.rs"
 addon_api = { path = "../addon_api" }
 collab = { path = "../collab", optional = true }
 build = { path = "../build" }
+citations = { path = "../citations" }
 editor_core = { path = "../editor_core" }
 git = { path = "../git" }
 pdf = { path = "../pdf" }
