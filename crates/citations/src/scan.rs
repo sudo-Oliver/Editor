@@ -39,6 +39,8 @@ pub struct Key {
 pub struct Label {
     pub name: String,
     pub range: Range<usize>,
+    /// The line of the name, from 0.
+    pub line: usize,
     /// The environment that numbers it, such as `figure` or `equation`, or
     /// the sectioning command before it, such as `section`. Empty if neither.
     pub env: String,
@@ -113,5 +115,19 @@ pub(crate) fn push_keys(into: &mut Vec<Key>, text: &str, offset: usize, command:
             into.push(Key { name: trimmed.to_string(), range: at..at + trimmed.len(), command: command.to_string() });
         }
         start += piece.len() + 1;
+    }
+}
+
+/// Sets the line of every label, in one pass over `text`.
+pub(crate) fn number_lines(text: &str, labels: &mut [Label]) {
+    let bytes = text.as_bytes();
+    let (mut at, mut line) = (0, 0);
+    let mut order: Vec<usize> = (0..labels.len()).collect();
+    order.sort_by_key(|index| labels[*index].range.start);
+    for index in order {
+        let start = labels[index].range.start.min(bytes.len());
+        line += bytes[at.min(start)..start].iter().filter(|byte| **byte == b'\n').count();
+        at = at.max(start);
+        labels[index].line = line;
     }
 }

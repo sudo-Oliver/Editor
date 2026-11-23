@@ -10,7 +10,7 @@ use std::{
 
 use build::Loaded;
 use editor_core::{
-    Decoration, DecorationKind, EditorState, HighlightKind, Language, LineChange, Mark, MarkSeverity, Motion, Selection, Symbol,
+    Decoration, DecorationKind, EditorState, HighlightKind, Language, LineChange, Mark, MarkSeverity, MarkSource, Motion, Selection, Symbol,
     SymbolKind, TextChange,
     conflicts::{Choice, Conflict, conflicts},
     line_diff::{HunkKind, LineHunk, line_diff},
@@ -658,23 +658,30 @@ impl EditorView {
         cx.notify();
     }
 
-    /// Replaces the editor's own marks. Compiler marks stay.
-    pub fn set_hint_marks(&mut self, hints: Vec<Mark>, cx: &mut Context<Self>) {
-        // Hints come first, so that a compiler error on the same text draws on top.
-        let mut marks = hints;
-        marks.extend(self.state.marks().iter().filter(|mark| mark.severity != MarkSeverity::Hint).cloned());
-        self.set_marks(marks, cx);
+    /// Replaces the marks of `source`. The others stay.
+    pub fn set_own_marks(&mut self, source: MarkSource, own: Vec<Mark>, cx: &mut Context<Self>) {
+        // The editor's own come first, so that a compiler error on the same text draws on top.
+        let others = self.state.marks().iter().filter(|mark| mark.source != source).cloned();
+        let (compiler, editor): (Vec<Mark>, Vec<Mark>) = others.partition(|mark| mark.source == MarkSource::Compiler);
+        self.set_marks(editor.into_iter().chain(own).chain(compiler).collect(), cx);
     }
 
-    /// The message of an editor mark on the line of the cursor.
-    pub fn hint_at_cursor(&self) -> Option<String> {
+    /// The mark of `source` on the line of the cursor: the one under the
+    /// cursor first, then the most severe.
+    pub fn mark_at_cursor(&self, source: MarkSource) -> Option<&Mark> {
         let buffer = self.state.buffer();
-        let line = buffer.offset_to_line(self.state.selections().primary().head);
+        let head = self.state.selections().primary().head;
+        let line = buffer.offset_to_line(head);
         self.state
             .marks()
             .iter()
-            .find(|mark| mark.severity == MarkSeverity::Hint && buffer.offset_to_line(mark.range.start) == line)
-            .map(|mark| mark.message.clone())
+            .filter(|mark| mark.source == source && buffer.offset_to_line(mark.range.start) == line)
+            .min_by_key(|mark| (!(mark.range.start <= head && head <= mark.range.end), mark.severity as u8))
+    }
+
+    /// The message of a package hint on the line of the cursor.
+    pub fn hint_at_cursor(&self) -> Option<String> {
+        self.mark_at_cursor(MarkSource::Packages).map(|mark| mark.message.clone())
     }
 
     pub fn set_auto_suggestions(&mut self, enabled: bool, cx: &mut Context<Self>) {

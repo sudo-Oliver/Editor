@@ -16,7 +16,7 @@ use build::{BuildEvent, BuildManager, BuildOutcome, BuildRequest, Config, Diagno
 use addon_api::{ActiveFile, DiagnosticInfo, Reply, Request, SearchHit};
 use editor_core::{
     Selection, Symbol, SymbolKind,
-    Language, Mark, MarkSeverity,
+    Language, Mark, MarkSeverity, MarkSource,
     snippet::Snippet,
     vim::{self, Effect, Key, Leader, Mode},
     vim_map::{self, Mapper, Mappings, Step},
@@ -2541,9 +2541,9 @@ impl Workspace {
                 let marks = hints
                     .iter()
                     .filter(|hint| view.path.as_deref() == Some(hint.path.as_path()))
-                    .map(|hint| Mark { range: hint.range.clone(), severity: MarkSeverity::Hint, message: hint.message.clone() })
+                    .map(|hint| Mark { range: hint.range.clone(), severity: MarkSeverity::Hint, message: hint.message.clone(), source: MarkSource::Packages })
                     .collect();
-                view.set_hint_marks(marks, cx);
+                view.set_own_marks(MarkSource::Packages, marks, cx);
             });
         }
         self.package_hints = hints;
@@ -2684,7 +2684,7 @@ impl Workspace {
                 let buffer = view.state.buffer();
                 let shown = if errors > MAX_ERRORS_MARKED { 1 } else { self.diagnostics.len() };
                 // The editor's own marks follow edits and get replaced by the next check.
-                let hints: Vec<Mark> = view.state.marks().iter().filter(|mark| mark.severity == MarkSeverity::Hint).cloned().collect();
+                let hints: Vec<Mark> = view.state.marks().iter().filter(|mark| mark.source != MarkSource::Compiler).cloned().collect();
                 let compiler_marks: Vec<Mark> = self
                     .diagnostics
                     .iter()
@@ -2721,6 +2721,7 @@ impl Workspace {
                                 Severity::Warning => MarkSeverity::Warning,
                             },
                             message: diagnostic.message.clone(),
+                            source: MarkSource::Compiler,
                         })
                     })
                     .collect();
@@ -6606,6 +6607,7 @@ impl Workspace {
             )
             .children(self.render_conflict_strip(cx))
             .when_some(self.cursor_hint(cx).cloned(), |element, hint| element.child(self.render_hint_strip(&hint, cx)))
+            .when(self.cursor_hint(cx).is_none(), |element| element.children(self.render_citation_strip(cx)))
             .when(self.error_count() > 0, |element| element.child(self.render_error_strip(cx)))
     }
 
@@ -6625,6 +6627,32 @@ impl Workspace {
             .on_click(cx.listener(move |this, _, _, cx| this.apply_fix(&fix, Some(&path), cx)))
             .child(div().flex_1().min_w_0().truncate().child(hint.message.clone()))
             .child(div().flex_none().font_weight(FontWeight::SEMIBOLD).child(hint.fix.label()))
+    }
+
+    /// What the citation mark at the cursor means, below the editor.
+    fn render_citation_strip(&self, cx: &App) -> Option<impl IntoElement> {
+        let view = self.active_view()?;
+        let view = view.read(cx);
+        let mark = view.mark_at_cursor(MarkSource::Citations)?;
+        let palette = theme::palette();
+        let color = match mark.severity {
+            MarkSeverity::Error => palette.error,
+            MarkSeverity::Warning => palette.warning,
+            MarkSeverity::Hint => palette.ui_muted,
+        };
+        Some(
+            div()
+                .id("citation-strip")
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(8.))
+                .h(px(28.))
+                .px(px(10.))
+                .bg(theme::color(palette.divider))
+                .child(div().flex_none().w(px(3.)).h(px(14.)).rounded(px(1.5)).bg(theme::color(color)))
+                .child(div().flex_1().min_w_0().truncate().child(mark.message.clone())),
+        )
     }
 
     /// Stays below the editor, so the error is visible while fixing it.
