@@ -15,9 +15,6 @@ use pdf::PageContent;
 
 use crate::pdf_text;
 
-/// Commands whose braces hold labels to point to.
-const REF_COMMANDS: &[&str] =
-    &["ref", "eqref", "pageref", "autoref", "Autoref", "cref", "Cref", "cpageref", "Cpageref", "vref", "Vref", "nameref", "Nameref", "labelcref", "subref"];
 /// Characters of the PDF shown on each side of a hit.
 const HIT_CONTEXT: usize = 40;
 
@@ -40,17 +37,16 @@ pub fn references(files: &[(String, String)], bib_keys: &[String]) -> ReferenceR
     let mut cites: Vec<(String, SourcePlace)> = Vec::new();
     let mut ats: Vec<(String, SourcePlace)> = Vec::new();
     let mut cites_everything = false;
+    let mut duplicates = Vec::new();
     for (path, text) in files {
-        let found = match Language::from_path(std::path::Path::new(path)) {
-            Language::Latex => latex_names(text),
-            Language::Typst => typst_names(text),
-            _ => continue,
-        };
+        let found = names(Language::from_path(std::path::Path::new(path)), text);
         for (kind, name, line) in found {
             let place = SourcePlace { path: path.clone(), line };
             match kind {
+                // A second definition is a mistake that LaTeX only warns about.
+                Use::Label if labels.contains_key(&name) => duplicates.push(MissingName { name, path: place.path, line }),
                 Use::Label => {
-                    labels.entry(name.clone()).or_insert(LabelInfo { name, path: place.path, line, uses: Vec::new() });
+                    labels.insert(name.clone(), LabelInfo { name, path: place.path, line, uses: Vec::new() });
                 }
                 Use::Ref => refs.push((name, place)),
                 Use::Cite if name == "*" => cites_everything = true,
@@ -67,7 +63,7 @@ pub fn references(files: &[(String, String)], bib_keys: &[String]) -> ReferenceR
             cites.push((name, place));
         }
     }
-    let mut report = ReferenceReport::default();
+    let mut report = ReferenceReport { duplicate_labels: duplicates, ..ReferenceReport::default() };
     for (name, place) in refs {
         match labels.get_mut(&name) {
             Some(label) => label.uses.push(place),
@@ -95,96 +91,24 @@ pub fn references(files: &[(String, String)], bib_keys: &[String]) -> ReferenceR
     report
 }
 
-/// `\label`, the `\ref` kin and every `\…cite…` command, with their lines from 1.
-fn latex_names(text: &str) -> Vec<(Use, String, usize)> {
-    let mut found = Vec::new();
-    for (index, line) in text.lines().enumerate() {
-        let line = strip_latex_comment(line);
-        let mut rest = line;
-        while let Some(slash) = rest.find('\\') {
-            rest = &rest[slash + 1..];
-            let name_end = rest.find(|ch: char| !ch.is_ascii_alphabetic()).unwrap_or(rest.len());
-            let name = &rest[..name_end];
-            let kind = if name == "label" {
-                Use::Label
-            } else if REF_COMMANDS.contains(&name) {
-                Use::Ref
-            } else if name.to_ascii_lowercase().contains("cite") {
-                Use::Cite
-            } else {
-                // `\\` and `\%` name no command, so the second sign is skipped too.
-                let skip = if name_end > 0 { name_end } else { rest.chars().next().map_or(0, char::len_utf8) };
-                rest = &rest[skip..];
-                continue;
-            };
-            rest = &rest[name_end..];
-            let Some((argument, after)) = braced_argument(rest) else {
-                continue;
-            };
-            rest = after;
-            for name in argument.split(',').map(str::trim).filter(|name| !name.is_empty()) {
-                found.push((kind, name.to_string(), index + 1));
-            }
-        }
-    }
-    found
-}
-
-/// The text before a `%` that no backslash escapes.
-fn strip_latex_comment(line: &str) -> &str {
-    let mut backslashes = 0;
-    for (index, ch) in line.char_indices() {
-        match ch {
-            '%' if backslashes % 2 == 0 => return &line[..index],
-            '\\' => backslashes += 1,
-            _ => backslashes = 0,
-        }
-    }
-    line
-}
-
-/// After a command name: a star, up to two optional arguments in brackets,
-/// then the first argument in braces and the text after it.
-fn braced_argument(text: &str) -> Option<(&str, &str)> {
-    let mut rest = text.strip_prefix('*').unwrap_or(text).trim_start();
-    for _ in 0..2 {
-        if let Some(inner) = rest.strip_prefix('[') {
-            rest = inner[inner.find(']')? + 1..].trim_start();
-        }
-    }
-    let inner = rest.strip_prefix('{')?;
-    let close = inner.find('}')?;
-    Some((&inner[..close], &inner[close + 1..]))
-}
-
-/// `<label>` and `@name` in Typst, outside of comments.
-fn typst_names(text: &str) -> Vec<(Use, String, usize)> {
-    let is_name = |ch: char| ch.is_alphanumeric() || matches!(ch, '_' | '-' | ':' | '.');
-    let mut found = Vec::new();
-    for (index, line) in text.lines().enumerate() {
-        let line = line.find("//").map_or(line, |comment| &line[..comment]);
-        let chars: Vec<(usize, char)> = line.char_indices().collect();
-        for (position, &(at, ch)) in chars.iter().enumerate() {
-            let before = position.checked_sub(1).map(|previous| chars[previous].1);
-            match ch {
-                '<' => {
-                    let rest = &line[at + 1..];
-                    let end = rest.find(|ch: char| !is_name(ch)).unwrap_or(rest.len());
-                    if end > 0 && rest[end..].starts_with('>') && rest.starts_with(char::is_alphabetic) {
-                        found.push((Use::Label, rest[..end].to_string(), index + 1));
-                    }
-                }
-                // `a@b` is a mail address.
-                '@' if !before.is_some_and(char::is_alphanumeric) => {
-                    let rest = &line[at + 1..];
-                    let name = rest[..rest.find(|ch: char| !is_name(ch)).unwrap_or(rest.len())].trim_end_matches(['.', ':']);
-                    if !name.is_empty() {
-                        found.push((Use::At, name.to_string(), index + 1));
-                    }
-                }
-                _ => {}
-            }
-        }
+/// Labels, references and citations of a source, with their lines from 1,
+/// as the citation index reads them: comments, verbatim and raw text hide
+/// them, and lists and multicites count each key.
+fn names(language: Language, text: &str) -> Vec<(Use, String, usize)> {
+    let scan = match language {
+        Language::Latex => citations::tex::scan(text),
+        Language::Typst => citations::typst::scan(text),
+        _ => return Vec::new(),
+    };
+    let newlines: Vec<usize> = text.match_indices('\n').map(|(at, _)| at).collect();
+    let line = |offset: usize| newlines.partition_point(|newline| *newline < offset) + 1;
+    let mut found: Vec<(Use, String, usize)> = Vec::new();
+    found.extend(scan.labels.iter().map(|label| (Use::Label, label.name.clone(), label.line + 1)));
+    found.extend(scan.refs.iter().map(|key| (Use::Ref, key.name.clone(), line(key.range.start))));
+    found.extend(scan.cites.iter().map(|key| (Use::Cite, key.name.clone(), line(key.range.start))));
+    found.extend(scan.either.iter().map(|key| (Use::At, key.name.clone(), line(key.range.start))));
+    if scan.cite_all {
+        found.push((Use::Cite, "*".to_string(), 1));
     }
     found
 }
@@ -299,6 +223,9 @@ mod tests {
         assert_eq!(keys, [("knuth84", true), ("lamport94", true), ("nobody", false)]);
         assert_eq!(report.undefined_citations[0].name, "nobody");
         assert_eq!(report.unused_entries, ["unread"]);
+        assert!(report.duplicate_labels.is_empty());
+        let twice = vec![("a.tex".to_string(), "\\label{x}".to_string()), ("b.tex".to_string(), "\n\\label{x}".to_string())];
+        assert_eq!(references(&twice, &[]).duplicate_labels, [MissingName { name: "x".into(), path: "b.tex".into(), line: 2 }]);
     }
 
     #[test]

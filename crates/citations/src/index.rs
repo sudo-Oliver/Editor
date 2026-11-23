@@ -14,13 +14,13 @@ use std::{
 };
 
 use crate::{
-    Diagnostic, Severity, aux,
+    Diagnostic, Severity, aux, lint,
     bib::{self, Bib, Part},
     fuzzy, hayagriva,
     project::{self, Backend, Env, Language, Project},
     scan::{Key, Label, Scan},
     tex,
-    text::{authors, clean, fold, fold_into, full_authors, line_col},
+    text::{authors, clean, fold, fold_into, full_authors},
     typst,
 };
 
@@ -247,6 +247,8 @@ pub struct CitationIndex {
     pub diagnostics: HashMap<PathBuf, Vec<Diagnostic>>,
     /// Every entry counts as cited, through `\nocite{*}`.
     pub cite_all: bool,
+    /// Every declared bibliography was read, so a key that is not here is wrong.
+    pub bibs_complete: bool,
 }
 
 /// Field weights: a hit in the key counts most, in the venue least.
@@ -282,7 +284,11 @@ pub fn build(cache: &mut Cache, inputs: &Inputs) -> CitationIndex {
         let mut env = Env { root: inputs.root, scan: &mut scan, exists: &exists, system_bib: inputs.system_bib };
         project::build(main.as_deref(), &extra, &mut env)
     };
-    let mut index = CitationIndex { cite_all: project.sources.iter().any(|source| source.scan.cite_all), ..CitationIndex::default() };
+    let mut index = CitationIndex {
+        cite_all: project.sources.iter().any(|source| source.scan.cite_all),
+        bibs_complete: project.bibliographies.iter().all(|bibliography| bibliography.path.is_some()),
+        ..CitationIndex::default()
+    };
 
     // The bibliographies, in the order BibTeX reads them, since an
     // `@string` of one is known in the ones after it.
@@ -314,11 +320,19 @@ pub fn build(cache: &mut Cache, inputs: &Inputs) -> CitationIndex {
         index.bib_files.push((shared.clone(), file.latin1));
         let diagnostics = index.diagnostics.entry(path.clone()).or_default();
         diagnostics.extend(file.bib.diagnostics.iter().cloned());
+        if file.latin1 && project.backend == Backend::Biber {
+            diagnostics.push(Diagnostic {
+                range: 0..0,
+                severity: Severity::Warning,
+                message: "This file is not UTF-8, which biber expects, so its accents come out wrong. Save it as UTF-8.".into(),
+            });
+        }
         let mut strings = file.bib.strings.iter().peekable();
         for entry in &file.bib.entries {
             while let Some(string) = strings.next_if(|string| string.range.start < entry.range.start) {
                 define(string, &mut macros, diagnostics);
             }
+            lint::entry_text(entry, project.backend, project.biblatex, diagnostics);
             let mut fields = Vec::with_capacity(entry.fields.len());
             for field in &entry.fields {
                 let mut unknown = Vec::new();
@@ -352,9 +366,12 @@ pub fn build(cache: &mut Cache, inputs: &Inputs) -> CitationIndex {
         index.by_key.entry(entry.key.clone()).or_default().push(position as u32);
         index.by_folded_key.entry(entry.key.to_lowercase()).or_default().push(position as u32);
     }
-    duplicate_keys(&mut index, open);
+    duplicate_keys(&mut index);
     inherit(&mut index);
     describe(&mut index);
+    for (path, diagnostic) in lint::entries(&index, project.backend, project.biblatex, &place) {
+        index.diagnostics.entry(path).or_default().push(diagnostic);
+    }
     letters(&mut index, cache, open, project.main.as_deref());
     search_text(&mut index);
     labels(&mut index, &project, cache, open);
@@ -378,26 +395,21 @@ fn unknown_macros(unknown: &[&Part], diagnostics: &mut Vec<Diagnostic>) {
     }
 }
 
-/// Where a file's line is, for messages that point to another place.
-fn place(path: &Path, offset: usize, open: &HashMap<PathBuf, Arc<str>>) -> String {
-    let name = path.file_name().map_or_else(String::new, |name| name.to_string_lossy().into_owned());
-    let line = open.get(path).map(|text| line_col(text, offset).0 + 1).or_else(|| std::fs::read(path).ok().map(|bytes| line_col(&decode(bytes).0, offset).0 + 1));
-    match line {
-        Some(line) => format!("{name}:{line}"),
-        None => name,
-    }
+/// `refs.bib:12`, for messages that point to another entry.
+fn place(entry: &IndexedEntry) -> String {
+    format!("{}:{}", entry.path.file_name().map_or_else(String::new, |name| name.to_string_lossy().into_owned()), entry.line + 1)
 }
 
-fn duplicate_keys(index: &mut CitationIndex, open: &HashMap<PathBuf, Arc<str>>) {
+fn duplicate_keys(index: &mut CitationIndex) {
     let mut found: Vec<(PathBuf, Diagnostic)> = Vec::new();
     for positions in index.by_folded_key.values().filter(|positions| positions.len() > 1) {
         let first = &index.entries[positions[0] as usize];
         for position in &positions[1..] {
             let entry = &index.entries[*position as usize];
             let (severity, message) = if entry.key == first.key {
-                (Severity::Error, format!("The key {} is already defined at {}.", entry.key, place(&first.path, first.key_range.start, open)))
+                (Severity::Error, format!("The key {} is already defined at {}.", entry.key, place(first)))
             } else {
-                (Severity::Warning, format!("The key {} differs from {} at {} only in case, which BibTeX takes for the same key.", entry.key, first.key, place(&first.path, first.key_range.start, open)))
+                (Severity::Warning, format!("The key {} differs from {} at {} only in case, which BibTeX takes for the same key.", entry.key, first.key, place(first)))
             };
             found.push((entry.path.to_path_buf(), Diagnostic { range: entry.key_range.clone(), severity, message }));
         }
@@ -850,7 +862,13 @@ mod tests {
         let main = std::fs::read_to_string(project.path("main.tex")).unwrap();
         assert_eq!(&main[index.diagnostics(&project.path("main.tex"))[0].range.clone()], "gone");
         // The system file cannot be read here, so its macro is unknown.
-        assert_eq!(messages(&index, &project.path("refs.bib")), ["No @string defines ieee_j_x, so its text is missing."]);
+        assert_eq!(
+            messages(&index, &project.path("refs.bib")),
+            ["No @string defines ieee_j_x, so its text is missing.", "This @article has no author, title, journal and year, which the bibliography prints. BibTeX warns and leaves it out."]
+        );
+        // A missing bibliography could hold any key, so none is called unknown.
+        assert!(!index.bibs_complete);
+        assert_eq!(crate::lint::source(&index, &project.path("main.tex")).len(), 1);
     }
 
     #[test]
@@ -976,6 +994,34 @@ mod tests {
         let biblatex = "\\entry{one}{article}{}\n  \\field{extradate}{2}\n\\endentry\n\\entry{two}{article}{}\n\\endentry";
         let letters = bbl_letters(biblatex);
         assert_eq!((letters["one"], letters["two"]), (Some('b'), None));
+    }
+
+    #[test]
+    fn sources_learn_what_is_missing_twice_or_misplaced() {
+        let project = Project::new(&[
+            ("main.tex", "\\documentclass{article}\n\\usepackage{xr}\n\\bibliography{refs}\n\\input{two}\n\\cite{known, typo2024, Known}\n\\ref{sec:a} \\ref{nowhere}\n\\section{A}\\label{sec:a}\n\\begin{figure}\\label{fig:early}\\caption{C}\\end{figure}\n"),
+            ("two.tex", "\\section{B}\\label{sec:a}\n"),
+            ("refs.bib", "@misc{known, title = {K}}\n@article{dup1, author = {A}, title = {Attention Is All You Need}, journal = {J}, year = 2017, doi = {10.1/X}}\n@article{dup2, author = {A}, title = {Attention is all you need}, journal = {J}, year = 2017}\n"),
+        ]);
+        let mut cache = Cache::default();
+        let index = project.index(&mut cache, Some("main.tex"), None, &HashMap::new());
+        let main = std::fs::read_to_string(project.path("main.tex")).unwrap();
+        let found: Vec<(String, Severity)> = crate::lint::source(&index, &project.path("main.tex")).into_iter().map(|diagnostic| (main[diagnostic.range].to_string(), diagnostic.severity)).collect();
+        assert_eq!(
+            found,
+            [
+                ("typo2024".to_string(), Severity::Error),
+                ("Known".to_string(), Severity::Error),
+                ("nowhere".to_string(), Severity::Warning),
+                ("sec:a".to_string(), Severity::Error),
+                ("fig:early".to_string(), Severity::Warning),
+            ]
+        );
+        let two = crate::lint::source(&index, &project.path("two.tex"));
+        assert_eq!(two.len(), 1);
+        assert!(two[0].message.ends_with("Also at main.tex:7."), "{}", two[0].message);
+        let hints: Vec<String> = messages(&index, &project.path("refs.bib"));
+        assert!(hints.iter().any(|message| message == "Same title and year as dup1 at refs.bib:2: the same work under two keys?"), "{hints:?}");
     }
 
     /// A large bibliography, as it grows over a career, searched as one types.

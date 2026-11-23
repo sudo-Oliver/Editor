@@ -23,12 +23,25 @@ pub enum MarkSeverity {
     Hint,
 }
 
+/// Who put a mark there, so that each replaces only its own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MarkSource {
+    /// The last build's log.
+    #[default]
+    Compiler,
+    /// Advice about packages.
+    Packages,
+    /// Keys, labels and bibliographies, checked as one types.
+    Citations,
+}
+
 /// A diagnostic range that follows edits.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Mark {
     pub range: Range<usize>,
     pub severity: MarkSeverity,
     pub message: String,
+    pub source: MarkSource,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1629,6 +1642,7 @@ mod tests {
             range: 6..11,
             severity: MarkSeverity::Error,
             message: "bad".into(),
+            source: MarkSource::Compiler,
         }]);
         state.insert("xx");
         assert_eq!(state.marks()[0].range, 8..13);

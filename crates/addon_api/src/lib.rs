@@ -912,6 +912,9 @@ pub struct ReferenceReport {
     pub unused_labels: Vec<String>,
     /// Bibliography keys that no document cites. Empty after `\nocite{*}`.
     pub unused_entries: Vec<String>,
+    /// Second and later definitions of a label, which LaTeX only warns about.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub duplicate_labels: Vec<MissingName>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]

@@ -10,6 +10,7 @@ pub mod bib;
 pub mod fuzzy;
 pub mod hayagriva;
 pub mod index;
+pub mod lint;
 pub mod project;
 pub mod scan;
 pub mod tex;

@@ -10,7 +10,9 @@ pub fn scan(text: &str) -> Scan {
     let mut scanner = Scanner { text, bytes: text.as_bytes(), pos: 0, scan: Scan::default(), calls: Vec::new(), last: None, heading: None };
     scanner.heading_at_line_start();
     scanner.markup(None);
-    scanner.scan
+    let mut scan = scanner.scan;
+    crate::scan::number_lines(text, &mut scan.labels);
+    scan
 }
 
 /// What a label right after it belongs to.
@@ -180,7 +182,7 @@ impl Scanner<'_> {
             (_, Some((_, title))) => ("heading", Some(title.clone())),
             _ => ("", None),
         };
-        self.scan.labels.push(Label { name: self.text[run.clone()].to_string(), range: run, env: env.to_string(), caption, before_caption: false });
+        self.scan.labels.push(Label { name: self.text[run.clone()].to_string(), range: run, line: 0, env: env.to_string(), caption, before_caption: false });
     }
 
     fn reference(&mut self) {
