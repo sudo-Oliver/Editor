@@ -79,6 +79,16 @@ lowercase and encodings the backend reads badly are muted hints. No key is calle
 declared bibliography is missing or on the web. These marks follow edits, add to neither the error
 count nor the badge, and the strip below the editor says what the one at the cursor means.
 
+## Hover and jump for keys and labels
+
+Resting the pointer on a cited key or a referenced label shows a card below it in the style of the
+suggestion popup: for an entry all authors, the title in semibold, venue and year, DOI, type, key
+and file:line; for a label its kind, number and page from the last build, caption and file:line,
+and how often it is defined if more than once. A name the document does not define shows no card,
+since its mark explains it. Moving away, scrolling, typing or clicking hides the card. Cmd+click on
+a key or label, or F12 with the cursor on one, opens the file that defines it with the name
+selected; Cmd+click elsewhere still adds a cursor.
+
 ## File tree header
 
 Clicking the header folds the tree, and the outline takes its space. To the right sit four 22 px

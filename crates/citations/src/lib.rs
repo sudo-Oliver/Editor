@@ -11,6 +11,7 @@ pub mod fuzzy;
 pub mod hayagriva;
 pub mod index;
 pub mod lint;
+pub mod lookup;
 pub mod project;
 pub mod scan;
 pub mod tex;
