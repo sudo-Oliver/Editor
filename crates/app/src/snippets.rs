@@ -237,13 +237,6 @@ pub fn citation(language: Language, key: &str) -> String {
     if language == Language::Typst { format!("@{key}") } else { format!("\\cite{{{key}}}") }
 }
 
-/// A citation key for the braces of a `\cite{` at the cursor. Adds the closing
-/// brace only when the text after the cursor does not have it.
-pub fn citation_key(key: &str, closing: bool) -> String {
-    let key = literal(key);
-    if closing { format!("{key}}}") } else { key }
-}
-
 /// Whether `before`, the text before the cursor, ends in the opening brace of a
 /// LaTeX citation command such as `\cite{`, `\autocite[p. 3]{` or `\citep*{`.
 pub fn opens_citation(before: &str) -> bool {
@@ -266,10 +259,96 @@ pub fn opens_citation(before: &str) -> bool {
     head.ends_with('\\') && name.to_ascii_lowercase().contains("cite")
 }
 
+/// Where a key goes at the cursor, inside the braces of a LaTeX citation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CiteSlot {
+    /// The keys already in these braces, which the picker leaves out.
+    pub cited: Vec<String>,
+    /// The braces are still open, so the key brings the `}`.
+    pub close: bool,
+    /// A key follows the cursor, so a comma goes between them.
+    pub before_key: bool,
+}
+
+/// The slot for a key when the cursor is where one starts in a citation:
+/// right after `\cite{` and its kind, after a comma in the list, or in a
+/// further group of `\cites{a}{`. `before` and `after` are the text of the
+/// line on either side of the cursor.
+pub fn cite_slot(before: &str, after: &str) -> Option<CiteSlot> {
+    let open = unclosed_brace(before)?;
+    let inside = &before[open + 1..];
+    if !(inside.trim().is_empty() || inside.trim_end().ends_with(',')) {
+        return None;
+    }
+    if !opens_citation(&before[..open + 1]) && !continues_multicite(&before[..open]) {
+        return None;
+    }
+    let end = after.find(['}', '{']).filter(|at| after.as_bytes()[*at] == b'}');
+    let rest = &after[..end.unwrap_or(after.len())];
+    let cited = inside.split(',').chain(rest.split(',')).map(str::trim).filter(|key| !key.is_empty()).map(str::to_string).collect();
+    Some(CiteSlot { cited, close: end.is_none(), before_key: rest.trim_start().chars().next().is_some_and(|ch| ch != ',') })
+}
+
+/// Where the last `{` that is still open stands, not counting `\{`.
+fn unclosed_brace(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    for index in (0..bytes.len()).rev() {
+        let escaped = bytes[..index].iter().rev().take_while(|byte| **byte == b'\\').count() % 2 == 1;
+        match bytes[index] {
+            b'}' if !escaped => depth += 1,
+            b'{' if !escaped && depth == 0 => return Some(index),
+            b'{' if !escaped => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether `text`, up to a `{`, is a multicite command with groups before
+/// it, as in `\autocites(see)()[p. 2]{a}[3]`.
+fn continues_multicite(text: &str) -> bool {
+    let mut rest = text.trim_end();
+    let mut groups = 0;
+    loop {
+        let (open, close) = match rest.as_bytes().last() {
+            Some(b'}') => (b'{', b'}'),
+            Some(b']') => (b'[', b']'),
+            Some(b')') => (b'(', b')'),
+            _ => break,
+        };
+        let mut depth = 0usize;
+        let Some(start) = rest.bytes().enumerate().rev().find_map(|(index, byte)| {
+            if byte == close {
+                depth += 1;
+            } else if byte == open {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            None
+        }) else {
+            return false;
+        };
+        groups += usize::from(close == b'}');
+        rest = rest[..start].trim_end();
+    }
+    let rest = rest.strip_suffix('*').unwrap_or(rest);
+    let name_length = rest.chars().rev().take_while(char::is_ascii_alphabetic).count();
+    let (head, name) = rest.split_at(rest.len() - name_length);
+    groups > 0 && head.ends_with('\\') && name.len() > 4 && name.to_ascii_lowercase().ends_with("cites")
+}
+
 /// Whether `before` ends in the `@` of a Typst reference or citation, not in
-/// a mail address or a comment.
+/// a mail address or a comment, or in `#cite(<`.
 pub fn opens_reference(before: &str) -> bool {
-    before.strip_suffix('@').is_some_and(|rest| !rest.ends_with(char::is_alphanumeric) && !rest.contains("//"))
+    before.strip_suffix('@').is_some_and(|rest| !rest.ends_with(char::is_alphanumeric) && !rest.contains("//")) || opens_typst_cite(before)
+}
+
+/// Whether `before` ends in the `<` of `cite(<`, where the key needs its `>`.
+pub fn opens_typst_cite(before: &str) -> bool {
+    before.ends_with("cite(<") && !before.contains("//")
 }
 
 /// Whether a figure in `language` can show this file.
@@ -323,8 +402,6 @@ mod tests {
     #[test]
     fn citations_follow_the_language() {
         assert_eq!(citation(Language::Latex, "a"), "\\cite{a}");
-        assert_eq!(citation_key("a", true), "a}");
-        assert_eq!(citation_key("a", false), "a");
         assert_eq!(citation(Language::Typst, "a"), "@a");
     }
 
@@ -391,6 +468,21 @@ mod tests {
         assert!(!opens_reference("mail me@"));
         assert!(!opens_reference("// see @"));
         assert!(!opens_reference("see @fig"));
+    }
+
+    #[test]
+    fn keys_go_after_the_brace_a_comma_or_into_the_next_group() {
+        let slot = |before: &str, after: &str| cite_slot(before, after);
+        assert_eq!(slot("\\cite{", ""), Some(CiteSlot { cited: vec![], close: true, before_key: false }));
+        assert_eq!(slot("\\cite{", "}"), Some(CiteSlot { cited: vec![], close: false, before_key: false }));
+        assert_eq!(slot("see \\citep[p. 3]{smith2020, ", "} and"), Some(CiteSlot { cited: vec!["smith2020".into()], close: false, before_key: false }));
+        assert_eq!(slot("\\cite{a,", "b, c} x"), Some(CiteSlot { cited: vec!["a".into(), "b".into(), "c".into()], close: false, before_key: true }));
+        assert_eq!(slot("\\autocites(see)()[p. 2]{a}[3]{", ""), Some(CiteSlot { cited: vec![], close: true, before_key: false }));
+        assert!(slot("\\cites{a}{", "}").is_some());
+        for before in ["\\cite{smi", "\\section{", "\\cite{a} {", "\\textbf{", "\\cite{a}{", "\\ref{x,"] {
+            assert_eq!(slot(before, ""), None, "{before}");
+        }
+        assert!(opens_reference("#cite(<") && opens_typst_cite("x #cite(<"));
     }
 
     #[test]

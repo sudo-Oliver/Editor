@@ -1,6 +1,8 @@
 //! What the suggestion popup offers at the cursor. Everything comes from fixed
 //! lists and the parse trees of the open documents, so it works offline.
 
+use std::collections::HashMap;
+
 use build::Loaded;
 use editor_core::{Language, Symbol, SymbolKind, snippet::literal};
 
@@ -28,6 +30,16 @@ pub enum TriggerKind {
 pub struct Trigger {
     pub kind: TriggerKind,
     pub start: usize,
+    /// The prefix of the labels this command usually takes, such as `eq:` for `\eqref`.
+    pub prefer: Option<&'static str>,
+}
+
+/// What the citation index knows about labels: their kind, number and
+/// caption, and which ones the command at the cursor usually takes.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LabelHints<'a> {
+    pub details: Option<&'a HashMap<String, String>>,
+    pub prefer: Option<&'a str>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,21 +77,57 @@ fn latex_trigger(before: &str) -> Option<Trigger> {
     let name = before.trim_end_matches(|ch: char| ch.is_ascii_alphabetic());
     if let Some(rest) = name.strip_suffix('\\') {
         let escaped = !(rest.len() - rest.trim_end_matches('\\').len()).is_multiple_of(2);
-        return (!escaped).then_some(Trigger { kind: TriggerKind::Command, start: rest.len() });
+        return (!escaped).then_some(Trigger { kind: TriggerKind::Command, start: rest.len(), prefer: None });
     }
     let key = before.trim_end_matches(|ch: char| ch.is_alphanumeric() || matches!(ch, ':' | '_' | '-' | '.' | '*'));
-    let command = key.strip_suffix('{')?;
-    let kind = if command.ends_with("\\begin") {
+    // Right after the brace, or after a comma in `\cref{a, `.
+    let command = match key.strip_suffix('{') {
+        Some(command) => command,
+        None => {
+            let list = key.trim_end().strip_suffix(',')?;
+            let open = list.rfind('{')?;
+            if list[open..].contains(['}', '\\']) {
+                return None;
+            }
+            &list[..open]
+        }
+    };
+    let command = strip_options(command);
+    // The second label of `\crefrange{a}{`.
+    let (command, second) = match command.strip_suffix('}') {
+        Some(inner) => (&inner[..inner.rfind('{')?], true),
+        None => (command, false),
+    };
+    let command = command.strip_suffix('*').unwrap_or(command);
+    let name = &command[command.trim_end_matches(|ch: char| ch.is_ascii_alphabetic()).len()..];
+    if !command[..command.len() - name.len()].ends_with('\\') {
+        return None;
+    }
+    if second && !name.ends_with("range") {
+        return None;
+    }
+    let lists = key.ends_with('{') || matches!(name, "cref" | "Cref" | "cpageref" | "Cpageref" | "labelcref" | "zcref" | "zcpageref");
+    let kind = if name == "begin" && key.ends_with('{') {
         TriggerKind::Environment
-    } else if ["\\ref", "\\eqref", "\\autoref", "\\cref", "\\Cref", "\\vref", "\\pageref", "\\nameref"]
-        .iter()
-        .any(|name| command.ends_with(name))
-    {
+    } else if citations::tex::is_ref(name) && lists {
         TriggerKind::Label
     } else {
         return None;
     };
-    Some(Trigger { kind, start: key.len() })
+    let prefer = matches!(name, "eqref").then_some("eq:");
+    Some(Trigger { kind, start: key.len(), prefer })
+}
+
+/// The command before its `[…]` options, as in `\zcref[S]`.
+fn strip_options(command: &str) -> &str {
+    let mut rest = command;
+    while let Some(inner) = rest.strip_suffix(']') {
+        match inner.rfind('[') {
+            Some(open) => rest = &inner[..open],
+            None => return command,
+        }
+    }
+    rest
 }
 
 fn has_latex_comment(before: &str) -> bool {
@@ -96,13 +144,13 @@ fn typst_trigger(before: &str) -> Option<Trigger> {
     let name = before.trim_end_matches(|ch: char| ch.is_alphanumeric() || matches!(ch, '_' | '-'));
     let start = name.len();
     if let Some(rest) = name.strip_suffix('#') {
-        return (!rest.ends_with('\\')).then_some(Trigger { kind: TriggerKind::Code, start });
+        return (!rest.ends_with('\\')).then_some(Trigger { kind: TriggerKind::Code, start, prefer: None });
     }
     let rest = name.strip_suffix('@')?;
     // `a@b` is a mail address, not a reference. A bare `@` opens the citation
     // picker instead, see `snippets::opens_reference`.
     let joined = rest.chars().next_back().is_some_and(char::is_alphanumeric);
-    (!joined && start < before.len()).then_some(Trigger { kind: TriggerKind::Label, start })
+    (!joined && start < before.len()).then_some(Trigger { kind: TriggerKind::Label, start, prefer: None })
 }
 
 /// The best suggestions for `prefix`, the text that accepting one replaces.
@@ -114,8 +162,9 @@ pub fn suggestions<'a>(
     symbols: impl Iterator<Item = &'a Symbol>,
     loaded: &Loaded,
     extra: &'a Extra,
+    labels: LabelHints<'a>,
 ) -> Vec<Entry> {
-    let candidates = candidates(language, kind, symbols, loaded, extra);
+    let candidates = candidates(language, kind, symbols, loaded, extra, labels.details);
     // Runs on every key, so nothing is copied before the best few are known.
     let mut scored: Vec<(i64, usize)> = candidates
         .iter()
@@ -123,7 +172,9 @@ pub fn suggestions<'a>(
         .filter_map(|(index, candidate)| {
             let score = fuzzy_score(prefix, candidate.label)?;
             let bonus = if candidate.label.starts_with(prefix) { PREFIX_BONUS } else { 0 };
-            Some((score + bonus, index))
+            // `\eqref` takes equations, so `eq:` labels come first among equals.
+            let preferred = labels.prefer.is_some_and(|prefer| candidate.template.is_none() && candidate.label.starts_with(prefer));
+            Some((score + bonus + if preferred { PREFIX_BONUS / 2 } else { 0 }, index))
         })
         .collect();
     // Stable, so that among equals the earlier candidate wins, also for doubles.
@@ -174,6 +225,7 @@ fn candidates<'a>(
     symbols: impl Iterator<Item = &'a Symbol>,
     loaded: &Loaded,
     extra: &'a Extra,
+    details: Option<&'a HashMap<String, String>>,
 ) -> Vec<Candidate<'a>> {
     let wanted = match kind {
         TriggerKind::Command => Some(SymbolKind::Command),
@@ -183,7 +235,10 @@ fn candidates<'a>(
     };
     let mut candidates: Vec<Candidate> = symbols
         .filter(|symbol| Some(symbol.kind) == wanted)
-        .map(|symbol| Candidate { label: &symbol.name, template: None, detail: "project" })
+        .map(|symbol| {
+            let detail = details.and_then(|details| details.get(&symbol.name)).map_or("project", String::as_str);
+            Candidate { label: &symbol.name, template: None, detail }
+        })
         .collect();
     let fixed = |label: &'a str, template: &'a str| Candidate { label, template: Some(template), detail: "" };
     match (language, kind) {
@@ -420,6 +475,31 @@ mod tests {
         assert_eq!(at(Language::Latex, "\\begin{ite"), Some((TriggerKind::Environment, "ite")));
         assert_eq!(at(Language::Latex, "see \\ref{fig:a"), Some((TriggerKind::Label, "fig:a")));
         assert_eq!(at(Language::Latex, "\\eqref{"), Some((TriggerKind::Label, "")));
+        assert_eq!(at(Language::Latex, "\\cref{fig:a, tab"), Some((TriggerKind::Label, "tab")));
+        assert_eq!(at(Language::Latex, "\\Cref{a,"), Some((TriggerKind::Label, "")));
+        assert_eq!(at(Language::Latex, "\\zcref[S]{eq:x,eq"), Some((TriggerKind::Label, "eq")));
+        assert_eq!(at(Language::Latex, "\\crefrange{fig:a}{fig"), Some((TriggerKind::Label, "fig")));
+        assert_eq!(at(Language::Latex, "\\subref*{a"), Some((TriggerKind::Label, "a")));
+        // `\ref` takes one label, so a comma ends it.
+        assert_eq!(at(Language::Latex, "\\ref{a,"), None);
+        assert_eq!(at(Language::Latex, "\\begin{a,"), None);
+        assert_eq!(trigger(Language::Latex, "\\eqref{").map(|trigger| trigger.prefer), Some(Some("eq:")));
+    }
+
+    #[test]
+    fn labels_show_what_they_are_and_eqref_prefers_equations() {
+        let symbols = [
+            Symbol { kind: SymbolKind::Label, name: "eq:energy".to_string() },
+            Symbol { kind: SymbolKind::Label, name: "fig:energy".to_string() },
+        ];
+        let details: HashMap<String, String> = [("fig:energy".to_string(), "figure 3.2: Energy use".to_string())].into();
+        let hints = LabelHints { details: Some(&details), prefer: None };
+        let items = suggestions(Language::Latex, TriggerKind::Label, "en", symbols.iter(), &Loaded::default(), &Extra::default(), hints);
+        let detail = |label: &str| items.iter().find(|item| item.label == label).map(|item| item.detail.clone());
+        assert_eq!((detail("fig:energy").as_deref(), detail("eq:energy").as_deref()), (Some("figure 3.2: Energy use"), Some("project")));
+        let hints = LabelHints { details: Some(&details), prefer: Some("eq:") };
+        let items = suggestions(Language::Latex, TriggerKind::Label, "energy", symbols.iter(), &Loaded::default(), &Extra::default(), hints);
+        assert_eq!(items[0].label, "eq:energy");
     }
 
     #[test]
@@ -471,7 +551,7 @@ mod tests {
             for prefix in ["\\c", "\\cit", "\\sec"] {
                 let started = std::time::Instant::now();
                 for _ in 0..10_000 {
-                    std::hint::black_box(suggestions(Language::Latex, TriggerKind::Command, prefix, symbols.iter(), &loaded, &extra));
+                    std::hint::black_box(suggestions(Language::Latex, TriggerKind::Command, prefix, symbols.iter(), &loaded, &extra, LabelHints::default()));
                 }
                 println!("{name} {prefix}: {:.1} µs per call", started.elapsed().as_secs_f64() * 1e6 / 10_000.);
             }
@@ -487,7 +567,7 @@ mod tests {
                 ..Default::default()
             })
         };
-        let cite = |loaded: &Loaded| labels(&suggestions(Language::Latex, TriggerKind::Command, "\\cit", std::iter::empty(), loaded, &Extra::default())).join(" ");
+        let cite = |loaded: &Loaded| labels(&suggestions(Language::Latex, TriggerKind::Command, "\\cit", std::iter::empty(), loaded, &Extra::default(), LabelHints::default())).join(" ");
         let plain = cite(&article(&[]));
         assert!(plain.contains("\\cite") && !plain.contains("\\citep") && !plain.contains("\\citealp"), "{plain}");
         assert!(cite(&article(&["natbib"])).contains("\\citep"));
@@ -495,10 +575,10 @@ mod tests {
         assert!(cite(&article(&[]).with(["natbib"])).contains("\\citep"));
         // Own commands stay, whatever is loaded.
         let own = [Symbol { kind: SymbolKind::Command, name: "\\citeown".to_string() }];
-        let items = suggestions(Language::Latex, TriggerKind::Command, "\\citeo", own.iter(), &article(&[]), &Extra::default());
+        let items = suggestions(Language::Latex, TriggerKind::Command, "\\citeo", own.iter(), &article(&[]), &Extra::default(), LabelHints::default());
         assert_eq!(labels(&items), ["\\citeown"]);
         // Sections and other LaTeX commands need no package.
-        let items = suggestions(Language::Latex, TriggerKind::Command, "\\sec", std::iter::empty(), &article(&[]), &Extra::default());
+        let items = suggestions(Language::Latex, TriggerKind::Command, "\\sec", std::iter::empty(), &article(&[]), &Extra::default(), LabelHints::default());
         assert_eq!(items[0].label, "\\section");
     }
 
@@ -513,7 +593,7 @@ mod tests {
             environments: vec![("glossarytable".to_string(), "glossaries".to_string())],
             used: vec!["\\myniche".to_string(), "\\section".to_string()],
         };
-        let at = |kind, prefix| suggestions(Language::Latex, kind, prefix, std::iter::empty(), &Loaded::default(), &extra);
+        let at = |kind, prefix| suggestions(Language::Latex, kind, prefix, std::iter::empty(), &Loaded::default(), &extra, LabelHints::default());
         let items = at(TriggerKind::Command, "\\glsd");
         assert_eq!((items[0].label.as_str(), items[0].template.as_str(), items[0].detail.as_str()), ("\\glsdesc", "\\glsdesc{${}}", "glossaries"));
         let items = at(TriggerKind::Command, "\\mynic");
@@ -537,11 +617,11 @@ mod tests {
             assert!(snippets::opens_citation(&before_cursor(template)), "{template}");
         }
         for (typed, wanted) in [("\\citep", "\\citep"), ("\\textc", "\\textcite"), ("\\parenc", "\\parencite"), ("\\citet", "\\citet*")] {
-            let items = suggestions(Language::Latex, TriggerKind::Command, typed, std::iter::empty(), &Loaded::default(), &Extra::default());
+            let items = suggestions(Language::Latex, TriggerKind::Command, typed, std::iter::empty(), &Loaded::default(), &Extra::default(), LabelHints::default());
             assert!(labels(&items).contains(&wanted), "{typed}: {:?}", labels(&items));
         }
         // The plain command stays first among its variants.
-        let items = suggestions(Language::Latex, TriggerKind::Command, "\\cite", std::iter::empty(), &Loaded::default(), &Extra::default());
+        let items = suggestions(Language::Latex, TriggerKind::Command, "\\cite", std::iter::empty(), &Loaded::default(), &Extra::default(), LabelHints::default());
         assert_eq!(items[0].label, "\\cite");
     }
 
@@ -555,10 +635,10 @@ mod tests {
 
     #[test]
     fn commands_come_from_the_list_and_the_palette() {
-        let items = suggestions(Language::Latex, TriggerKind::Command, "\\fr", std::iter::empty(), &Loaded::default(), &Extra::default());
+        let items = suggestions(Language::Latex, TriggerKind::Command, "\\fr", std::iter::empty(), &Loaded::default(), &Extra::default(), LabelHints::default());
         assert_eq!(items[0].label, "\\frac");
         assert_eq!(items[0].template, "\\frac{${}}{${}}");
-        let items = suggestions(Language::Latex, TriggerKind::Command, "\\alph", std::iter::empty(), &Loaded::default(), &Extra::default());
+        let items = suggestions(Language::Latex, TriggerKind::Command, "\\alph", std::iter::empty(), &Loaded::default(), &Extra::default(), LabelHints::default());
         assert_eq!(items[0].detail, "α");
     }
 
@@ -568,39 +648,39 @@ mod tests {
             Symbol { kind: SymbolKind::Label, name: "fig:a".to_string() },
             Symbol { kind: SymbolKind::Command, name: "\\myfoo".to_string() },
         ];
-        let items = suggestions(Language::Latex, TriggerKind::Label, "fi", symbols.iter(), &Loaded::default(), &Extra::default());
+        let items = suggestions(Language::Latex, TriggerKind::Label, "fi", symbols.iter(), &Loaded::default(), &Extra::default(), LabelHints::default());
         assert_eq!(labels(&items), ["fig:a"]);
-        let items = suggestions(Language::Latex, TriggerKind::Command, "\\myf", symbols.iter(), &Loaded::default(), &Extra::default());
+        let items = suggestions(Language::Latex, TriggerKind::Command, "\\myf", symbols.iter(), &Loaded::default(), &Extra::default(), LabelHints::default());
         assert_eq!(items[0].label, "\\myfoo");
     }
 
     #[test]
     fn symbols_with_dollars_stay_literal() {
         let symbols = [Symbol { kind: SymbolKind::Label, name: "a$b".to_string() }];
-        let items = suggestions(Language::Latex, TriggerKind::Label, "a", symbols.iter(), &Loaded::default(), &Extra::default());
+        let items = suggestions(Language::Latex, TriggerKind::Label, "a", symbols.iter(), &Loaded::default(), &Extra::default(), LabelHints::default());
         assert_eq!(items[0].template, "a$$b");
     }
 
     #[test]
     fn a_finished_word_closes_the_popup() {
         let symbols = [Symbol { kind: SymbolKind::Label, name: "fig:a".to_string() }];
-        assert!(suggestions(Language::Latex, TriggerKind::Label, "fig:a", symbols.iter(), &Loaded::default(), &Extra::default()).is_empty());
+        assert!(suggestions(Language::Latex, TriggerKind::Label, "fig:a", symbols.iter(), &Loaded::default(), &Extra::default(), LabelHints::default()).is_empty());
     }
 
     #[test]
     fn the_popup_stays_short_and_has_no_doubles() {
-        let items = suggestions(Language::Latex, TriggerKind::Command, "\\", std::iter::empty(), &Loaded::default(), &Extra::default());
+        let items = suggestions(Language::Latex, TriggerKind::Command, "\\", std::iter::empty(), &Loaded::default(), &Extra::default(), LabelHints::default());
         assert_eq!(items.len(), MAX_ITEMS);
         let symbols = [Symbol { kind: SymbolKind::Command, name: "\\frac".to_string() }];
-        let items = suggestions(Language::Latex, TriggerKind::Command, "\\fra", symbols.iter(), &Loaded::default(), &Extra::default());
+        let items = suggestions(Language::Latex, TriggerKind::Command, "\\fra", symbols.iter(), &Loaded::default(), &Extra::default(), LabelHints::default());
         assert_eq!(items.iter().filter(|entry| entry.label == "\\frac").count(), 1);
     }
 
     #[test]
     fn environments_and_typst_names_match() {
-        let items = suggestions(Language::Latex, TriggerKind::Environment, "ite", std::iter::empty(), &Loaded::default(), &Extra::default());
+        let items = suggestions(Language::Latex, TriggerKind::Environment, "ite", std::iter::empty(), &Loaded::default(), &Extra::default(), LabelHints::default());
         assert_eq!(items[0].label, "itemize");
-        let items = suggestions(Language::Typst, TriggerKind::Code, "fig", std::iter::empty(), &Loaded::default(), &Extra::default());
+        let items = suggestions(Language::Typst, TriggerKind::Code, "fig", std::iter::empty(), &Loaded::default(), &Extra::default(), LabelHints::default());
         assert_eq!(items[0].label, "figure");
         assert_eq!(items[0].template, "figure(${})");
     }

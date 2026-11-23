@@ -122,6 +122,8 @@ const DIALOG_WIDTH: f32 = 640.0;
 const DIALOG_HEIGHT: f32 = 560.0;
 const PICKER_WIDTH: f32 = 720.0;
 const PICKER_HEIGHT: f32 = 440.0;
+/// The entry in full, beside the citation list.
+const CITATION_DETAIL_WIDTH: f32 = 300.0;
 /// A pause in typing before the project is searched for the query.
 const PICKER_SEARCH_DELAY: Duration = Duration::from_millis(120);
 
@@ -436,7 +438,7 @@ pub struct Workspace {
     outline_version: (usize, u64),
     /// The active document and the number of documents when the active view last
     /// got the names of the others.
-    symbols_version: (usize, usize),
+    symbols_version: (usize, usize, usize),
     package_hints: Vec<PackageHint>,
     /// What the project loads, for the suggestions of every document.
     loaded_packages: Arc<Loaded>,
@@ -737,7 +739,7 @@ impl Workspace {
             active: None,
             outline: Vec::new(),
             outline_version: (usize::MAX, 0),
-            symbols_version: (usize::MAX, 0),
+            symbols_version: (usize::MAX, 0, 0),
             package_hints: Vec::new(),
             loaded_packages: Arc::default(),
             package_extra: Arc::default(),
@@ -2021,7 +2023,7 @@ impl Workspace {
             Request::EditFile { path, old, new, group } => self.addon_edit(addon_host::edit_group(&add_on, group), &path, &old, &new, cx).map(|()| Reply::Done),
             Request::CreateFile { path, text, group } => self.addon_create(addon_host::edit_group(&add_on, group), &path, &text, cx).map(|()| Reply::Done),
             Request::WriteFile { path, text } => self.addon_write(&path, &text, cx).map(|()| Reply::Done),
-            Request::InsertCitation { key } => Ok(Reply::Text { text: self.insert_citation(&key, cx) }),
+            Request::InsertCitation { key } => Ok(Reply::Text { text: self.insert_citation(&key, false, cx) }),
             Request::BeginEdits { group } => {
                 self.tracked_edits.insert(addon_host::edit_group(&add_on, group), TrackedEdits::default());
                 Ok(Reply::Done)
@@ -4130,8 +4132,9 @@ impl Workspace {
         let language = self.active_language(cx);
         let offered = if kind == PickerKind::Citations { self.offered_citations(cx) } else { Vec::new() };
         let index = self.citations.clone();
-        // The labels that `@` cites in Typst.
-        let labels = if kind == PickerKind::Citations && language == Some(Language::Typst) { self.document_labels(cx) } else { Vec::new() };
+        // The labels that `@` refers to in Typst, from the whole document.
+        let labels = if kind == PickerKind::Citations && language == Some(Language::Typst) { self.typst_labels(cx) } else { Vec::new() };
+        let cited = if kind == PickerKind::Citations { self.cite_slot(cx).map(|slot| slot.cited).unwrap_or_default() } else { Vec::new() };
         let repository = self.git_panel.read(cx).repository();
         if kind == PickerKind::Branches && repository.is_none() {
             return;
@@ -4149,7 +4152,7 @@ impl Workspace {
             themes: Arc::new(nvim_themes::Themes::new()),
             original: None,
             citations: None,
-        });
+            cited: Vec::new(),        });
         window.focus(&self.picker_focus, cx);
         self.picker_files_task = Some(cx.spawn(async move |this, cx| {
             let (files, entries, citations) = cx
@@ -4180,6 +4183,7 @@ impl Workspace {
                     picker.files = Arc::new(files);
                     picker.entries = Arc::new(entries);
                     picker.citations = citations;
+                    picker.cited = cited;
                 }
                 this.refresh_picker(cx);
             })
@@ -4230,7 +4234,7 @@ impl Workspace {
             themes: Arc::default(),
             original: None,
             citations: None,
-        });
+            cited: Vec::new(),        });
         window.focus(&self.picker_focus, cx);
         self.refresh_picker(cx);
     }
@@ -4266,7 +4270,7 @@ impl Workspace {
             themes: Arc::new(themes),
             original: Some(theme::palette()),
             citations: None,
-        });
+            cited: Vec::new(),        });
         window.focus(&self.picker_focus, cx);
         self.refresh_picker(cx);
         self.picker_files_task = Some(cx.spawn(async move |this, cx| {
@@ -4318,7 +4322,7 @@ impl Workspace {
             themes: Arc::new(nvim_themes::Themes::new()),
             original: None,
             citations: None,
-        });
+            cited: Vec::new(),        });
         window.focus(&self.picker_focus, cx);
         self.picker_files_task = Some(cx.spawn(async move |this, cx| {
             let entries = cx
@@ -4375,7 +4379,7 @@ impl Workspace {
             themes: Arc::new(nvim_themes::Themes::new()),
             original: None,
             citations: None,
-        });
+            cited: Vec::new(),        });
         window.focus(&self.picker_focus, cx);
         self.refresh_picker(cx);
         cx.notify();
@@ -4459,7 +4463,7 @@ impl Workspace {
                 picker.selected = 0;
             }
             PickerKind::Citations => {
-                picker.items = picker.citations.as_ref().map(|rows| rows.matches(&picker.query)).unwrap_or_default();
+                picker.items = picker.citations.as_ref().map(|rows| rows.matches(&picker.query, &picker.cited)).unwrap_or_default();
                 picker.selected = 0;
             }
             PickerKind::History | PickerKind::Commands => {
@@ -4587,7 +4591,7 @@ impl Workspace {
                 for entry in &self.addon_panels {
                     entry.panel.read(cx).notify_citation_picked(&item.label);
                 }
-                self.insert_citation(&item.label, cx);
+                self.insert_citation(&item.label, false, cx);
                 return;
             }
         }
@@ -4599,20 +4603,37 @@ impl Workspace {
 
     /// Writes a citation at the cursor, where the document takes one, and else
     /// puts the key on the clipboard. Says which.
-    fn insert_citation(&mut self, key: &str, cx: &mut Context<Self>) -> String {
-        if let Some(closing) = self.needs_closing_brace(cx) {
-            self.insert_snippet(&snippets::citation_key(key, closing), false, cx);
+    /// With `more`, another key follows, so the list stays open after a comma.
+    fn insert_citation(&mut self, key: &str, more: bool, cx: &mut Context<Self>) -> String {
+        if let Some(slot) = self.cite_slot(cx) {
+            let mut text = editor_core::snippet::literal(key);
+            if slot.before_key || more {
+                text.push_str(", ");
+            }
+            if slot.close && !more {
+                text.push('}');
+            }
+            self.insert_snippet(&text, false, cx);
             // The next thing to type is the sentence, not another key.
-            if !closing {
+            let at_brace = self.active_view().and_then(|view| Self::around_cursor(view.read(cx))).is_some_and(|(_, _, after)| after.starts_with('}'));
+            if !more && !slot.close && !slot.before_key && at_brace {
                 self.with_active(cx, |view, cx| view.step_forward(cx));
             }
             return format!("Cited {key} at the cursor.");
         }
-        // The `@` that opened the picker is already there.
+        // The `@` or `cite(<` that opened the picker is already there.
         if self.active_language(cx) == Some(Language::Typst)
-            && self.active_view().and_then(|view| Self::around_cursor(view.read(cx))).is_some_and(|(_, before, _)| snippets::opens_reference(&before))
+            && let Some((_, before, after)) = self.active_view().and_then(|view| Self::around_cursor(view.read(cx)))
+            && snippets::opens_reference(&before)
         {
-            self.insert_snippet(&snippets::citation_key(key, false), false, cx);
+            let mut text = editor_core::snippet::literal(key);
+            if snippets::opens_typst_cite(&before) && !after.starts_with('>') {
+                text.push('>');
+            }
+            if more {
+                text.push_str(if snippets::opens_typst_cite(&before) { ") #cite(<" } else { " @" });
+            }
+            self.insert_snippet(&text, false, cx);
             return format!("Cited {key} at the cursor.");
         }
         match self.active_language(cx) {
@@ -4748,14 +4769,39 @@ impl Workspace {
         Some((head, before.to_string(), after.to_string()))
     }
 
-    /// `Some` when the cursor is right after `\cite{`, with whether a brace is missing.
-    fn needs_closing_brace(&self, cx: &App) -> Option<bool> {
+    /// Where a key goes when the cursor is in the braces of a LaTeX citation.
+    fn cite_slot(&self, cx: &App) -> Option<snippets::CiteSlot> {
         if self.active_language(cx) != Some(Language::Latex) {
             return None;
         }
         let view = self.active_view()?;
         let (_, before, after) = Self::around_cursor(view.read(cx))?;
-        snippets::opens_citation(&before).then(|| !after.starts_with('}'))
+        snippets::cite_slot(&before, &after)
+    }
+
+    /// Cites the chosen entry and keeps the list open for the next key.
+    fn cite_another(&mut self, cx: &mut Context<Self>) {
+        let Some(item) = self.picker.as_ref().and_then(|picker| picker.items.get(picker.selected).cloned()) else {
+            return;
+        };
+        for entry in &self.addon_panels {
+            entry.panel.read(cx).notify_citation_picked(&item.label);
+        }
+        self.insert_citation(&item.label, true, cx);
+        if let Some(picker) = &mut self.picker {
+            picker.cited.push(item.label);
+            picker.query.clear();
+        }
+        self.refresh_picker(cx);
+    }
+
+    /// The labels of the whole document, which Typst's `@` refers to.
+    fn typst_labels(&self, cx: &App) -> Vec<String> {
+        let mut labels = self.document_labels(cx);
+        labels.extend(self.citations.labels.keys().cloned());
+        labels.sort();
+        labels.dedup();
+        labels
     }
 
     /// Opens the picker when `\cite{`, or `@` in Typst, was typed and there is
@@ -4773,7 +4819,8 @@ impl Workspace {
         if self.citation_trigger.is_some_and(|(view, offset)| view != id || head < offset) {
             self.citation_trigger = None;
         }
-        let opens = if language == Some(Language::Typst) { snippets::opens_reference(&before) } else { snippets::opens_citation(&before) };
+        let after = Self::around_cursor(view.read(cx)).map(|(_, _, after)| after).unwrap_or_default();
+        let opens = if language == Some(Language::Typst) { snippets::opens_reference(&before) } else { snippets::cite_slot(&before, &after).is_some() };
         if !opens || self.citation_trigger == Some((id, head)) {
             return;
         }
@@ -4785,7 +4832,7 @@ impl Workspace {
         let available = !self.citations_ready
             || !self.citations.entries.is_empty()
             || !self.offered_citations(cx).is_empty()
-            || (language == Some(Language::Typst) && !self.document_labels(cx).is_empty());
+            || (language == Some(Language::Typst) && !self.typst_labels(cx).is_empty());
         if available {
             self.open_citations_soon = true;
             cx.notify();
@@ -4823,6 +4870,9 @@ impl Workspace {
     fn picker_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) {
         match keystroke.key.as_str() {
             "escape" => return self.close_picker(window, cx),
+            "enter" if keystroke.modifiers.platform && self.picker.as_ref().is_some_and(|picker| picker.kind == PickerKind::Citations) => {
+                return self.cite_another(cx);
+            }
             "enter" => {
                 let selected = self.picker.as_ref().map_or(0, |picker| picker.selected);
                 return self.accept_picker(selected, window, cx);
@@ -4903,26 +4953,32 @@ impl Workspace {
         }
     }
 
-    /// Gives the active view what the other open documents define. Those change
-    /// rarely, so this runs on a switch and not on every key.
+    /// Gives the active view what the other open documents define, and the
+    /// labels of the whole document from the citation index. Those change
+    /// rarely, so this runs on a switch or a new index and not on every key.
     fn sync_project_symbols(&mut self, cx: &mut Context<Self>) {
         let Some(active) = self.active else {
             return;
         };
-        let key = (active, self.documents.len());
+        let key = (active, self.documents.len(), Arc::as_ptr(&self.citations) as usize);
         if key == self.symbols_version {
             return;
         }
         self.symbols_version = key;
-        let symbols: Vec<Symbol> = self
+        let mut symbols: Vec<Symbol> = self
             .documents
             .iter()
             .enumerate()
             .filter(|(index, _)| *index != active)
             .flat_map(|(_, document)| document.view.read(cx).symbols().to_vec())
             .collect();
+        symbols.extend(self.citations.labels.keys().map(|name| Symbol { kind: SymbolKind::Label, name: name.clone() }));
+        let details = Arc::new(citation_index::label_details(&self.citations));
         if let Some(document) = self.documents.get(active) {
-            document.view.update(cx, |view, _| view.set_project_symbols(Arc::new(symbols)));
+            document.view.update(cx, |view, _| {
+                view.set_project_symbols(Arc::new(symbols));
+                view.set_label_details(details);
+            });
         }
     }
 
@@ -8373,6 +8429,15 @@ impl Workspace {
             (PickerKind::History, true) => "No earlier versions yet. Each save keeps the one before.",
             _ => "No results.",
         };
+        let detail = self.citation_detail(picker);
+        let width = PICKER_WIDTH + if detail.is_some() { CITATION_DETAIL_WIDTH } else { 0. };
+        // How many entries the list leaves out, and how to cite more than one.
+        let citation_hint = picker.citations.as_ref().filter(|_| picker.kind == PickerKind::Citations).map(|rows| {
+            let more = keymap::display("secondary-enter", keymap::host_os());
+            let shown = picker.items.len();
+            let total = rows.len().saturating_sub(picker.cited.len());
+            if picker.query.trim().is_empty() && shown < total { format!("{shown} of {total}. {more} cites another") } else { format!("{more} cites another") }
+        });
         div()
             .id("picker-backdrop")
             .absolute()
@@ -8392,7 +8457,7 @@ impl Workspace {
                     .occlude()
                     .flex()
                     .flex_col()
-                    .w(px(PICKER_WIDTH))
+                    .w(px(width))
                     .h(px(PICKER_HEIGHT))
                     .max_h(gpui::relative(0.8))
                     .rounded(px(6.))
@@ -8416,11 +8481,17 @@ impl Workspace {
                                     .flex()
                                     .items_center()
                                     .font_family(theme::code_font())
+                                    .flex_1()
+                                    .min_w_0()
                                     .child(picker.query.clone())
                                     .child(div().w(px(1.5)).h(px(15.)).bg(theme::color(theme::palette().focus))),
-                            ),
+                            )
+                            .when_some(citation_hint, |element, hint| {
+                                element.child(div().flex_none().text_size(px(11.)).text_color(theme::color(theme::palette().ui_muted)).child(hint))
+                            }),
                     )
                     .child(
+                        div().flex().flex_1().min_h_0().child(
                         div()
                             .id("picker-results")
                             .flex_1()
@@ -8491,8 +8562,69 @@ impl Workspace {
                                     })
                                     .into_any_element()
                             })),
+                        )
+                        .children(detail),
                     ),
             )
+    }
+
+    /// Beside the citation list: the chosen entry in full, as the
+    /// bibliography will show it, and where it is written.
+    fn citation_detail(&self, picker: &Picker) -> Option<AnyElement> {
+        let rows = picker.citations.as_ref().filter(|_| picker.kind == PickerKind::Citations)?;
+        let palette = theme::palette();
+        let muted = theme::color(palette.ui_muted);
+        let panel = div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w(px(CITATION_DETAIL_WIDTH))
+            .gap(px(8.))
+            .p(px(14.))
+            .border_l_1()
+            .border_color(theme::color(palette.divider))
+            .overflow_hidden();
+        let Some(item) = picker.items.get(picker.selected) else {
+            return Some(panel.into_any_element());
+        };
+        let Some(entry) = rows.entry(&item.label) else {
+            // Offered by an add-on, or a Typst label: only what the row says.
+            return Some(panel.child(div().font_family(theme::code_font()).child(item.label.clone())).when_some(item.detail.clone(), |panel, detail| panel.child(div().text_color(muted).child(detail))).into_any_element());
+        };
+        let small = |text: String| div().text_size(px(11.)).text_color(muted).child(text);
+        let mut venue = entry.venue.clone();
+        if !entry.year.is_empty() {
+            if !venue.is_empty() {
+                venue.push_str(", ");
+            }
+            venue.push_str(&entry.year);
+            venue.extend(entry.letter);
+        }
+        let place = {
+            let relative = self.root.as_deref().and_then(|root| entry.path.strip_prefix(root).ok()).unwrap_or(&entry.path).to_string_lossy().into_owned();
+            if entry.kind == "bibitem" { relative } else { format!("{relative}:{}", entry.line + 1) }
+        };
+        Some(
+            panel
+                .when(!entry.full_authors.is_empty(), |panel| panel.child(div().text_color(muted).child(entry.full_authors.clone())))
+                .when(!entry.title.is_empty(), |panel| panel.child(div().font_weight(FontWeight::SEMIBOLD).child(entry.title.clone())))
+                .when(!venue.is_empty(), |panel| panel.child(div().child(venue)))
+                .when(!entry.doi.is_empty(), |panel| panel.child(small(format!("doi: {}", entry.doi))))
+                .when(entry.doi.is_empty() && !entry.url.is_empty(), |panel| panel.child(small(entry.url.clone())))
+                .when(!entry.abstract_text.is_empty(), |panel| panel.child(div().flex_1().min_h_0().overflow_hidden().text_size(px(12.)).text_color(muted).child(entry.abstract_text.clone())))
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(8.))
+                        .mt_auto()
+                        .font_family(theme::code_font())
+                        .text_size(px(theme::code_font_size() - 1.))
+                        .text_color(muted)
+                        .child(div().flex_none().child(format!("@{}", entry.kind)))
+                        .child(div().flex_1().min_w_0().truncate().child(place)),
+                )
+                .into_any_element(),
+        )
     }
 
     /// The logs or the PDF with the errors of the last build above it.
