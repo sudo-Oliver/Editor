@@ -121,7 +121,9 @@ pub fn is_ref(name: &str) -> bool {
 pub fn scan(text: &str) -> Scan {
     let mut scanner = Scanner { text, bytes: text.as_bytes(), pos: 0, scan: Scan::default(), envs: Vec::new(), section: None };
     scanner.run();
-    scanner.scan
+    let mut scan = scanner.scan;
+    crate::scan::number_lines(text, &mut scan.labels);
+    scan
 }
 
 struct Frame {
@@ -492,7 +494,7 @@ impl Scanner<'_> {
                 None => (String::new(), None, false),
             },
         };
-        self.scan.labels.push(Label { name: name.to_string(), range: at..at + name.len(), env, caption, before_caption });
+        self.scan.labels.push(Label { name: name.to_string(), range: at..at + name.len(), line: 0, env, caption, before_caption });
     }
 
     fn caption(&mut self, of: bool) {

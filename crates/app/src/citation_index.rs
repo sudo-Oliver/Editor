@@ -11,7 +11,13 @@ use std::{
 };
 
 use build::find_main;
-use citations::index::{self, CitationIndex, Inputs};
+use citations::{
+    Severity,
+    index::{self, CitationIndex, Inputs},
+    lint,
+    project::Language,
+};
+use editor_core::{Mark, MarkSeverity, MarkSource};
 use gpui::{AppContext, Context};
 
 use super::Workspace;
@@ -87,6 +93,7 @@ impl Workspace {
                     .update(cx, |this, cx| {
                         this.citations = Arc::new(built);
                         this.citations_ready = true;
+                        this.show_citation_marks(cx);
                         cx.notify();
                         this.citations_stale
                     })
@@ -97,6 +104,47 @@ impl Workspace {
             }
             this.update(cx, |this, _| this.citations_task = None).ok();
         }));
+    }
+
+    /// Marks what is wrong with keys, labels and bibliographies in the open
+    /// documents, for those whose text is still the one the index read.
+    pub(super) fn show_citation_marks(&mut self, cx: &mut Context<Self>) {
+        for document in &self.documents {
+            let index = self.citations.clone();
+            let texts = &self.citation_texts;
+            document.view.update(cx, |view, cx| {
+                let Some(path) = view.path.clone() else {
+                    return;
+                };
+                if texts.get(&path).is_none_or(|(version, _)| *version != view.state.version()) {
+                    return;
+                }
+                let diagnostics = match Language::of(&path) {
+                    Some(_) => lint::source(&index, &path),
+                    None => index.diagnostics(&path).to_vec(),
+                };
+                let length = view.state.buffer().len();
+                let marks = diagnostics
+                    .into_iter()
+                    .map(|diagnostic| {
+                        let start = diagnostic.range.start.min(length);
+                        // An empty range still shows, on the char after it.
+                        let end = if diagnostic.range.end > start { diagnostic.range.end.min(length) } else { view.state.buffer().next_boundary(start).min(length) };
+                        Mark {
+                            range: start..end,
+                            severity: match diagnostic.severity {
+                                Severity::Error => MarkSeverity::Error,
+                                Severity::Warning => MarkSeverity::Warning,
+                                Severity::Hint => MarkSeverity::Hint,
+                            },
+                            message: diagnostic.message,
+                            source: MarkSource::Citations,
+                        }
+                    })
+                    .collect();
+                view.set_own_marks(MarkSource::Citations, marks, cx);
+            });
+        }
     }
 
     /// What a rebuild needs, taken on the main thread: the main file, the
