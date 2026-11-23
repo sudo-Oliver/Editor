@@ -45,6 +45,20 @@ pub struct Inputs<'a> {
 pub struct Cache {
     files: HashMap<PathBuf, Cached>,
     generation: u64,
+    /// The entries of the last build, which a build reuses while what they
+    /// come from is unchanged, as when only a chapter was edited.
+    entries: Option<(EntriesKey, Arc<Entries>)>,
+}
+
+/// What the entries come from: the bibliographies as they are now, the
+/// `\bibitem`s, the program that reads them, and the last build's letters.
+#[derive(Clone, PartialEq, Eq)]
+struct EntriesKey {
+    files: Vec<(PathBuf, Option<Stamp>)>,
+    bibitems: Vec<(PathBuf, String, Range<usize>)>,
+    backend: Backend,
+    biblatex: bool,
+    bbl: Option<Stamp>,
 }
 
 struct Cached {
@@ -87,19 +101,32 @@ pub fn decode(bytes: Vec<u8>) -> (String, bool) {
     }
 }
 
+/// What tells one version of a file from the next: the hash of an open
+/// document's text, or the time and size on the disk.
+fn stamp(path: &Path, open: &HashMap<PathBuf, Arc<str>>) -> Option<(Stamp, Option<Arc<str>>)> {
+    match open.get(path) {
+        Some(text) => {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            text.hash(&mut hasher);
+            Some((Stamp::Open(hasher.finish()), Some(text.clone())))
+        }
+        None => {
+            let metadata = std::fs::metadata(path).ok().filter(std::fs::Metadata::is_file)?;
+            Some((Stamp::Disk(metadata.modified().ok(), metadata.len()), None))
+        }
+    }
+}
+
 impl Cache {
+    /// Keeps a parsed file that a reused part of the index still stands on.
+    fn touch(&mut self, path: &Path) {
+        if let Some(cached) = self.files.get_mut(path) {
+            cached.used = self.generation;
+        }
+    }
+
     fn get(&mut self, path: &Path, open: &HashMap<PathBuf, Arc<str>>, kind: Kind) -> Option<Parsed> {
-        let (stamp, text) = match open.get(path) {
-            Some(text) => {
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                text.hash(&mut hasher);
-                (Stamp::Open(hasher.finish()), Some(text.clone()))
-            }
-            None => {
-                let metadata = std::fs::metadata(path).ok().filter(std::fs::Metadata::is_file)?;
-                (Stamp::Disk(metadata.modified().ok(), metadata.len()), None)
-            }
-        };
+        let (stamp, text) = stamp(path, open)?;
         let generation = self.generation;
         if let Some(cached) = self.files.get_mut(path)
             && cached.stamp == stamp
@@ -227,9 +254,10 @@ pub struct LabelDef {
     pub page: Option<String>,
 }
 
+/// The entries of the bibliographies with what is wrong in them, ready to
+/// search. Shared between builds while the bibliographies stay the same.
 #[derive(Default)]
-pub struct CitationIndex {
-    pub project: Project,
+pub struct Entries {
     pub entries: Vec<IndexedEntry>,
     /// Entries by author, year and letter, as the picker lists them unfiltered.
     order: Vec<u32>,
@@ -237,18 +265,36 @@ pub struct CitationIndex {
     spans: Vec<Spans>,
     by_key: HashMap<String, Vec<u32>>,
     by_folded_key: HashMap<String, Vec<u32>>,
+    /// The bibliographies read, in order, with whether each is Windows-1252.
+    pub bib_files: Vec<(Arc<PathBuf>, bool)>,
+    /// What is wrong in each bibliography.
+    pub diagnostics: HashMap<PathBuf, Vec<Diagnostic>>,
+}
+
+#[derive(Default)]
+pub struct CitationIndex {
+    pub project: Project,
+    /// The entries, which reading `index.entries` and searching reach directly.
+    bib: Arc<Entries>,
     pub labels: HashMap<String, Vec<LabelDef>>,
     /// Labels of other documents through `\externaldocument`.
     pub external_labels: HashSet<String>,
     /// An external document has no `.aux` yet, so its labels are unknown.
     pub external_unknown: bool,
-    /// The bibliographies read, in order, with whether each is Windows-1252.
-    pub bib_files: Vec<(Arc<PathBuf>, bool)>,
-    pub diagnostics: HashMap<PathBuf, Vec<Diagnostic>>,
+    /// What is wrong in the sources, such as a bibliography that is not there.
+    source_diagnostics: HashMap<PathBuf, Vec<Diagnostic>>,
     /// Every entry counts as cited, through `\nocite{*}`.
     pub cite_all: bool,
     /// Every declared bibliography was read, so a key that is not here is wrong.
     pub bibs_complete: bool,
+}
+
+impl std::ops::Deref for CitationIndex {
+    type Target = Entries;
+
+    fn deref(&self) -> &Entries {
+        &self.bib
+    }
 }
 
 /// Field weights: a hit in the key counts most, in the venue least.
@@ -289,6 +335,7 @@ pub fn build(cache: &mut Cache, inputs: &Inputs) -> CitationIndex {
         bibs_complete: project.bibliographies.iter().all(|bibliography| bibliography.path.is_some()),
         ..CitationIndex::default()
     };
+    let mut bib = Entries::default();
 
     // The bibliographies, in the order BibTeX reads them, since an
     // `@string` of one is known in the ones after it.
@@ -303,7 +350,7 @@ pub fn build(cache: &mut Cache, inputs: &Inputs) -> CitationIndex {
                 Some(path) if !bib_paths.contains(path) => bib_paths.push(path.clone()),
                 Some(_) => {}
                 None if bibliography.elsewhere => {}
-                None => index.diagnostics.entry(bibliography.declared_in.clone()).or_default().push(Diagnostic {
+                None => index.source_diagnostics.entry(bibliography.declared_in.clone()).or_default().push(Diagnostic {
                     range: bibliography.range.clone(),
                     severity: Severity::Error,
                     message: format!("There is no bibliography {}.", bibliography.name),
@@ -311,14 +358,33 @@ pub fn build(cache: &mut Cache, inputs: &Inputs) -> CitationIndex {
             }
         }
     }
+    let key = EntriesKey {
+        files: bib_paths.iter().map(|path| (path.clone(), stamp(path, open).map(|(stamp, _)| stamp))).collect(),
+        bibitems: project.sources.iter().flat_map(|source| source.scan.bibitems.iter().map(|item| (source.path.clone(), item.name.clone(), item.range.clone()))).collect(),
+        backend: project.backend,
+        biblatex: project.biblatex,
+        bbl: project.main.as_deref().and_then(bbl_path).and_then(|path| stamp(&path, open)).map(|(stamp, _)| stamp),
+    };
+    if let Some((known, entries)) = &cache.entries
+        && *known == key
+    {
+        index.bib = entries.clone();
+        for path in bib_paths.iter().cloned().chain(project.main.as_deref().and_then(bbl_path)) {
+            cache.touch(&path);
+        }
+        labels(&mut index, &project, cache, open);
+        index.project = project;
+        cache.files.retain(|_, cached| cached.used == cache.generation);
+        return index;
+    }
     let mut macros: HashMap<String, String> = HashMap::new();
     for path in &bib_paths {
         let Some(file) = cache.bib(path, open) else {
             continue;
         };
         let shared = Arc::new(path.clone());
-        index.bib_files.push((shared.clone(), file.latin1));
-        let diagnostics = index.diagnostics.entry(path.clone()).or_default();
+        bib.bib_files.push((shared.clone(), file.latin1));
+        let diagnostics = bib.diagnostics.entry(path.clone()).or_default();
         diagnostics.extend(file.bib.diagnostics.iter().cloned());
         if file.latin1 && project.backend == Backend::Biber {
             diagnostics.push(Diagnostic {
@@ -340,7 +406,7 @@ pub fn build(cache: &mut Cache, inputs: &Inputs) -> CitationIndex {
                 unknown_macros(&unknown, diagnostics);
                 fields.push((field.name.clone(), value));
             }
-            index.entries.push(IndexedEntry {
+            bib.entries.push(IndexedEntry {
                 key: entry.key.clone(),
                 kind: entry.kind.clone(),
                 path: shared.clone(),
@@ -358,22 +424,25 @@ pub fn build(cache: &mut Cache, inputs: &Inputs) -> CitationIndex {
     for source in &project.sources {
         let shared = Arc::new(source.path.clone());
         for item in &source.scan.bibitems {
-            index.entries.push(IndexedEntry { key: item.name.clone(), kind: "bibitem".into(), path: shared.clone(), key_range: item.range.clone(), range: item.range.clone(), ..IndexedEntry::default() });
+            bib.entries.push(IndexedEntry { key: item.name.clone(), kind: "bibitem".into(), path: shared.clone(), key_range: item.range.clone(), range: item.range.clone(), ..IndexedEntry::default() });
         }
     }
-    index.entries.retain(|entry| !entry.key.is_empty());
-    for (position, entry) in index.entries.iter().enumerate() {
-        index.by_key.entry(entry.key.clone()).or_default().push(position as u32);
-        index.by_folded_key.entry(entry.key.to_lowercase()).or_default().push(position as u32);
+    bib.entries.retain(|entry| !entry.key.is_empty());
+    for (position, entry) in bib.entries.iter().enumerate() {
+        bib.by_key.entry(entry.key.clone()).or_default().push(position as u32);
+        bib.by_folded_key.entry(entry.key.to_lowercase()).or_default().push(position as u32);
     }
-    duplicate_keys(&mut index);
-    inherit(&mut index);
-    describe(&mut index);
-    for (path, diagnostic) in lint::entries(&index, project.backend, project.biblatex, &place) {
-        index.diagnostics.entry(path).or_default().push(diagnostic);
+    duplicate_keys(&mut bib);
+    inherit(&mut bib);
+    describe(&mut bib);
+    for (path, diagnostic) in lint::entries(&bib, project.backend, project.biblatex, &place) {
+        bib.diagnostics.entry(path).or_default().push(diagnostic);
     }
-    letters(&mut index, cache, open, project.main.as_deref());
-    search_text(&mut index);
+    letters(&mut bib, cache, open, project.main.as_deref());
+    search_text(&mut bib);
+    let bib = Arc::new(bib);
+    cache.entries = Some((key, bib.clone()));
+    index.bib = bib;
     labels(&mut index, &project, cache, open);
     index.project = project;
     cache.files.retain(|_, cached| cached.used == cache.generation);
@@ -400,7 +469,7 @@ fn place(entry: &IndexedEntry) -> String {
     format!("{}:{}", entry.path.file_name().map_or_else(String::new, |name| name.to_string_lossy().into_owned()), entry.line + 1)
 }
 
-fn duplicate_keys(index: &mut CitationIndex) {
+fn duplicate_keys(index: &mut Entries) {
     let mut found: Vec<(PathBuf, Diagnostic)> = Vec::new();
     for positions in index.by_folded_key.values().filter(|positions| positions.len() > 1) {
         let first = &index.entries[positions[0] as usize];
@@ -420,7 +489,7 @@ fn duplicate_keys(index: &mut CitationIndex) {
 }
 
 /// Fields from `crossref` and `xdata` parents that an entry does not set itself.
-fn inherit(index: &mut CitationIndex) {
+fn inherit(index: &mut Entries) {
     let mut additions: Vec<(usize, Vec<(String, String)>)> = Vec::new();
     let mut found: Vec<(PathBuf, Diagnostic)> = Vec::new();
     for (position, entry) in index.entries.iter().enumerate() {
@@ -479,7 +548,7 @@ fn inherit(index: &mut CitationIndex) {
     }
 }
 
-fn describe(index: &mut CitationIndex) {
+fn describe(index: &mut Entries) {
     for entry in &mut index.entries {
         let field = |names: &[&str]| names.iter().find_map(|name| entry.field(name)).unwrap_or_default().to_string();
         let people = field(&["author", "editor"]);
@@ -499,7 +568,7 @@ fn describe(index: &mut CitationIndex) {
 
 /// Letters for entries that share authors and year: those of the last build,
 /// or else in the order of their keys, as plainnat gives them.
-fn letters(index: &mut CitationIndex, cache: &mut Cache, open: &HashMap<PathBuf, Arc<str>>, main: Option<&Path>) {
+fn letters(index: &mut Entries, cache: &mut Cache, open: &HashMap<PathBuf, Arc<str>>, main: Option<&Path>) {
     let mut groups: HashMap<(String, String), Vec<usize>> = HashMap::new();
     for (position, entry) in index.entries.iter().enumerate().filter(|(_, entry)| !entry.year.is_empty()) {
         groups.entry((fold(&entry.authors), entry.year.clone())).or_default().push(position);
@@ -574,7 +643,7 @@ pub fn bbl_letters(bbl: &str) -> HashMap<String, Option<char>> {
 
 /// Folds key, authors, year, title and venue of every entry into one text,
 /// once, and sorts the entries as the picker lists them.
-fn search_text(index: &mut CitationIndex) {
+fn search_text(index: &mut Entries) {
     let mut arena = String::new();
     let mut spans = Vec::with_capacity(index.entries.len());
     for entry in &index.entries {
@@ -642,7 +711,7 @@ fn labels(index: &mut CitationIndex, project: &Project, cache: &mut Cache, open:
     }
 }
 
-impl CitationIndex {
+impl Entries {
     /// The entries with exactly this key.
     pub fn entries_with(&self, key: &str) -> impl Iterator<Item = &IndexedEntry> {
         self.by_key.get(key).into_iter().flatten().map(|position| &self.entries[*position as usize])
@@ -657,6 +726,9 @@ impl CitationIndex {
         self.by_folded_key.get(&key.to_lowercase())?.first().map(|position| &self.entries[*position as usize])
     }
 
+}
+
+impl CitationIndex {
     pub fn label(&self, name: &str) -> &[LabelDef] {
         self.labels.get(name).map_or(&[], Vec::as_slice)
     }
@@ -666,8 +738,10 @@ impl CitationIndex {
         self.labels.contains_key(name) || self.external_labels.contains(name)
     }
 
-    pub fn diagnostics(&self, path: &Path) -> &[Diagnostic] {
-        self.diagnostics.get(path).map_or(&[], Vec::as_slice)
+    /// What is wrong in one file: in a bibliography, or in a source.
+    pub fn diagnostics(&self, path: &Path) -> Vec<Diagnostic> {
+        let bib = self.bib.diagnostics.get(path).into_iter().flatten();
+        bib.chain(self.source_diagnostics.get(path).into_iter().flatten()).cloned().collect()
     }
 
     /// Every source file of the document.
@@ -680,6 +754,9 @@ impl CitationIndex {
         self.project.sources.iter().find(|source| source.path == path).map(|source| source.scan.as_ref())
     }
 
+}
+
+impl Entries {
     /// Entries that match every word of `query` in key, authors, year, title
     /// or venue, best first. An empty query lists them by author and year.
     /// One pass per entry over text folded beforehand; nothing is allocated
@@ -1024,6 +1101,21 @@ mod tests {
         assert!(hints.iter().any(|message| message == "Same title and year as dup1 at refs.bib:2: the same work under two keys?"), "{hints:?}");
     }
 
+    #[test]
+    fn an_edit_of_a_chapter_reuses_the_entries_and_an_edit_of_the_bib_does_not() {
+        let project = Project::new(THESIS);
+        let mut cache = Cache::default();
+        let first = project.index(&mut cache, Some("thesis.tex"), None, &HashMap::new());
+        let chapter: HashMap<PathBuf, Arc<str>> = [(project.path("chapters/01_intro.tex"), Arc::from("\\chapter{Intro}\\label{chap:new}\n"))].into();
+        let edited = project.index(&mut cache, Some("thesis.tex"), None, &chapter);
+        assert!(Arc::ptr_eq(&first.bib, &edited.bib));
+        assert!(edited.knows_label("chap:new") && !edited.knows_label("chap:intro"));
+        let bib: HashMap<PathBuf, Arc<str>> = [(project.path("refs/extra.bib"), Arc::from("@misc{fresh}"))].into();
+        let changed = project.index(&mut cache, Some("thesis.tex"), None, &bib);
+        assert!(!Arc::ptr_eq(&first.bib, &changed.bib));
+        assert!(changed.entry("fresh").is_some() && changed.entry("smith2020").is_none());
+    }
+
     /// A large bibliography, as it grows over a career, searched as one types.
     #[test]
     #[ignore = "timing, run with --release --ignored"]
@@ -1043,6 +1135,12 @@ mod tests {
         let again = project.index(&mut cache, Some("main.tex"), None, &HashMap::new());
         let rebuilt = started.elapsed();
         assert_eq!(again.entries.len(), 5000);
+        // Typing in the document: its text changes, the bibliography does not.
+        let typed: HashMap<PathBuf, Arc<str>> = [(project.path("main.tex"), Arc::from("\\documentclass{article}\\bibliography{big}\\cite{key1}"))].into();
+        let started = std::time::Instant::now();
+        project.index(&mut cache, Some("main.tex"), None, &typed);
+        let typed = started.elapsed();
+        println!("after typing in the document, rebuilt in {typed:?}");
         for query in ["a", "mu", "mueller 1999", "attention 4711", "jfill", "xyz"] {
             let mut fastest = std::time::Duration::MAX;
             let mut found = 0;

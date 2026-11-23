@@ -773,6 +773,7 @@ dependencies = [
 name = "build"
 version = "0.1.0"
 dependencies = [
+ "citations",
  "libc",
  "serde",
  "tempfile",
