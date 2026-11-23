@@ -79,6 +79,8 @@ mod git_sync;
 mod addon_host;
 #[path = "review.rs"]
 mod review;
+#[path = "citation_index.rs"]
+mod citation_index;
 
 const RECOVERY_DELAY: Duration = Duration::from_secs(1);
 const TOP_BAR_HEIGHT: f32 = 40.0;
@@ -573,7 +575,16 @@ pub struct Workspace {
     picker: Option<Picker>,
     /// Where `\cite{` last opened the picker by itself.
     citation_trigger: Option<(EntityId, usize)>,
-    citation_check_task: Option<Task<()>>,
+    /// What the document cites and refers to, rebuilt off the main thread after changes.
+    citations: Arc<citations::index::CitationIndex>,
+    /// Whether the first index is built, since before that an empty one says nothing.
+    citations_ready: bool,
+    citation_cache: Arc<std::sync::Mutex<citations::index::Cache>>,
+    /// The text of open documents by version, so that a rebuild copies only what changed.
+    citation_texts: HashMap<PathBuf, (u64, Arc<str>)>,
+    citations_task: Option<Task<()>>,
+    /// Something changed during a rebuild, so another one follows.
+    citations_stale: bool,
     /// The picker needs a window, so the next render opens it.
     open_citations_soon: bool,
     picker_focus: FocusHandle,
@@ -838,7 +849,12 @@ impl Workspace {
             storage_task: None,
             picker: None,
             citation_trigger: None,
-            citation_check_task: None,
+            citations: Arc::default(),
+            citations_ready: false,
+            citation_cache: Arc::default(),
+            citation_texts: HashMap::new(),
+            citations_task: None,
+            citations_stale: false,
             open_citations_soon: false,
             picker_focus: cx.focus_handle(),
             picker_scroll: ScrollHandle::new(),
@@ -1033,6 +1049,10 @@ impl Workspace {
             self.addon_project_closed(cx);
         }
         self.root = Some(root.clone());
+        self.citations = Arc::default();
+        self.citations_ready = false;
+        self.citation_cache = Arc::default();
+        self.schedule_citations(cx);
         let (vim_mode, cards) = (self.settings.vim_mode, self.settings.hub_cards);
         self.home.update(cx, |home, cx| {
             home.touch(&root, cx);
@@ -1173,6 +1193,7 @@ impl Workspace {
                 }
                 this.git_panel.update(cx, |panel, cx| panel.refresh(cx));
                 this.refresh_git(cx);
+                this.schedule_citations(cx);
                 cx.notify();
                 if std::mem::take(&mut this.refresh_again) {
                     this.refresh_in_background(cx);
@@ -1251,6 +1272,9 @@ impl Workspace {
                 this.collab_edited(&view, cx);
                 this.schedule_recovery(cx);
                 this.schedule_type_build(cx);
+                if view.read(cx).path.as_deref().is_some_and(citation_index::matters) {
+                    this.schedule_citations(cx);
+                }
                 this.check_citation_trigger(&view, cx);
                 this.addon_document_changed(&view, cx);
                 cx.notify();
@@ -1409,6 +1433,7 @@ impl Workspace {
         let view = self.documents[index].view.clone();
         window.focus(&view.read(cx).focus_handle(cx), cx);
         self.compile_if_document_changed(cx);
+        self.schedule_citations(cx);
         // The others see the switch, also before the cursor moves.
         #[cfg(feature = "collab")]
         self.collab_cursor(&view, cx);
@@ -2368,6 +2393,8 @@ impl Workspace {
 
     fn finish_build(&mut self, outcome: BuildOutcome, cx: &mut Context<Self>) {
         self.building = false;
+        // New numbers for the labels, and letters for the entries.
+        self.schedule_citations(cx);
         if self.dialog == Some(Dialog::Settings(SettingsPage::Storage)) {
             self.measure_storage(cx);
         }
@@ -4117,14 +4144,8 @@ impl Workspace {
         let scan_root = root.clone();
         let language = self.active_language(cx);
         let offered = if kind == PickerKind::Citations { self.offered_citations(cx) } else { Vec::new() };
-        // The letters of the last LaTeX build, and the labels that `@` cites in Typst.
-        let bbl = (kind == PickerKind::Citations && language == Some(Language::Latex))
-            .then(|| {
-                let active = self.active_view().and_then(|view| view.read(cx).path.clone());
-                find_main(&root, &self.config, active.as_deref())
-            })
-            .flatten()
-            .and_then(|main| bib::bbl_path(&main));
+        let index = self.citations.clone();
+        // The labels that `@` cites in Typst.
         let labels = if kind == PickerKind::Citations && language == Some(Language::Typst) { self.document_labels(cx) } else { Vec::new() };
         let repository = self.git_panel.read(cx).repository();
         if kind == PickerKind::Branches && repository.is_none() {
@@ -4142,13 +4163,18 @@ impl Workspace {
             task: None,
             themes: Arc::new(nvim_themes::Themes::new()),
             original: None,
+            citations: None,
         });
         window.focus(&self.picker_focus, cx);
         self.picker_files_task = Some(cx.spawn(async move |this, cx| {
-            let (files, entries) = cx
+            let (files, entries, citations) = cx
                 .background_spawn(async move {
                     if let Some(repository) = repository.filter(|_| kind == PickerKind::Branches) {
-                        return (Vec::new(), picker::branch_items(repository.branches().unwrap_or_default()));
+                        return (Vec::new(), picker::branch_items(repository.branches().unwrap_or_default()), None);
+                    }
+                    // Citations come from the index, without a walk of the project.
+                    if kind == PickerKind::Citations {
+                        return (Vec::new(), Vec::new(), Some(Arc::new(bib::CitationRows::new(index, offered, picker::label_items(labels)))));
                     }
                     let files = file_tree::scan(&scan_root, &HashSet::new())
                         .into_iter()
@@ -4158,24 +4184,17 @@ impl Workspace {
                             PickerKind::Files | PickerKind::Text | PickerKind::Branches | PickerKind::Themes | PickerKind::Fonts(_) | PickerKind::Commands => true,
                             PickerKind::History => false,
                             PickerKind::Figures => language.is_some_and(|language| snippets::is_figure_file(language, path)),
-                            PickerKind::Citations => path.extension().is_some_and(|extension| extension == "bib"),
+                            PickerKind::Citations => false,
                         })
                         .collect::<Vec<_>>();
-                    let entries = if kind == PickerKind::Citations {
-                        let bbl = bbl.and_then(|path| std::fs::read_to_string(path).ok());
-                        let mut entries = picker::merge_citations(bib::citation_items(&files, bbl.as_deref()), offered);
-                        entries.extend(picker::label_items(labels));
-                        entries
-                    } else {
-                        Vec::new()
-                    };
-                    (files, entries)
+                    (files, Vec::new(), None)
                 })
                 .await;
             this.update(cx, |this, cx| {
                 if let Some(picker) = &mut this.picker {
                     picker.files = Arc::new(files);
                     picker.entries = Arc::new(entries);
+                    picker.citations = citations;
                 }
                 this.refresh_picker(cx);
             })
@@ -4225,6 +4244,7 @@ impl Workspace {
             task: None,
             themes: Arc::default(),
             original: None,
+            citations: None,
         });
         window.focus(&self.picker_focus, cx);
         self.refresh_picker(cx);
@@ -4260,6 +4280,7 @@ impl Workspace {
             task: None,
             themes: Arc::new(themes),
             original: Some(theme::palette()),
+            citations: None,
         });
         window.focus(&self.picker_focus, cx);
         self.refresh_picker(cx);
@@ -4311,6 +4332,7 @@ impl Workspace {
             task: None,
             themes: Arc::new(nvim_themes::Themes::new()),
             original: None,
+            citations: None,
         });
         window.focus(&self.picker_focus, cx);
         self.picker_files_task = Some(cx.spawn(async move |this, cx| {
@@ -4367,6 +4389,7 @@ impl Workspace {
             task: None,
             themes: Arc::new(nvim_themes::Themes::new()),
             original: None,
+            citations: None,
         });
         window.focus(&self.picker_focus, cx);
         self.refresh_picker(cx);
@@ -4450,7 +4473,11 @@ impl Workspace {
                 picker.items = picker::match_files(&picker.files, &picker.root, &picker.query);
                 picker.selected = 0;
             }
-            PickerKind::Citations | PickerKind::History | PickerKind::Commands => {
+            PickerKind::Citations => {
+                picker.items = picker.citations.as_ref().map(|rows| rows.matches(&picker.query)).unwrap_or_default();
+                picker.selected = 0;
+            }
+            PickerKind::History | PickerKind::Commands => {
                 picker.items = picker::match_in_order(&picker.entries, &picker.query);
                 picker.selected = 0;
             }
@@ -4766,32 +4793,18 @@ impl Workspace {
             return;
         }
         self.citation_trigger = Some((id, head));
-        let Some(root) = self.root.clone() else {
+        if self.root.is_none() {
             return;
-        };
-        let offered = !self.offered_citations(cx).is_empty() || (language == Some(Language::Typst) && !self.document_labels(cx).is_empty());
-        let view = view.clone();
-        self.citation_check_task = Some(cx.spawn(async move |this, cx| {
-            let available = offered
-                || cx
-                    .background_spawn(async move {
-                        let files: Vec<PathBuf> = file_tree::scan(&root, &HashSet::new())
-                            .into_iter()
-                            .filter(|entry| !entry.is_dir && entry.path.extension().is_some_and(|extension| extension == "bib"))
-                            .map(|entry| entry.path)
-                            .collect();
-                        !bib::citation_items(&files, None).is_empty()
-                    })
-                    .await;
-            this.update(cx, |this, cx| {
-                let unmoved = Self::around_cursor(view.read(cx)).is_some_and(|(now, ..)| now == head);
-                if available && unmoved && this.active_view().as_ref() == Some(&view) {
-                    this.open_citations_soon = true;
-                    cx.notify();
-                }
-            })
-            .ok();
-        }));
+        }
+        // Before the first index is built, an empty one says nothing, so it opens anyway.
+        let available = !self.citations_ready
+            || !self.citations.entries.is_empty()
+            || !self.offered_citations(cx).is_empty()
+            || (language == Some(Language::Typst) && !self.document_labels(cx).is_empty());
+        if available {
+            self.open_citations_soon = true;
+            cx.notify();
+        }
     }
 
     fn insert_figure(&mut self, path: &Path, cx: &mut Context<Self>) {
