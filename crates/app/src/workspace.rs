@@ -3044,6 +3044,16 @@ impl Workspace {
         if self.git_key(event, window, cx) {
             return;
         }
+        // Cmd+Enter in the citation picker cites another key instead of compiling.
+        let secondary = if cfg!(target_os = "macos") { event.keystroke.modifiers.platform } else { event.keystroke.modifiers.control };
+        if secondary
+            && event.keystroke.key == "enter"
+            && self.picker.as_ref().is_some_and(|picker| picker.kind == PickerKind::Citations)
+        {
+            cx.stop_propagation();
+            self.cite_another(cx);
+            return;
+        }
         if event.keystroke.modifiers.platform {
             return;
         }
@@ -4871,9 +4881,6 @@ impl Workspace {
     fn picker_key(&mut self, keystroke: &Keystroke, window: &mut Window, cx: &mut Context<Self>) {
         match keystroke.key.as_str() {
             "escape" => return self.close_picker(window, cx),
-            "enter" if keystroke.modifiers.platform && self.picker.as_ref().is_some_and(|picker| picker.kind == PickerKind::Citations) => {
-                return self.cite_another(cx);
-            }
             "enter" => {
                 let selected = self.picker.as_ref().map_or(0, |picker| picker.selected);
                 return self.accept_picker(selected, window, cx);
