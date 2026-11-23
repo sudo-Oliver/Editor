@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+citations = { path = "../citations" }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
