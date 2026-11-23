@@ -274,8 +274,8 @@ fn missing_file(name: &str) -> Option<Explanation> {
         }
         return Some(Explanation {
             title: format!("The package {package} is not installed"),
-            hint: "Check the name in \\usepackage. If the name is right, update your LaTeX packages: new packages come with updates.".to_string(),
-            fix: Some(Fix::UpdateLatex),
+            hint: format!("Check the name in \\usepackage. If the name is right, install {package}: it takes a few seconds, and the document compiles again."),
+            fix: Some(Fix::InstallLatexPackage(format!("{package}.sty"))),
         });
     }
     if let Some(class) = name.strip_suffix(".cls") {
@@ -483,9 +483,9 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_or_old_package_offers_the_update() {
+    fn a_missing_package_offers_itself_and_an_old_one_the_update() {
         let diagnostic = Diagnostic { message: "LaTeX Error: File `zqxwvfancy.sty' not found.".into(), ..Default::default() };
-        assert_eq!(explain(&diagnostic).unwrap().fix, Some(Fix::UpdateLatex));
+        assert_eq!(explain(&diagnostic).unwrap().fix, Some(Fix::InstallLatexPackage("zqxwvfancy.sty".into())));
         let diagnostic = Diagnostic {
             message: "LaTeX Warning: You have requested, on input line 3, version `2026/01/01' of package siunitx,".into(),
             ..Default::default()

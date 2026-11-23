@@ -62,7 +62,7 @@ use crate::{
     snippets,
     status_bar::{self, StatusInfo},
     history,
-    texlive::{self, TexLive},
+    texlive::{self, TexLive, TexLiveEvent},
     text_file,
     theme,
     toolchain::{self, Tool, Toolchain, ToolchainEvent},
@@ -486,6 +486,7 @@ pub struct Workspace {
     /// Package updates and new years of MacTeX.
     texlive: Entity<TexLive>,
     _texlive_observer: Subscription,
+    _texlive_events: Subscription,
     /// Opens the setup at the next frame, for actions without a window.
     setup_requested: bool,
     /// The draft export that waits for Pandoc to be installed.
@@ -639,6 +640,13 @@ impl Workspace {
         let _updater_observer = cx.observe(&updater, |_, _, cx| cx.notify());
         let texlive = cx.new(TexLive::new);
         let _texlive_observer = cx.observe(&texlive, |_, _, cx| cx.notify());
+        let _texlive_events = cx.subscribe(&texlive, |this, _, event, cx| match event {
+            TexLiveEvent::Installed(package) => {
+                this.set_status(format!("{package} is installed. Compiling again."), cx);
+                this.recompile(cx);
+            }
+            TexLiveEvent::InstallFailed(error) => this.set_status(error.clone(), cx),
+        });
         let toolchain_subscriptions = [
             cx.observe(&toolchain, |_, _, cx| cx.notify()),
             cx.subscribe(&toolchain, |this, _, event, cx| match event {
@@ -766,6 +774,7 @@ impl Workspace {
             _mover_subscriptions,
             texlive,
             _texlive_observer,
+            _texlive_events,
             setup_requested: false,
             export_after_pandoc: None,
             tour: None,
@@ -2529,6 +2538,12 @@ impl Workspace {
             self.dialog = Some(Dialog::Settings(SettingsPage::Tools));
             return cx.notify();
         }
+        if let Fix::InstallLatexPackage(file) = fix {
+            let file = file.clone();
+            self.set_status(format!("Installing the package of {file}. macOS asks for your Mac password; Editor never sees it."), cx);
+            self.texlive.update(cx, |texlive, cx| texlive.install_file(file, cx));
+            return cx.notify();
+        }
         if *fix == Fix::UpdateLatex {
             // The settings say why macOS asks for the password, then ask.
             self.texlive.update(cx, |texlive, cx| texlive.ask_update(cx));
@@ -2554,7 +2569,7 @@ impl Workspace {
         let done = match fix {
             Fix::AddPackage(package) => format!("Added {package}"),
             Fix::RemovePackage(package) => format!("Removed {package}"),
-            Fix::InstallTool(_) | Fix::UpdateLatex => return,
+            Fix::InstallTool(_) | Fix::InstallLatexPackage(_) | Fix::UpdateLatex => return,
         };
         self.set_status(done, cx);
     }
@@ -2605,7 +2620,7 @@ impl Workspace {
 
     /// Whether `fix` can help on this Mac: updating packages needs MacTeX.
     fn offers(&self, fix: &Fix, cx: &App) -> bool {
-        *fix != Fix::UpdateLatex || self.texlive.read(cx).installed()
+        !matches!(fix, Fix::UpdateLatex | Fix::InstallLatexPackage(_)) || self.texlive.read(cx).installed()
     }
 
     /// Applies the package fix on the line of the cursor.
