@@ -4,6 +4,15 @@
 //! since MacTeX belongs to the system: one click, one password dialog of
 //! macOS, and tlmgr updates itself and every package.
 //!
+//! tlmgr changes packages one at a time, so a TeX Live it is still updating
+//! does not compile: hyperref can be new before nameref, which it now needs,
+//! is there, and the formats are rebuilt only at the end. An update that stops
+//! halfway leaves that for good, as tlmgr then takes the missing packages for
+//! removed on purpose. So tlmgr updates a clone of the year, which APFS makes
+//! in a minute without taking space, and the clone takes the place of the year
+//! only once it is done. LaTeX keeps working meanwhile, and a stopped update
+//! changes nothing.
+//!
 //! Each spring tug.org publishes the TeX Live of the new year, which the old
 //! one cannot update to. The weekly question finds out, since tlmgr then names
 //! both years. That beats asking the download server: MacTeX.pkg has the same
@@ -40,6 +49,40 @@ const LOOK_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 const LIST_TIMEOUT: Duration = Duration::from_secs(300);
 const POLL: Duration = Duration::from_millis(250);
 const UPDATE_PROMPT: &str = "Editor wants to update the LaTeX packages of MacTeX.";
+/// The name the update runs under, so that a later start of the app finds it.
+const UPDATE_NAME: &str = "editor-texlive-update";
+/// The last line of the log of an update that went through.
+const UPDATED: &str = "TeX Live is updated.";
+/// Runs as root with the TeX Live root, the year, and the folder of tlmgr
+/// within the year. Next to the year it keeps `<year>-update` for the clone,
+/// with `.pid` and `.log`. Only one runs at a time, even across starts of the
+/// app. Lines it writes before its log starts begin with `editor:`.
+const UPDATE_SCRIPT: &str = r#"cd "$1" || exit 1
+live=$2
+work=$2-update
+old=$2-previous
+if [ -f "$work.pid" ] && /bin/ps -p "$(cat "$work.pid")" >/dev/null; then
+  echo "editor: An update of the LaTeX packages is already running." >&2
+  exit 3
+fi
+echo $$ >"$work.pid"
+trap 'rm -f "$work.pid"' EXIT
+exec >"$work.log" 2>&1
+rm -rf "$work" "$old"
+echo "Preparing a copy of TeX Live $live, so that LaTeX keeps working meanwhile"
+/bin/cp -cR "$live" "$work" || { rm -rf "$work"; exit 1; }
+if ! "$1/$work/$3/tlmgr" update --self --all; then
+  echo "Removing the unfinished copy"
+  rm -rf "$work"
+  exit 1
+fi
+echo "Switching to the updated copy"
+mv "$live" "$old" || exit 1
+mv "$work" "$live" || { mv "$old" "$live"; exit 1; }
+echo "Removing the old copy"
+rm -rf "$old"
+echo "TeX Live is updated."
+"#;
 
 /// What `tlmgr update --list` said.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -255,42 +298,89 @@ fn last_line(log: &str) -> Option<&str> {
     log.lines().map(str::trim).rfind(|line| !line.is_empty())
 }
 
-/// Runs `tlmgr update --self --all` as an administrator. tlmgr updates
-/// itself first when it needs to, then every package. Its output goes to a
-/// file whose last line `line` follows. Blocks.
-fn update_packages(line: &Mutex<String>) -> Outcome {
-    let Some(tlmgr) = tlmgr() else {
-        return Outcome::Failed("MacTeX is not installed.".to_string());
+/// The clone of `year` an update works on, or its `.pid` and `.log` with `extension`.
+fn update_path(year: u16, extension: &str) -> PathBuf {
+    Path::new(TEXLIVE_ROOT).join(format!("{year}-update{extension}"))
+}
+
+/// The folder of tlmgr within the year, such as `bin/universal-darwin`.
+fn bin_within(year: u16) -> Option<PathBuf> {
+    let bin = std::fs::canonicalize(toolchain::MACTEX_TEXBIN).ok()?;
+    Some(bin.strip_prefix(Path::new(TEXLIVE_ROOT).join(year.to_string())).ok()?.to_path_buf())
+}
+
+/// Whether an update of `year` runs, maybe started before the app was. Blocks briefly.
+fn updating(year: u16) -> bool {
+    let Ok(pid) = std::fs::read_to_string(update_path(year, ".pid")) else {
+        return false;
     };
-    let log = match tempfile::Builder::new().prefix("editor-tlmgr-").suffix(".log").tempfile() {
-        Ok(log) => log,
-        Err(error) => return Outcome::Failed(format!("Cannot prepare the update: {error}")),
+    let Ok(output) = Command::new("/bin/ps").args(["-p", pid.trim(), "-o", "command="]).stderr(Stdio::null()).output() else {
+        return false;
     };
-    let path = log.path().to_path_buf();
+    output.status.success() && String::from_utf8_lossy(&output.stdout).contains(UPDATE_NAME)
+}
+
+/// Puts the last line of the update's log into `line`.
+fn show_progress(year: u16, line: &Mutex<String>) {
+    if let Ok(text) = std::fs::read_to_string(update_path(year, ".log"))
+        && let Some(last) = last_line(&text)
+        && let Ok(mut line) = line.lock()
+    {
+        *line = last.to_string();
+    }
+}
+
+/// How an update ended, from its log.
+fn ended(said: &str) -> Outcome {
+    if last_line(said) == Some(UPDATED) {
+        return Outcome::Done;
+    }
+    match newer_release(said) {
+        Some(year) => Outcome::NewRelease(year),
+        None => Outcome::Failed(failure(said)),
+    }
+}
+
+/// Updates tlmgr and every package of `year` as an administrator, on a clone
+/// that takes the place of the year once it is done. `line` follows the log.
+/// Blocks.
+fn update_packages(year: u16, line: &Mutex<String>) -> Outcome {
+    let Some(bin) = bin_within(year) else {
+        return Outcome::Failed(format!("MacTeX is not in {TEXLIVE_ROOT}, so Editor cannot update it."));
+    };
+    if updating(year) {
+        return follow_update(year, line);
+    }
     let work = std::thread::spawn(move || {
-        let script = OsStr::new("\"$0\" update --self --all >\"$1\" 2>&1");
-        toolchain::as_administrator(UPDATE_PROMPT, Path::new("/bin/sh"), &[OsStr::new("-c"), script, tlmgr.as_os_str(), path.as_os_str()])
+        let year = year.to_string();
+        let args = [OsStr::new("-c"), OsStr::new(UPDATE_SCRIPT), OsStr::new(UPDATE_NAME), OsStr::new(TEXLIVE_ROOT), OsStr::new(&year), bin.as_os_str()];
+        toolchain::as_administrator(UPDATE_PROMPT, Path::new("/bin/sh"), &args)
     });
     while !work.is_finished() {
-        if let Ok(text) = std::fs::read_to_string(log.path())
-            && let Some(last) = last_line(&text)
-            && let Ok(mut line) = line.lock()
-        {
-            *line = last.to_string();
-        }
+        show_progress(year, line);
         std::thread::sleep(POLL);
     }
-    let said = std::fs::read_to_string(log.path()).unwrap_or_default();
+    let said = std::fs::read_to_string(update_path(year, ".log")).unwrap_or_default();
     match work.join() {
         Ok(Ok(())) => Outcome::Done,
         Ok(Err(AdminError::Closed)) => Outcome::Closed,
-        Ok(Err(AdminError::Failed(error))) => match newer_release(&said) {
-            Some(year) => Outcome::NewRelease(year),
+        Ok(Err(AdminError::Failed(error))) => match error.split_once("editor: ") {
+            Some((_, why)) => Outcome::Failed(why.trim().to_string()),
             None if said.trim().is_empty() => Outcome::Failed(error),
-            None => Outcome::Failed(failure(&said)),
+            None => ended(&said),
         },
         Err(_) => Outcome::Failed("The update stopped unexpectedly.".to_string()),
     }
+}
+
+/// Follows an update that runs without the app waiting for it, as it was
+/// started before the app was, until it ends. Blocks.
+fn follow_update(year: u16, line: &Mutex<String>) -> Outcome {
+    while updating(year) {
+        show_progress(year, line);
+        std::thread::sleep(POLL);
+    }
+    ended(&std::fs::read_to_string(update_path(year, ".log")).unwrap_or_default())
 }
 
 /// Removes the TeX Live of `year` as an administrator, never the one in use. Blocks.
@@ -311,10 +401,14 @@ fn remove_year(year: u16) -> Outcome {
     }
 }
 
-/// Earlier years on the disk, with what each takes, measured once.
-fn look_around(known: Vec<(u16, Option<u64>)>) -> (Option<u16>, Vec<(u16, Option<u64>)>) {
+/// Earlier years of TeX Live, with what each takes in bytes.
+type Older = Vec<(u16, Option<u64>)>;
+
+/// Earlier years on the disk, with what each takes, measured once, and
+/// whether an update runs.
+fn look_around(known: Older) -> (Option<u16>, Older, bool) {
     let Some(current) = installed_year() else {
-        return (None, Vec::new());
+        return (None, Vec::new(), false);
     };
     let names = std::fs::read_dir(TEXLIVE_ROOT).into_iter().flatten().flatten().map(|entry| entry.file_name().to_string_lossy().into_owned());
     let older = older_years(names, current)
@@ -324,7 +418,7 @@ fn look_around(known: Vec<(u16, Option<u64>)>) -> (Option<u16>, Vec<(u16, Option
             (year, size.or_else(|| Some(storage::size_of(&Path::new(TEXLIVE_ROOT).join(year.to_string())))))
         })
         .collect();
-    (Some(current), older)
+    (Some(current), older, updating(current))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -390,12 +484,15 @@ impl TexLive {
     pub fn look(&mut self, cx: &mut Context<Self>) {
         let known = self.older.clone();
         cx.spawn(async move |this, cx| {
-            let (record, (year, older)) = cx.background_spawn(async move { (load(), look_around(known)) }).await;
+            let (record, (year, older, updating)) = cx.background_spawn(async move { (load(), look_around(known)) }).await;
             this.update(cx, |this, cx| {
                 this.record = record;
                 this.year = year;
                 this.older = older;
-                if let Some(year) = year
+                if updating && this.work.is_none() {
+                    // Started before this start of the app, so it is followed.
+                    this.update_packages(cx);
+                } else if let Some(year) = year
                     && due(this.record.checked, this.record.year, year, now())
                 {
                     this.check(cx);
@@ -457,17 +554,18 @@ impl TexLive {
         }
     }
 
+    /// Updates the packages, or follows the update that already runs.
     fn update_packages(&mut self, cx: &mut Context<Self>) {
-        if self.work.is_some() {
+        let Some(year) = self.year.filter(|_| self.work.is_none()) else {
             return;
-        }
+        };
         let line = Arc::new(Mutex::new(String::new()));
         self.work = Some(Work::Updating(line.clone()));
         self.said = None;
         cx.notify();
         let work = cx.background_spawn({
             let line = line.clone();
-            async move { update_packages(&line) }
+            async move { update_packages(year, &line) }
         });
         cx.spawn(async move |this, cx| {
             let mut work = std::pin::pin!(work);
@@ -567,7 +665,7 @@ pub fn section(texlive: &Entity<TexLive>, toolchain: &Entity<Toolchain>, cx: &Ap
     let line = |text: String| div().text_size(px(11.)).text_color(muted).child(text).into_any_element();
     match (&state.work, state.ask) {
         (Some(Work::Updating(progress)), _) => {
-            lines.push(line("tlmgr updates itself and every package. This takes a few minutes, and LaTeX keeps working meanwhile.".to_string()));
+            lines.push(line("tlmgr updates a copy of TeX Live, which takes its place once every package is done. With many updates this takes an hour or more. LaTeX keeps working meanwhile.".to_string()));
             let last = progress.lock().map(|line| line.clone()).unwrap_or_default();
             if !last.is_empty() {
                 lines.push(div().text_size(px(11.)).text_color(muted).truncate().font_family(theme::code_font()).child(last).into_any_element());
@@ -733,6 +831,16 @@ mod tests {
         assert!(matches!(parse_list(offline, false), Listed::Failed(error) if error.contains("No connection")));
         assert!(matches!(parse_list("tlmgr: Remote database is older than local\n", false), Listed::Failed(error) if error.contains("not caught up")));
         assert_eq!(parse_list("tlmgr: something new\n", false), Listed::Failed("something new".to_string()));
+    }
+
+    #[test]
+    fn only_a_log_that_ends_with_the_switch_is_an_update() {
+        assert_eq!(ended("Switching to the updated copy\nRemoving the old copy\nTeX Live is updated.\n"), Outcome::Done);
+        let stopped = "[ 823/1806, 23:26/49:51] update: match_parens [84k] (76442 -> 79202) ... done\nRemoving the unfinished copy\n";
+        assert!(matches!(ended(stopped), Outcome::Failed(_)));
+        let later = "tlmgr: Local TeX Live (2025) is older than remote repository (2026).\nRemoving the unfinished copy\n";
+        assert_eq!(ended(later), Outcome::NewRelease(2026));
+        assert!(UPDATE_SCRIPT.trim_end().ends_with(&format!("echo \"{UPDATED}\"")));
     }
 
     #[test]
