@@ -9,6 +9,10 @@ use std::{
 };
 
 use build::Loaded;
+use citations::{
+    index::CitationIndex,
+    lookup::{Definition, Target},
+};
 use editor_core::{
     Decoration, DecorationKind, EditorState, HighlightKind, Language, LineChange, Mark, MarkSeverity, MarkSource, Motion, Selection, Symbol,
     SymbolKind, TextChange,
@@ -97,6 +101,8 @@ pub enum EditorEvent {
     EditedByOthers,
     /// A plain click placed the cursor on this zero-based line.
     CursorClicked { line: usize },
+    /// Cmd+click on a key or label: open its definition and select it.
+    GoToDefinition { path: PathBuf, range: Range<usize>, line: usize },
 }
 
 const MAX_ROW_CHANGES: usize = 64;
@@ -244,6 +250,10 @@ pub struct EditorView {
     project_symbols: Arc<Vec<Symbol>>,
     /// What each label of the document is, such as `figure 3.2: Results`.
     label_details: Arc<HashMap<String, String>>,
+    /// The document's entries and labels, for hovering and jumping.
+    citations: Arc<CitationIndex>,
+    /// What the key or label under the pointer stands for.
+    hover: Option<Hover>,
     /// The packages the project loads, as of the last package check.
     loaded_packages: Arc<Loaded>,
     /// What those packages define and what the project already uses.
@@ -329,6 +339,8 @@ impl EditorView {
             auto_suggestions: false,
             project_symbols: Arc::default(),
             label_details: Arc::default(),
+            citations: Arc::default(),
+            hover: None,
             loaded_packages: Arc::default(),
             package_extra: Arc::default(),
             diff_base: None,
@@ -618,7 +630,6 @@ impl EditorView {
         }
     }
 
-    #[cfg_attr(not(feature = "collab"), allow(dead_code))]
     pub fn select_range(&mut self, range: Range<usize>, window: &mut Window, cx: &mut Context<Self>) {
         let length = self.state.buffer().len();
         self.state.set_selections(vec![Selection::new(range.start.min(length), range.end.min(length))]);
@@ -694,6 +705,70 @@ impl EditorView {
 
     pub fn set_label_details(&mut self, details: Arc<HashMap<String, String>>) {
         self.label_details = details;
+    }
+
+    pub fn set_citation_index(&mut self, citations: Arc<CitationIndex>) {
+        self.citations = citations;
+    }
+
+    /// The key or label at `offset`, read from its line.
+    fn citation_target(&self, offset: usize) -> Option<(Target, usize)> {
+        let language = match self.state.language() {
+            Language::Latex => citations::project::Language::Latex,
+            Language::Typst => citations::project::Language::Typst,
+            _ => return None,
+        };
+        let buffer = self.state.buffer();
+        let line = buffer.offset_to_line(offset);
+        let start = buffer.line_start(line);
+        let target = citations::lookup::target_at(language, &buffer.line_text(line), offset - start)?;
+        Some((target, start))
+    }
+
+    /// Asks to open the entry or label at the cursor.
+    fn go_to_definition(&mut self, cx: &mut Context<Self>) {
+        let head = self.state.selections().primary().head;
+        if let Some((target, _)) = self.citation_target(head)
+            && let Some((path, range, line)) = self.citations.definition(&target).and_then(|definition| definition.place())
+        {
+            cx.emit(EditorEvent::GoToDefinition { path, range, line });
+        }
+    }
+
+    /// Shows what the key or label under the pointer stands for, or nothing.
+    fn update_hover(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let found = self.citation_target(offset).and_then(|(target, start)| {
+            let range = start + target.range.start..start + target.range.end;
+            if self.hover.as_ref().is_some_and(|hover| hover.range == range) {
+                return Some(None);
+            }
+            let lines = hover_lines(&self.citations, &target)?;
+            Some(Some(Hover { range, lines }))
+        });
+        match found {
+            Some(None) => {}
+            Some(Some(hover)) => {
+                self.hover = Some(hover);
+                cx.notify();
+            }
+            None => self.clear_hover(cx),
+        }
+    }
+
+    fn clear_hover(&mut self, cx: &mut Context<Self>) {
+        if self.hover.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Selects a definition the index found. A range that no longer fits
+    /// the text, as after a change outside, goes to the start of `line`.
+    pub fn select_definition(&mut self, range: Range<usize>, line: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let buffer = self.state.buffer();
+        if range.end > buffer.len() || buffer.clip(range.start) != range.start || buffer.clip(range.end) != range.end {
+            return self.go_to_line(line, 0, window, cx);
+        }
+        self.select_range(range, window, cx);
     }
 
     pub fn set_project_symbols(&mut self, symbols: Arc<Vec<Symbol>>) {
@@ -954,16 +1029,54 @@ impl EditorView {
         )
     }
 
-    /// Below the start of the replaced text. Needs the rows of this frame.
+    /// The card of the hovered key or label, in the style of the suggestions.
+    fn render_hover(&self) -> Option<AnyElement> {
+        let hover = self.hover.as_ref()?;
+        let palette = theme::palette();
+        let lines = hover.lines.iter().map(|line| {
+            div()
+                .when(line.strong, |line| line.font_weight(FontWeight::SEMIBOLD))
+                .when(line.muted, |line| line.text_color(theme::color(palette.ui_muted)))
+                .child(line.text.clone())
+        });
+        Some(
+            div()
+                .id("hover")
+                .occlude()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .max_w(px(460.))
+                .px(px(10.))
+                .py(px(6.))
+                .rounded(px(4.))
+                .text_size(px(theme::code_font_size()))
+                .text_color(theme::color(palette.code_text))
+                .bg(theme::color(palette.panel))
+                .border_1()
+                .border_color(theme::color(palette.divider))
+                .shadow_lg()
+                .children(lines)
+                .into_any_element(),
+        )
+    }
+
+    /// Below the start of the replaced text, or of the hovered name. Needs
+    /// the rows of this frame.
     fn completion_origin(&self, bounds: Bounds<Pixels>, window: &mut Window) -> Option<Point<Pixels>> {
-        let completion = self.completion.as_ref()?;
-        let (row, x) = self.row_and_x(completion.start, window);
+        let start = match (&self.completion, &self.hover) {
+            (Some(completion), _) => completion.start,
+            (None, Some(hover)) => hover.range.start,
+            (None, None) => return None,
+        };
+        let (row, x) = self.row_and_x(start, window);
         let y = Self::line_height() * (row + 1) as f32 - self.scroll_y;
         Some(point(bounds.left() + self.gutter_width() + x, bounds.top() + y))
     }
 
     fn changed(&mut self, cx: &mut Context<Self>) {
         self.completion = None;
+        self.hover = None;
         self.autoscroll = true;
         self.schedule_parse(cx);
         cx.emit(EditorEvent::Edited);
@@ -1211,7 +1324,16 @@ impl EditorView {
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.focus_handle.focus(window, cx);
+        self.hover = None;
         let offset = self.position_to_offset(event.position, window);
+        // Cmd+click on a key or a label jumps to where it is defined.
+        if event.modifiers.secondary(cx)
+            && let Some((target, _)) = self.citation_target(offset)
+            && let Some((path, range, line)) = self.citations.definition(&target).and_then(|definition| definition.place())
+        {
+            cx.emit(EditorEvent::GoToDefinition { path, range, line });
+            return;
+        }
         if event.modifiers.secondary(cx) {
             self.state.toggle_cursor(offset);
         } else if event.modifiers.shift {
@@ -1242,6 +1364,10 @@ impl EditorView {
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
         if !self.is_selecting || event.pressed_button != Some(MouseButton::Left) {
+            if event.pressed_button.is_none() && self.completion.is_none() {
+                let offset = self.position_to_offset(event.position, window);
+                self.update_hover(offset, cx);
+            }
             return;
         }
         let offset = self.position_to_offset(event.position, window);
@@ -1255,6 +1381,7 @@ impl EditorView {
     }
 
     fn on_scroll(&mut self, event: &ScrollEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.hover = None;
         let delta = event.delta.pixel_delta(Self::line_height());
         self.scroll_y -= delta.y;
         if let Some(bounds) = self.bounds {
@@ -1471,6 +1598,7 @@ impl Render for EditorView {
             .on_action(cx.listener(|this, _: &Redo, _, cx| this.redo_edit(cx)))
             .on_action(cx.listener(|this, _: &Bold, _, cx| this.format(FormatKind::Bold, cx)))
             .on_action(cx.listener(|this, _: &Italic, _, cx| this.format(FormatKind::Italic, cx)))
+            .on_action(cx.listener(|this, _: &GoToDefinition, _, cx| this.go_to_definition(cx)))
             .on_action(cx.listener(|this, _: &Copy, _, cx| {
                 if let Some(text) = this.state.selected_text() {
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -1493,8 +1621,13 @@ impl Render for EditorView {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if !*hovered {
+                    this.clear_hover(cx);
+                }
+            }))
             .on_scroll(cx.listener(Self::on_scroll))
-            .child(EditorElement { view: cx.entity(), popup: self.render_completion(cx) })
+            .child(EditorElement { view: cx.entity(), popup: self.render_completion(cx).or_else(|| self.render_hover()) })
     }
 }
 
@@ -1640,6 +1773,82 @@ impl EntityInputHandler for EditorView {
         let offset = self.position_to_offset(position, window);
         Some(self.state.buffer().offset_to_utf16(offset))
     }
+}
+
+/// The card shown over a key or label under the pointer.
+struct Hover {
+    /// The name in the buffer.
+    range: Range<usize>,
+    lines: Vec<HoverLine>,
+}
+
+struct HoverLine {
+    text: String,
+    strong: bool,
+    muted: bool,
+}
+
+/// What the card says: the entry with its authors, title, venue and place,
+/// or the label with its kind, number, caption and place. Nothing for a
+/// name the document does not define, which its mark already explains.
+fn hover_lines(index: &CitationIndex, target: &Target) -> Option<Vec<HoverLine>> {
+    let line = |text: String, strong: bool, muted: bool| HoverLine { text, strong, muted };
+    let place = |path: &Path, line: usize| format!("{}:{}", path.file_name().map_or_else(String::new, |name| name.to_string_lossy().into_owned()), line + 1);
+    let mut lines = Vec::new();
+    match index.definition(target)? {
+        Definition::Entry(entry) => {
+            if !entry.full_authors.is_empty() {
+                lines.push(line(entry.full_authors.clone(), false, true));
+            }
+            if !entry.title.is_empty() {
+                lines.push(line(entry.title.clone(), true, false));
+            }
+            let mut venue = entry.venue.clone();
+            if !entry.year.is_empty() {
+                if !venue.is_empty() {
+                    venue.push_str(", ");
+                }
+                venue.push_str(&entry.year);
+                venue.extend(entry.letter);
+            }
+            if !venue.is_empty() {
+                lines.push(line(venue, false, false));
+            }
+            if !entry.doi.is_empty() {
+                lines.push(line(format!("doi: {}", entry.doi), false, true));
+            }
+            let at = if entry.kind == "bibitem" { place(&entry.path, entry.line).split(':').next().unwrap_or_default().to_string() } else { place(&entry.path, entry.line) };
+            lines.push(line(format!("@{} {}  {at}", entry.kind, entry.key), false, true));
+        }
+        Definition::Label(definitions) => {
+            let first = &definitions[0];
+            let mut what = match first.label.env.as_str() {
+                "" => "Label".to_string(),
+                env => {
+                    let env = env.trim_end_matches('*');
+                    let mut chars = env.chars();
+                    chars.next().map(|first| first.to_uppercase().chain(chars).collect()).unwrap_or_default()
+                }
+            };
+            if let Some(number) = first.number.as_deref().filter(|number| !number.is_empty()) {
+                what.push(' ');
+                what.push_str(number);
+            }
+            if let Some(page) = first.page.as_deref().filter(|page| !page.is_empty()) {
+                what.push_str(&format!(", page {page}"));
+            }
+            lines.push(line(what, true, false));
+            if let Some(caption) = &first.label.caption {
+                lines.push(line(caption.clone(), false, false));
+            }
+            let mut at = place(&first.path, first.label.line);
+            if definitions.len() > 1 {
+                at.push_str(&format!(", defined {} times", definitions.len()));
+            }
+            lines.push(line(at, false, true));
+        }
+    }
+    Some(lines)
 }
 
 struct EditorElement {
