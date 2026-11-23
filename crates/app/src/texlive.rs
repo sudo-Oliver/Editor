@@ -71,11 +71,32 @@ exec >"$work.log" 2>&1
 rm -rf "$work" "$old"
 echo "Preparing a copy of TeX Live $live, so that LaTeX keeps working meanwhile"
 /bin/cp -cR "$live" "$work" || { rm -rf "$work"; exit 1; }
-if ! "$1/$work/$3/tlmgr" update --self --all; then
+bin="$1/$work/$3"
+if ! "$bin/tlmgr" update --self --all; then
   echo "Removing the unfinished copy"
   rm -rf "$work"
   exit 1
 fi
+# The copy takes the place of TeX Live only when it compiles a document with
+# the common packages. A file it lacks, such as a package that an earlier,
+# stopped update left out, is installed into the copy first.
+test=$(mktemp -d)
+printf '%s\n' '\documentclass{article}' '\usepackage[T1]{fontenc}' '\usepackage{lmodern,amsmath,amssymb,graphicx,xcolor,booktabs,tikz,hyperref,cleveref}' '\begin{document}\section{A}\label{a}See \cref{a}.\end{document}' >"$test/check.tex"
+tries=0
+until (cd "$test" && "$bin/pdflatex" -interaction=nonstopmode -halt-on-error check.tex >/dev/null 2>&1); do
+  missing=$(sed -n "s/.*File \`\(.*\)' not found.*/\1/p" "$test/check.log" | head -n 1)
+  tries=$((tries + 1))
+  if [ -z "$missing" ] || [ "$tries" -gt 5 ]; then
+    sed -n '/^!/,+2p' "$test/check.log" | head -n 6
+    echo "The updated copy could not compile a test document, so TeX Live stays as it was and keeps working."
+    rm -rf "$work" "$test"
+    exit 1
+  fi
+  package=$("$bin/tlmgr" search --global --file "/$missing" | sed -n 's/^\([^[:space:]]*\):$/\1/p' | head -n 1)
+  echo "Installing ${package:-${missing%.*}}, which the copy lacks"
+  "$bin/tlmgr" install "${package:-${missing%.*}}"
+done
+rm -rf "$test"
 echo "Switching to the updated copy"
 mv "$live" "$old" || exit 1
 mv "$work" "$live" || { mv "$old" "$live"; exit 1; }
@@ -89,7 +110,7 @@ echo "TeX Live is updated."
 pub enum Listed {
     /// Packages with a newer version. `tlmgr_first` when tlmgr has to update
     /// itself before it can tell all of them.
-    Updates { count: usize, tlmgr_first: bool },
+    Updates { count: usize, tlmgr_first: bool, bytes: u64 },
     /// The year gets no more updates, since the next one is being prepared.
     Frozen,
     /// The server already has the TeX Live of a later year.
@@ -107,6 +128,8 @@ struct Record {
     year: u16,
     updates: usize,
     tlmgr_first: bool,
+    /// What the updates download, in bytes.
+    bytes: u64,
     frozen: bool,
     /// The later year the server has, if any.
     newer: Option<u16>,
@@ -235,7 +258,8 @@ pub fn parse_list(said: &str, success: bool) -> Listed {
             }
         }
     }
-    Listed::Updates { count, tlmgr_first }
+    let bytes = said.lines().find_map(|line| line.trim().strip_prefix("total-bytes")?.trim().parse().ok()).unwrap_or(0);
+    Listed::Updates { count, tlmgr_first, bytes }
 }
 
 /// Runs `command` and returns what it printed on both streams, and whether it
@@ -383,6 +407,38 @@ fn follow_update(year: u16, line: &Mutex<String>) -> Outcome {
     ended(&std::fs::read_to_string(update_path(year, ".log")).unwrap_or_default())
 }
 
+/// The package of TeX Live that has `file`, such as `nameref` for
+/// `nameref.sty`, asked of the server. The file's name without its
+/// extension when the server cannot say. Blocks for a few seconds.
+fn package_of(file: &str) -> String {
+    let fallback = file.rsplit_once('.').map_or(file, |(stem, _)| stem).to_string();
+    let Some(tlmgr) = tlmgr() else {
+        return fallback;
+    };
+    let mut command = Command::new(tlmgr);
+    command.args(["search", "--global", "--file", &format!("/{file}")]);
+    match run_for(command, LIST_TIMEOUT) {
+        Ok((said, true)) => said
+            .lines()
+            .find_map(|line| line.strip_suffix(':').filter(|name| !name.is_empty() && name.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))))
+            .map_or(fallback, str::to_string),
+        _ => fallback,
+    }
+}
+
+/// Installs the package that has `file` as an administrator, into the TeX
+/// Live in use: one package, which takes seconds. Blocks.
+fn install_file(file: &str) -> Result<String, String> {
+    let tlmgr = tlmgr().ok_or("MacTeX is not installed.")?;
+    let package = package_of(file);
+    let prompt = format!("Editor wants to install the LaTeX package {package}.");
+    match toolchain::as_administrator(&prompt, &tlmgr, &[OsStr::new("install"), OsStr::new(&package)]) {
+        Ok(()) => Ok(package),
+        Err(AdminError::Closed) => Err("Nothing changed, since the password dialog was closed.".to_string()),
+        Err(AdminError::Failed(error)) => Err(format!("{package} could not be installed. {}", failure(&error))),
+    }
+}
+
 /// Removes the TeX Live of `year` as an administrator, never the one in use. Blocks.
 fn remove_year(year: u16) -> Outcome {
     if installed_year().is_none_or(|current| current <= year) {
@@ -431,7 +487,17 @@ enum Work {
     Checking,
     Updating(Arc<Mutex<String>>),
     Removing(u16),
+    /// One package, for a file a document misses.
+    Installing(String),
 }
+
+/// What the workspace hears, so that it compiles again after an install.
+pub enum TexLiveEvent {
+    Installed(String),
+    InstallFailed(String),
+}
+
+impl gpui::EventEmitter<TexLiveEvent> for TexLive {}
 
 /// The state of MacTeX's packages, which the settings show next to the compilers.
 pub struct TexLive {
@@ -517,7 +583,7 @@ impl TexLive {
                 this.work = None;
                 let checked = Record { checked: now(), year, ..Record::default() };
                 let record = match listed {
-                    Listed::Updates { count, tlmgr_first } => Record { updates: count, tlmgr_first, ..checked },
+                    Listed::Updates { count, tlmgr_first, bytes } => Record { updates: count, tlmgr_first, bytes, ..checked },
                     Listed::Frozen => Record { frozen: true, ..checked },
                     Listed::NewRelease(newer) => Record { newer: Some(newer), ..checked },
                     Listed::Failed(error) => {
@@ -607,6 +673,38 @@ impl TexLive {
         .detach();
     }
 
+    /// Installs the package that has `file`, which a document misses, and
+    /// says how it went, so that the document compiles again.
+    pub fn install_file(&mut self, file: String, cx: &mut Context<Self>) {
+        if self.work.as_ref().is_some_and(|work| !matches!(work, Work::Checking)) {
+            cx.emit(TexLiveEvent::InstallFailed("LaTeX is busy with an update. Try again when it is done.".to_string()));
+            return;
+        }
+        let name = file.rsplit_once('.').map_or(file.as_str(), |(stem, _)| stem).to_string();
+        self.work = Some(Work::Installing(name));
+        self.said = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_spawn(async move { install_file(&file) }).await;
+            this.update(cx, |this, cx| {
+                this.work = None;
+                match result {
+                    Ok(package) => {
+                        this.said = Some((format!("{package} is installed."), false));
+                        cx.emit(TexLiveEvent::Installed(package));
+                    }
+                    Err(error) => {
+                        this.said = Some((error.clone(), true));
+                        cx.emit(TexLiveEvent::InstallFailed(error));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn remove(&mut self, year: u16, cx: &mut Context<Self>) {
         if self.work.is_some() {
             return;
@@ -650,11 +748,13 @@ pub fn section(texlive: &Entity<TexLive>, toolchain: &Entity<Toolchain>, cx: &Ap
         Some(Work::Checking) => "Checking for updates…".into(),
         Some(Work::Updating(_)) => "Updating…".into(),
         Some(Work::Removing(old)) => format!("Removing TeX Live {old}…").into(),
+        Some(Work::Installing(package)) => format!("Installing {package}…").into(),
         None if newer.is_some() => "A new year is out".into(),
         None if !fresh => "Not checked yet".into(),
         None if record.frozen => "No more updates this year".into(),
         None if record.tlmgr_first => "Updates available".into(),
         None if record.updates == 1 => "1 package update available".into(),
+        None if record.updates > 1 && record.bytes > 0 => format!("{} package updates, {}", record.updates, storage::human(record.bytes)).into(),
         None if record.updates > 1 => format!("{} package updates available", record.updates).into(),
         None => "Up to date".into(),
     };
@@ -674,7 +774,16 @@ pub fn section(texlive: &Entity<TexLive>, toolchain: &Entity<Toolchain>, cx: &Ap
         (Some(_), _) => {}
         (None, Some(ask)) => {
             let text = match ask {
-                Ask::Update => "MacTeX belongs to your Mac's system, so macOS asks for your Mac password to update it. Editor never sees the password.".to_string(),
+                Ask::Update => {
+                    // Honest about the time: a year's updates are many packages.
+                    let size = if state.record.bytes > 0 { format!(" and downloads {}", storage::human(state.record.bytes)) } else { String::new() };
+                    let many = state.record.updates > 100;
+                    format!(
+                        "This updates {} packages{size}{}. LaTeX keeps working meanwhile, and nothing changes until the update has passed a test compile. A missing package alone needs no update: the fix of its error installs just that one. MacTeX belongs to your Mac's system, so macOS asks for your Mac password. Editor never sees it.",
+                        state.record.updates.max(1),
+                        if many { ", which can take an hour" } else { "" }
+                    )
+                }
                 Ask::Remove(old) => {
                     let frees = state.older.iter().find(|(other, _)| *other == old).and_then(|(_, size)| *size).map_or(String::new(), |size| format!(" and frees {}", storage::human(size)));
                     format!("This deletes {TEXLIVE_ROOT}/{old}{frees}. It belongs to your Mac's system, so macOS asks for your Mac password. Editor never sees the password.")
@@ -798,23 +907,23 @@ mod tests {
 
     #[test]
     fn updates_are_counted_from_the_machine_readable_list() {
-        assert_eq!(parse_list(MACHINE, true), Listed::Updates { count: 3, tlmgr_first: false });
+        assert_eq!(parse_list(MACHINE, true), Listed::Updates { count: 3, tlmgr_first: false, bytes: 1234567 });
         let empty = "location-url\thttps://x\ntotal-bytes\t0\nend-of-header\nend-of-updates\n";
-        assert_eq!(parse_list(empty, true), Listed::Updates { count: 0, tlmgr_first: false });
+        assert_eq!(parse_list(empty, true), Listed::Updates { count: 0, tlmgr_first: false, bytes: 0 });
     }
 
     #[test]
     fn the_plain_list_of_older_versions_counts_too() {
         let plain = "tlmgr: package repository https://mirror.ctan.org/systems/texlive/tlnet (verified)\nupdate:   babel  [1234k]: local:    68432, source:    69000\nauto-install: newpkg\n";
-        assert_eq!(parse_list(plain, true), Listed::Updates { count: 2, tlmgr_first: false });
+        assert_eq!(parse_list(plain, true), Listed::Updates { count: 2, tlmgr_first: false, bytes: 0 });
     }
 
     #[test]
     fn tlmgr_that_must_update_itself_is_noticed() {
         let said = "end-of-header\ntexlive.infra\tu\t1\t2\t3\t-\t-\t-\t-\t-\t-\nend-of-updates\n";
-        assert_eq!(parse_list(said, true), Listed::Updates { count: 1, tlmgr_first: true });
+        assert_eq!(parse_list(said, true), Listed::Updates { count: 1, tlmgr_first: true, bytes: 0 });
         let said = "tlmgr itself needs to be updated.\nPlease do this via either\n  tlmgr update --self\n";
-        assert_eq!(parse_list(said, true), Listed::Updates { count: 0, tlmgr_first: true });
+        assert_eq!(parse_list(said, true), Listed::Updates { count: 0, tlmgr_first: true, bytes: 0 });
     }
 
     #[test]
@@ -871,7 +980,7 @@ mod tests {
 
     #[test]
     fn the_record_survives_a_round_trip() {
-        let record = Record { checked: 5, year: 2025, updates: 3, tlmgr_first: false, frozen: false, newer: Some(2026) };
+        let record = Record { checked: 5, year: 2025, updates: 3, tlmgr_first: false, bytes: 7, frozen: false, newer: Some(2026) };
         assert_eq!(toml::from_str::<Record>(&toml::to_string(&record).unwrap()).unwrap(), record);
         assert_eq!(toml::from_str::<Record>("").unwrap(), Record::default());
     }
