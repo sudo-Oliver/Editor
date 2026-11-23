@@ -715,6 +715,7 @@ impl Workspace {
             Some(("add_package", package)) => Fix::AddPackage(package.to_string()),
             Some(("remove_package", package)) => Fix::RemovePackage(package.to_string()),
             Some(("install_tool", _)) => return Err("Installing a compiler needs the user. Ask them to use the fix in the editor.".to_string()),
+            Some(("install_latex_package", _)) => return Err("Installing a LaTeX package needs the Mac password. Ask the user to use the fix in the editor.".to_string()),
             None if id == "update_latex" => return Err("Updating LaTeX needs the Mac password. Ask the user to use the fix in the editor.".to_string()),
             _ => return Err(format!("No fix is called {id}.")),
         };

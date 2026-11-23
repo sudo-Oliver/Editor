@@ -237,6 +237,7 @@ pub fn fix_id(fix: &Fix) -> String {
         Fix::AddPackage(package) => format!("add_package:{package}"),
         Fix::RemovePackage(package) => format!("remove_package:{package}"),
         Fix::InstallTool(tool) => format!("install_tool:{tool}"),
+        Fix::InstallLatexPackage(file) => format!("install_latex_package:{file}"),
         Fix::UpdateLatex => "update_latex".to_string(),
     }
 }
