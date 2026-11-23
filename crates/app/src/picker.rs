@@ -95,6 +95,8 @@ pub struct Picker {
     pub original: Option<theme::Palette>,
     /// The citation picker's rows, searched through the citation index.
     pub citations: Option<Arc<crate::bib::CitationRows>>,
+    /// Keys the citation at the cursor already has, which the list leaves out.
+    pub cited: Vec<String>,
 }
 
 pub fn relative_label(path: &Path, root: &Path) -> String {

@@ -91,16 +91,29 @@ impl CitationRows {
         Self { index, rows, positions, others }
     }
 
-    /// The rows that match `query`: the index's search first, then the rest.
-    pub fn matches(&self, query: &str) -> Vec<PickerItem> {
+    /// The rows that match `query`, without the keys in `cited`: the index's
+    /// search first, then the rest. At most as many as the list shows.
+    pub fn matches(&self, query: &str, cited: &[String]) -> Vec<PickerItem> {
+        let wanted = |row: &&PickerItem| !cited.contains(&row.label);
+        let limit = crate::picker::MAX_RESULTS;
         if query.trim().is_empty() {
-            return self.rows.clone();
+            return self.rows.iter().filter(wanted).take(limit).cloned().collect();
         }
-        let mut found: Vec<PickerItem> =
-            self.index.search(query, crate::picker::MAX_RESULTS).into_iter().filter_map(|entry| self.positions.get(&entry.key)).map(|position| self.rows[*position].clone()).collect();
-        found.extend(crate::picker::match_entries(&self.others, query));
-        found.truncate(crate::picker::MAX_RESULTS);
+        let indexed = self.index.search(query, limit + cited.len()).into_iter().filter_map(|entry| self.positions.get(&entry.key)).map(|position| &self.rows[*position]);
+        let mut found: Vec<PickerItem> = indexed.filter(wanted).cloned().collect();
+        found.extend(crate::picker::match_entries(&self.others, query).into_iter().filter(|row| !cited.contains(&row.label)));
+        found.truncate(limit);
         found
+    }
+
+    /// The entry behind a row, for the details beside the list.
+    pub fn entry(&self, key: &str) -> Option<&IndexedEntry> {
+        self.index.entry(key)
+    }
+
+    /// How many rows there are in all.
+    pub fn len(&self) -> usize {
+        self.rows.len()
     }
 }
 

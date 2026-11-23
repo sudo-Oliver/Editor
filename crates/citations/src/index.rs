@@ -154,6 +154,8 @@ pub struct IndexedEntry {
     pub path: Arc<PathBuf>,
     pub key_range: Range<usize>,
     pub range: Range<usize>,
+    /// The line of the entry in its file, from 0.
+    pub line: usize,
     /// `Müller et al.`, as natbib writes them.
     pub authors: String,
     pub full_authors: String,
@@ -330,6 +332,7 @@ pub fn build(cache: &mut Cache, inputs: &Inputs) -> CitationIndex {
                 path: shared.clone(),
                 key_range: entry.key_range.clone(),
                 range: entry.range.clone(),
+                line: entry.line,
                 fields,
                 ..IndexedEntry::default()
             });

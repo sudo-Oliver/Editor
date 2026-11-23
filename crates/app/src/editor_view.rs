@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     hash::{DefaultHasher, Hasher},
     io,
     ops::Range,
@@ -241,6 +242,8 @@ pub struct EditorView {
     auto_suggestions: bool,
     /// What the other open documents define.
     project_symbols: Arc<Vec<Symbol>>,
+    /// What each label of the document is, such as `figure 3.2: Results`.
+    label_details: Arc<HashMap<String, String>>,
     /// The packages the project loads, as of the last package check.
     loaded_packages: Arc<Loaded>,
     /// What those packages define and what the project already uses.
@@ -325,6 +328,7 @@ impl EditorView {
             completion: None,
             auto_suggestions: false,
             project_symbols: Arc::default(),
+            label_details: Arc::default(),
             loaded_packages: Arc::default(),
             package_extra: Arc::default(),
             diff_base: None,
@@ -681,6 +685,10 @@ impl EditorView {
         cx.notify();
     }
 
+    pub fn set_label_details(&mut self, details: Arc<HashMap<String, String>>) {
+        self.label_details = details;
+    }
+
     pub fn set_project_symbols(&mut self, symbols: Arc<Vec<Symbol>>) {
         self.project_symbols = symbols;
     }
@@ -868,7 +876,8 @@ impl EditorView {
         // A `\usepackage` typed since the last check counts at once.
         let packages = symbols().filter(|symbol| symbol.kind == SymbolKind::Package).flat_map(|symbol| symbol.name.split(','));
         let loaded = self.loaded_packages.with(packages);
-        let items = completion::suggestions(language, trigger.kind, &before[trigger.start..], symbols(), &loaded, &self.package_extra);
+        let hints = completion::LabelHints { details: Some(&self.label_details), prefer: trigger.prefer };
+        let items = completion::suggestions(language, trigger.kind, &before[trigger.start..], symbols(), &loaded, &self.package_extra, hints);
         if !items.is_empty() {
             self.completion = Some(Completion { start: line_start + trigger.start, head, items, selected: 0 });
         }
