@@ -538,6 +538,8 @@ pub struct Workspace {
     report_with_details: bool,
     report_preview: bool,
     report_error: Option<SharedString>,
+    /// The details as the dialog opened, so that drawing it reads nothing.
+    report_snapshot: Option<problem_report::Details>,
     /// What the app wrote when it quit unexpectedly last time, until reported.
     crash_report: Option<String>,
     pdf: Entity<PdfView>,
@@ -859,6 +861,7 @@ impl Workspace {
             report_with_details: true,
             report_preview: false,
             report_error: None,
+            report_snapshot: None,
             crash_report: problem_report::take_crash(),
             pdf,
             markdown,
@@ -1142,7 +1145,14 @@ impl Workspace {
             });
         if let Some(path) = first {
             self.open_file(path, window, cx);
-            self.build_when_free(cx);
+            // A build of the project before must not finish into this one.
+            if self.markdown_view(cx).is_some() {
+                self.build.cancel();
+                self.build_task = None;
+                self.building = false;
+            } else {
+                self.recompile(cx);
+            }
         }
         self.forget_saved_recovery(cx);
         let swept = root.clone();

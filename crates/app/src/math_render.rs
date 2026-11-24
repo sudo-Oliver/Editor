@@ -11,6 +11,10 @@ use std::{
 
 /// Longer than any sane run of formulas, which takes well under a second.
 const TIMEOUT: Duration = Duration::from_secs(20);
+/// Tectonic fetches its packages on its first run, which takes minutes.
+const TECTONIC_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// What `typeset` says when LaTeX did not finish in time.
+pub const TOO_LONG: &str = "LaTeX took too long.";
 
 /// Bitmap pixels per PDF point. 1.7 logical pixels per point set 10 pt math
 /// a little above the 16 px text, and twice that keeps it sharp on Retina.
@@ -130,10 +134,10 @@ pub fn typeset(engine: &Path, formulas: &[&str]) -> Result<(Vec<u8>, Vec<usize>)
         if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
             break status;
         }
-        if started.elapsed() > TIMEOUT {
+        if started.elapsed() > if tectonic { TECTONIC_TIMEOUT } else { TIMEOUT } {
             child.kill().ok();
             child.wait().ok();
-            return Err("LaTeX took too long.".to_string());
+            return Err(TOO_LONG.to_string());
         }
         std::thread::sleep(Duration::from_millis(10));
     };
