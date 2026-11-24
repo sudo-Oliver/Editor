@@ -679,6 +679,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_failed_template_copy_leaves_no_half_template() {
         let directory = tempfile::tempdir().unwrap();
         let project = directory.path().join("project");
