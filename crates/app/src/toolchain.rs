@@ -418,18 +418,42 @@ pub fn probe(language: Tool) -> Result<(), String> {
     };
     let text = if language == Tool::Typst { PROBE_TYPST } else { PROBE_LATEX };
     std::fs::write(directory.path().join(file), text).map_err(|error| format!("Cannot prepare the test: {error}"))?;
-    let output = command
+    // Into files, so that a talkative compiler cannot fill a pipe and stall.
+    let prepare = |error: std::io::Error| format!("Cannot prepare the test: {error}");
+    // Not `probe.out`, which hyperref writes for the bookmarks.
+    let said_path = directory.path().join("compiler-said.txt");
+    let said_file = std::fs::File::create(&said_path).map_err(prepare)?;
+    let mut child = command
         .current_dir(directory.path())
         .envs(build::child_env())
         .stdin(Stdio::null())
-        .output()
+        .stdout(said_file.try_clone().map_err(prepare)?)
+        .stderr(said_file)
+        .spawn()
         .map_err(|error| format!("Cannot start the compiler: {error}"))?;
-    if output.status.success() && directory.path().join("probe.pdf").is_file() {
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|error| format!("Cannot run the test: {error}"))? {
+            break status;
+        }
+        // Without the internet, the first fetch of packages can wait forever.
+        if started.elapsed() > PROBE_TIMEOUT {
+            child.kill().ok();
+            child.wait().ok();
+            return Err("The test took too long. Check the internet connection, then press Test again.".to_string());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    if status.success() && directory.path().join("probe.pdf").is_file() {
         return Ok(());
     }
-    let said = format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    let said = std::fs::read_to_string(&said_path).unwrap_or_default();
     Err(probe_failure(&said))
 }
+
+/// Tectonic fetches its packages on the first compile, which takes two or three
+/// minutes on a normal line; far more means it is stuck.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// Why a test compile failed, in words that say what to do.
 fn probe_failure(said: &str) -> String {
@@ -1628,6 +1652,30 @@ mod live {
         time("find(Typst)", &|| drop(find(Tool::Typst)));
         time("latex()", &|| drop(latex()));
         time("homebrew()", &|| drop(homebrew()));
+    }
+
+    /// What the setup does on a fresh Mac without Homebrew: download, check,
+    /// unpack, and compile the test document with the program alone.
+    /// Needs the internet: cargo test -p app fresh_mac -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn fresh_mac_installs_compile() {
+        for (tool, file, text, args) in [
+            (Tool::Typst, "probe.typ", PROBE_TYPST, vec!["compile", "probe.typ"]),
+            (Tool::Tectonic, "probe.tex", PROBE_LATEX, vec!["--keep-logs", "probe.tex"]),
+        ] {
+            let started = Instant::now();
+            let release = tool.release().unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let (received, cancel) = (AtomicU64::new(0), AtomicBool::new(false));
+            let program = install_release(tool, &release, directory.path(), &received, &cancel).unwrap();
+            let work = tempfile::tempdir().unwrap();
+            std::fs::write(work.path().join(file), text).unwrap();
+            let output = Command::new(&program).args(&args).current_dir(work.path()).stdin(Stdio::null()).output().unwrap();
+            assert!(output.status.success(), "{tool:?}: {}", String::from_utf8_lossy(&output.stderr));
+            assert!(work.path().join(file.replace(".typ", ".pdf").replace(".tex", ".pdf")).is_file(), "{tool:?} made no PDF");
+            println!("{tool:?}: installed and compiled in {:?}", started.elapsed());
+        }
     }
 
     /// Needs the compilers and the internet: cargo test -p app live -- --ignored
