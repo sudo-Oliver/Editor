@@ -16,7 +16,7 @@ use std::{
 use crate::{
     Diagnostic, Severity, aux, lint,
     bib::{self, Bib, Part},
-    fuzzy, hayagriva,
+    fuzzy, hayagriva, markdown,
     project::{self, Backend, Env, Language, Project},
     scan::{Key, Label, Scan},
     tex,
@@ -141,6 +141,7 @@ impl Cache {
         let parsed = match kind {
             Kind::Scan(Language::Latex) => Parsed::Scan(Arc::new(tex::scan(&text))),
             Kind::Scan(Language::Typst) => Parsed::Scan(Arc::new(typst::scan(&text))),
+            Kind::Scan(Language::Markdown) => Parsed::Scan(Arc::new(markdown::scan(&text))),
             Kind::Bib => {
                 let yaml = path.extension().is_some_and(|extension| extension == "yml" || extension == "yaml");
                 Parsed::Bib(Arc::new(BibFile { bib: if yaml { hayagriva::parse(&text) } else { bib::parse(&text) }, latin1 }))

@@ -36,8 +36,12 @@ pub fn write(directory: &Path, path: &Path, text: &str) -> io::Result<()> {
 }
 
 fn create_private(directory: &Path) -> io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    fs::DirBuilder::new().recursive(true).mode(0o700).create(directory)
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    // On Windows the folder inherits the rights of the user's data folder.
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(directory)
 }
 
 pub fn remove(directory: &Path, path: &Path) {
@@ -74,8 +78,7 @@ pub fn pending(directory: &Path, root: &Path) -> Vec<Snapshot> {
 }
 
 fn process_runs(pid: u32) -> bool {
-    // SAFETY: `kill` takes plain values, and signal 0 sends nothing.
-    pid == std::process::id() || unsafe { libc::kill(pid as libc::pid_t, 0) } == 0
+    pid == std::process::id() || build::process_running(pid)
 }
 
 #[cfg(test)]
@@ -131,6 +134,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn copies_stay_private() {
         use std::os::unix::fs::PermissionsExt;
         let parent = tempfile::tempdir().unwrap();

@@ -45,6 +45,9 @@ impl Program {
             // Reading must leave the index alone, or the file watcher would
             // see the write and read again, without end.
             .args(["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.quotePath=false"]);
+        // No console window flashing up for every status check on Windows.
+        #[cfg(windows)]
+        std::os::windows::process::CommandExt::creation_flags(&mut command, 0x0800_0000);
         command
     }
 

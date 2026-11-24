@@ -239,11 +239,22 @@ fn current_file(files: &[Option<String>]) -> Option<&str> {
     files.iter().rev().find_map(|file| file.as_deref())
 }
 
+/// Whether `text` starts with a path as TeX prints one: relative, absolute,
+/// or with a Windows drive, as in `C:/Users/…` or `C:\Users\…`.
+fn starts_path(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let drive = bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'/' | b'\\');
+    drive || ["./", "/", "../", ".\\", "..\\"].iter().any(|start| text.starts_with(start))
+}
+
 fn file_line_error(line: &str) -> Option<(&str, usize, &str)> {
-    if !(line.starts_with("./") || line.starts_with('/') || line.starts_with("../")) {
+    if !starts_path(line) {
         return None;
     }
-    let (file, rest) = line.split_once(':')?;
+    // The colon after a drive letter is part of the path.
+    let skip = if line.as_bytes().get(1) == Some(&b':') { 2 } else { 0 };
+    let colon = skip + line[skip..].find(':')?;
+    let (file, rest) = (&line[..colon], &line[colon + 1..]);
     let (number, message) = rest.split_once(": ")?;
     Some((file, number.parse().ok()?, message))
 }
@@ -266,7 +277,7 @@ fn track_files(line: &str, files: &mut Vec<Option<String>>) {
         let after = &rest[position + 1..];
         let end = after.find([' ', '(', ')', '[', '{', '<']).unwrap_or(after.len());
         let token = &after[..end];
-        let is_file = token.starts_with("./") || token.starts_with('/') || token.starts_with("../");
+        let is_file = starts_path(token);
         files.push(is_file.then(|| token.to_string()));
         rest = &after[end..];
     }
@@ -315,6 +326,16 @@ fn pandoc_location(line: &str) -> Option<(&str, usize, usize, &str)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn windows_paths_in_the_log_are_files() {
+        assert_eq!(file_line_error("C:/Users/Ada/Thesis/main.tex:12: Undefined control sequence."), Some(("C:/Users/Ada/Thesis/main.tex", 12, "Undefined control sequence.")));
+        assert_eq!(file_line_error(r"D:\Arbeit\kapitel.tex:3: Missing $ inserted."), Some((r"D:\Arbeit\kapitel.tex", 3, "Missing $ inserted.")));
+        assert_eq!(file_line_error("./main.tex:7: Oops."), Some(("./main.tex", 7, "Oops.")));
+        let mut files = Vec::new();
+        track_files("(C:/texlive/2026/texmf-dist/tex/latex/base/article.cls", &mut files);
+        assert_eq!(files, [Some("C:/texlive/2026/texmf-dist/tex/latex/base/article.cls".to_string())]);
+    }
+
     use super::*;
 
     fn cwd() -> &'static Path {

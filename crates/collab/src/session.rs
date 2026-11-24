@@ -26,7 +26,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     model::Project,
-    protocol::{ALPN, CommentIntent, Frame, Hello, Presence, Role, Ticket, read_frame, same_secret, write_frame},
+    protocol::{ALPN, CommentIntent, Frame, Hello, MAX_FRAME, Presence, Role, Ticket, read_frame, same_secret, write_frame},
 };
 
 const SERVICE: &str = "editor-collab";
@@ -35,6 +35,9 @@ const HOST: u64 = 0;
 /// How often a guest tries to get back to the host before giving up, about a
 /// minute and a half in all.
 const RECONNECT_ATTEMPTS: u32 = 10;
+/// An update this large would be refused at the other end, which would drop
+/// the link and try again forever. Room for the frame's own header.
+const MAX_UPDATE: usize = MAX_FRAME - 1024;
 
 #[derive(Clone, Debug)]
 pub struct Identity {
@@ -608,6 +611,12 @@ impl Actor {
     fn command(&mut self, command: Command) -> bool {
         match command {
             Command::Update(update) => {
+                // Every later update builds on this one, so leaving it out would
+                // silently stop all edits from here on: the session ends instead.
+                if update.len() > MAX_UPDATE {
+                    self.emit(Event::Ended("This change is too large to share live, so the session ended. Your files keep it; share again without it.".to_string()));
+                    return false;
+                }
                 if self.replica.apply(&update).is_ok() {
                     self.replica.forget_events();
                     self.broadcast(None, || Frame::Update(update.clone()));
@@ -684,7 +693,14 @@ impl Actor {
                 if let Ok(update) = self.replica.diff(&state_vector)
                     && let Some(peer) = self.peers.get(&from)
                 {
-                    peer.sender.send(Frame::Update(update)).ok();
+                    if update.len() > MAX_UPDATE {
+                        let name = peer.guest.as_ref().map_or_else(|| "the host".to_string(), |guest| guest.name.clone());
+                        self.emit(Event::Warning(format!("The project is too large to send to {name}. Leave out large files and share again.")));
+                        // The guest would wait for it forever: tell them, and let go.
+                        peer.sender.send(Frame::Denied).ok();
+                    } else {
+                        peer.sender.send(Frame::Update(update)).ok();
+                    }
                 }
             }
             Frame::Update(update) => match role {
@@ -735,6 +751,11 @@ impl Actor {
                 return false;
             }
             Frame::Left(peer) => self.emit(Event::PeerLeft(peer)),
+            // After the welcome, a refusal means the project cannot come over.
+            Frame::Denied if !self.is_host() => {
+                self.emit(Event::Ended("The project is too large to share live. Ask the host to leave out large files.".to_string()));
+                return false;
+            }
             Frame::Hello(_) | Frame::Welcome(..) | Frame::Denied => {}
         }
         true
@@ -849,6 +870,97 @@ mod tests {
             name: name.to_string(),
             color: 0x3366ff,
         }
+    }
+
+    /// Three editors and the host type at once, as fast as they can, over the
+    /// real network stack: everyone must end with the same text, quickly.
+    /// cargo test -p collab --release -- --ignored many_editors --nocapture
+    #[test]
+    #[ignore]
+    fn many_editors_converge_under_load() {
+        const EDITS: usize = 300;
+        let start = "\\section{Intro}\nSome text to edit, with Ümlauts.\n".repeat(50);
+        let mut host_project = Project::new(20);
+        host_project.add_file("main.tex", &start);
+        let host = Session::host(identity("Host"), &host_project.encode_state(), None, || {}).unwrap();
+        let code = host.ticket(Role::Editor).unwrap().to_string();
+        let mut guests: Vec<(Session, Project)> = (0..3)
+            .map(|index| {
+                let session = Session::join(&code, identity(&format!("Guest {index}")), || {}).unwrap();
+                let mut project = Project::new(21 + index as u64);
+                wait_for(&session, &mut project, |event| matches!(event, Event::Joined(_)));
+                sync_until(&session, &mut project, |project| project.content("main.tex") == start);
+                (session, project)
+            })
+            .collect();
+
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut random = move |below: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % below.max(1) as u64) as usize
+        };
+        let started = Instant::now();
+        for _ in 0..EDITS {
+            for index in 0..=guests.len() {
+                let (session, project) = match index {
+                    0 => (&host, &mut host_project),
+                    _ => {
+                        let (session, project) = &mut guests[index - 1];
+                        (&*session, project)
+                    }
+                };
+                for event in session.poll() {
+                    if let Event::Update(update) = event {
+                        project.apply(&update).unwrap();
+                    }
+                }
+                project.take_remote();
+                let text = project.content("main.tex");
+                let mut at = random(text.len() + 1);
+                while !text.is_char_boundary(at) {
+                    at -= 1;
+                }
+                let mut end = (at + random(3)).min(text.len());
+                while !text.is_char_boundary(end) {
+                    end += 1;
+                }
+                let change = if random(3) == 0 { TextChange::new(at, end - at, "") } else { TextChange::new(at, 0, ["a", "ß", "\n", "{}"][random(4)]) };
+                session.send_update(project.edit("main.tex", &[change]));
+            }
+        }
+        let typed = started.elapsed();
+        let expected = loop {
+            for (session, project) in &mut guests {
+                for event in session.poll() {
+                    if let Event::Update(update) = event {
+                        project.apply(&update).unwrap();
+                    }
+                }
+            }
+            for event in host.poll() {
+                if let Event::Update(update) = event {
+                    host_project.apply(&update).unwrap();
+                }
+            }
+            let text = host_project.content("main.tex");
+            if guests.iter_mut().all(|(_, project)| project.content("main.tex") == text) {
+                break text;
+            }
+            assert!(started.elapsed() < Duration::from_secs(60), "editors did not converge");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        println!("{} edits typed in {typed:?}, all equal after {:?}, {} bytes", EDITS * 4, started.elapsed(), expected.len());
+
+        // One more edit, timed from typing to arriving everywhere.
+        let sent = Instant::now();
+        host.send_update(host_project.edit("main.tex", &[TextChange::new(0, 0, "#")]));
+        for (session, project) in &mut guests {
+            sync_until(session, project, |project| project.content("main.tex").starts_with('#'));
+        }
+        println!("one edit reached every guest in {:?}", sent.elapsed());
+        assert!(sent.elapsed() < Duration::from_secs(2));
     }
 
     /// Runs over the real network stack, so it needs a network.

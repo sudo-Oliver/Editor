@@ -256,8 +256,12 @@ pub fn clear(directory: &Path) -> io::Result<()> {
 }
 
 fn create_private(directory: &Path) -> io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    fs::DirBuilder::new().recursive(true).mode(0o700).create(directory)
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    // On Windows the folder inherits the rights of the user's data folder.
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(directory)
 }
 
 #[cfg(test)]

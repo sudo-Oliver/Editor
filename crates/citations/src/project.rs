@@ -15,6 +15,7 @@ use crate::scan::{BibKind, IncludeKind, Scan};
 pub enum Language {
     Latex,
     Typst,
+    Markdown,
 }
 
 impl Language {
@@ -22,6 +23,7 @@ impl Language {
         match path.extension()?.to_str()? {
             "tex" | "ltx" | "sty" | "cls" => Some(Self::Latex),
             "typ" => Some(Self::Typst),
+            "md" | "markdown" => Some(Self::Markdown),
             _ => None,
         }
     }
@@ -35,7 +37,7 @@ pub enum Backend {
     Bibtex,
     /// biblatex's default.
     Biber,
-    /// Typst reads `.bib` and Hayagriva itself.
+    /// Typst reads `.bib` and Hayagriva itself, as Pandoc reads `.bib` for Markdown.
     Typst,
 }
 
@@ -133,7 +135,8 @@ pub fn build(main: Option<&Path>, extra: &[PathBuf], env: &mut Env) -> Project {
         for external in &scan.external_documents {
             project.external.push((main_dir.join(format!("{}.aux", external.name)), external.prefix.clone()));
         }
-        if language == Language::Typst {
+        // A Markdown file decides only as the main file, not as a README beside LaTeX.
+        if language == Language::Typst || (language == Language::Markdown && project.main.as_deref().is_none_or(|main| normalize(main) == path)) {
             project.backend = Backend::Typst;
         }
         project.sources.push(Source { path, language, scan });
@@ -176,7 +179,7 @@ fn resolve_bib(name: &str, kind: BibKind, main_dir: &Path, file_dir: &Path, env:
         BibKind::Bibliography if !name.ends_with(".bib") => format!("{name}.bib"),
         _ => name.to_string(),
     };
-    if kind == BibKind::Typst {
+    if matches!(kind, BibKind::Typst | BibKind::Pandoc) {
         let path = match file.strip_prefix('/') {
             Some(from_root) => env.root.join(from_root),
             None => file_dir.join(&file),

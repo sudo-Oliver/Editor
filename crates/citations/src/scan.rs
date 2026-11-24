@@ -90,6 +90,8 @@ pub enum BibKind {
     Resource,
     /// Typst's `#bibliography("name.bib")`, relative to the file.
     Typst,
+    /// `bibliography:` in a Markdown front matter, relative to the file.
+    Pandoc,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

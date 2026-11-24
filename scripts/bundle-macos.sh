@@ -44,16 +44,16 @@ lipo -create \
   vendor/pdfium-x86_64/lib/libpdfium.dylib \
   -output "$app/Contents/Frameworks/libpdfium.dylib"
 
-# The icon: the SVG drawn once at full size, then every size macOS asks for.
+# The icon: AppIcon.png, made by scripts/make-icon.swift from the artwork,
+# in every size macOS asks for.
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
-qlmanage -t -s 1024 -o "$work" packaging/macos/AppIcon.svg >/dev/null 2>&1
 iconset="$work/AppIcon.iconset"
 mkdir -p "$iconset"
 for size in 16 32 128 256 512; do
-  sips -z "$size" "$size" "$work/AppIcon.svg.png" --out "$iconset/icon_${size}x${size}.png" >/dev/null
+  sips -z "$size" "$size" packaging/macos/AppIcon.png --out "$iconset/icon_${size}x${size}.png" >/dev/null
   double=$((size * 2))
-  sips -z "$double" "$double" "$work/AppIcon.svg.png" --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+  sips -z "$double" "$double" packaging/macos/AppIcon.png --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
 done
 iconutil -c icns "$iconset" -o "$app/Contents/Resources/AppIcon.icns"
 
@@ -88,10 +88,10 @@ mkdir -p "$staging/.background"
 cp -R "$app" "$staging/"
 ln -s /Applications "$staging/Applications"
 cp "packaging/macos/First open.txt" "$staging/First open.txt"
-# Quick Look draws the square SVG; the middle band is the 640 by 400 window.
-qlmanage -t -s 1280 -o "$work" packaging/macos/DmgBackground.svg >/dev/null 2>&1
-sips -c 800 1280 "$work/DmgBackground.svg.png" --out "$work/background@2x.png" >/dev/null
-sips -z 400 640 "$work/background@2x.png" --out "$work/background.png" >/dev/null
+# Quick Look draws the square SVG; the middle band is the 960 by 480 window.
+qlmanage -t -s 1920 -o "$work" packaging/macos/DmgBackground.svg >/dev/null 2>&1
+sips -c 960 1920 "$work/DmgBackground.svg.png" --out "$work/background@2x.png" >/dev/null
+sips -z 480 960 "$work/background@2x.png" --out "$work/background.png" >/dev/null
 tiffutil -cathidpicheck "$work/background.png" "$work/background@2x.png" -out "$staging/.background/background.tiff" >/dev/null 2>&1
 
 writable_dmg="$work/Editor-rw.dmg"
@@ -107,15 +107,15 @@ on run argv
       set current view of container window to icon view
       set toolbar visible of container window to false
       set statusbar visible of container window to false
-      set the bounds of container window to {200, 120, 840, 548}
+      set the bounds of container window to {200, 120, 1160, 628}
       set options to the icon view options of container window
       set arrangement of options to not arranged
       set icon size of options to 96
       set text size of options to 13
       set background picture of options to file ".background:background.tiff"
-      set position of item "Editor.app" of container window to {160, 170}
-      set position of item "Applications" of container window to {480, 170}
-      set position of item "First open.txt" of container window to {320, 290}
+      set position of item "Editor.app" of container window to {300, 200}
+      set position of item "Applications" of container window to {660, 200}
+      set position of item "First open.txt" of container window to {480, 310}
       update without registering applications
       delay 1
       close

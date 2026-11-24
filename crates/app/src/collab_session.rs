@@ -28,6 +28,10 @@ use crate::{editor_view::EditorView, theme};
 const MAX_BLOB_BYTES: usize = 8 * 1024 * 1024;
 /// All files that are not text together, which must fit in one message.
 const MAX_BLOBS_BYTES: usize = 48 * 1024 * 1024;
+/// Text files beyond this, such as large data tables, stay out, so that the
+/// whole project fits one message to a newcomer, with blobs and history.
+const MAX_TEXT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TEXTS_BYTES: usize = 12 * 1024 * 1024;
 
 const TEXT_EXTENSIONS: &[&str] = &["tex", "bib", "sty", "cls", "bst", "bbx", "cbx", "typ", "md", "txt", "toml", "csv", "tikz", "ltx", "dtx", "ins"];
 const BLOB_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "pdf", "eps", "svg"];
@@ -190,6 +194,7 @@ fn collect_project(root: &Path, open: &HashMap<PathBuf, String>) -> (Project, Ha
     let mut shared = HashSet::new();
     let mut skipped = Vec::new();
     let mut blob_bytes = 0;
+    let mut text_bytes = 0;
     for entry in ignore::WalkBuilder::new(root).build().flatten() {
         let path = entry.path();
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
@@ -201,11 +206,12 @@ fn collect_project(root: &Path, open: &HashMap<PathBuf, String>) -> (Project, Ha
         let extension = path.extension().and_then(|extension| extension.to_str()).unwrap_or_default().to_ascii_lowercase();
         if is_text(&relative) {
             match open.get(path).cloned().or_else(|| std::fs::read_to_string(path).ok()) {
-                Some(text) => {
+                Some(text) if text.len() <= MAX_TEXT_BYTES && text_bytes + text.len() <= MAX_TEXTS_BYTES => {
+                    text_bytes += text.len();
                     project.add_file(&relative, &text);
                     shared.insert(relative);
                 }
-                None => skipped.push(relative),
+                _ => skipped.push(relative),
             }
         } else if BLOB_EXTENSIONS.contains(&extension.as_str()) {
             match std::fs::read(path) {
@@ -1458,6 +1464,8 @@ impl Workspace {
             return panel
                 .child(div().flex_none().font_weight(FontWeight::SEMIBOLD).child("Work together"))
                 .child(Self::muted("Share this project with others on your network or over the internet. Nobody needs an account, and no server stores the project."))
+                // Windows asks once whether the editor may talk on the network.
+                .when(cfg!(windows), |panel| panel.child(Self::muted("The first time, Windows asks whether Editor may use the network. Allow it, so that others can reach you.")))
                 .child(Self::heading("Your name"))
                 .child(Self::field_box(&self.collab.name_field))
                 .child(self.check_row("collab-lan-visible", self.collab.visible_on_lan, "Visible on this network", cx, |this, _| {
@@ -1943,7 +1951,7 @@ fn decorations_for(state: &CollabState, path: &str) -> Vec<Decoration> {
 }
 
 fn dirs_home() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
+    crate::platform::home().unwrap_or_else(|| PathBuf::from("."))
 }
 
 #[cfg(test)]
