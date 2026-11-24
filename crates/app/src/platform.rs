@@ -20,6 +20,20 @@ pub fn command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
     command
 }
 
+/// The program as Windows ships it, such as `C:\\Windows\\System32\\tar.exe`.
+/// Git for Windows can put its own tar and curl first on the `PATH`, and its
+/// tar reads `C:` in a path as the name of another computer. Elsewhere the name.
+pub fn system_program(name: &str) -> std::ffi::OsString {
+    #[cfg(windows)]
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        let program = std::path::Path::new(&root).join("System32").join(format!("{name}.exe"));
+        if program.is_file() {
+            return program.into_os_string();
+        }
+    }
+    name.into()
+}
+
 /// Megabytes free on the disk that holds `path`.
 pub fn free_megabytes(path: &Path) -> Option<u64> {
     imp::free_bytes(path).map(|bytes| bytes / 1_000_000)

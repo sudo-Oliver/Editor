@@ -59,6 +59,11 @@ fn extra_directories() -> Vec<PathBuf> {
         directories.push(base.join("Git\\cmd"));
         directories.push(base.join("Pandoc"));
     }
+    if let Some(local) = variable("LOCALAPPDATA") {
+        // Where winget links what it installs for one user, and Pandoc's own installer.
+        directories.push(local.join("Microsoft\\WinGet\\Links"));
+        directories.push(local.join("Pandoc"));
+    }
     if let Some(profile) = variable("USERPROFILE") {
         directories.push(profile.join(".cargo\\bin"));
     }

@@ -64,7 +64,11 @@ pub const MACTEX_TEXBIN: &str = "/Library/TeX/texbin";
 
 impl Tool {
     /// The ones listed in the settings, in the order shown.
-    pub const ALL: [Tool; 5] = [Tool::MacTex, Tool::Tectonic, Tool::Typst, Tool::Pandoc, Tool::Homebrew];
+    #[cfg(not(windows))]
+    pub const ALL: &[Tool] = &[Tool::MacTex, Tool::Tectonic, Tool::Typst, Tool::Pandoc, Tool::Homebrew];
+    /// No Homebrew on Windows.
+    #[cfg(windows)]
+    pub const ALL: &[Tool] = &[Tool::MacTex, Tool::Tectonic, Tool::Typst, Tool::Pandoc];
 
     pub fn program(self) -> &'static str {
         match self {
@@ -88,10 +92,12 @@ impl Tool {
 
     pub fn name(self) -> &'static str {
         match self {
+            Self::MacTex if cfg!(windows) => "LaTeX, complete (MiKTeX)",
             Self::MacTex => "LaTeX, complete (MacTeX)",
             Self::Tectonic => "LaTeX, compact (Tectonic)",
             Self::Typst => "Typst",
             Self::Pandoc => "Pandoc",
+            Self::Homebrew if cfg!(windows) => "winget",
             Self::Homebrew => "Homebrew",
         }
     }
@@ -109,6 +115,7 @@ impl Tool {
 
     pub fn purpose(self) -> &'static str {
         match self {
+            Self::MacTex if cfg!(windows) => "LaTeX as most people on Windows use it. Fetches each package once, the first time a document needs it.",
             Self::MacTex => "Everything LaTeX has, on your Mac. Every package works at once, also without internet.",
             Self::Tectonic => "Turns LaTeX into a PDF. Small, and fetches each package the first time a document uses it.",
             Self::Typst => "Turns Typst into a PDF. Typst is a newer, simpler language for documents.",
@@ -119,6 +126,7 @@ impl Tool {
 
     pub fn source(self) -> &'static str {
         match self {
+            Self::MacTex if cfg!(windows) => "Official MiKTeX from miktex.org, through CTAN",
             Self::MacTex => "Official MacTeX from tug.org, signed by its author",
             Self::Tectonic => "Official release from github.com/tectonic-typesetting",
             Self::Typst => "Official release from github.com/typst",
@@ -130,6 +138,7 @@ impl Tool {
     /// The page to download it by hand.
     pub fn download_page(self) -> &'static str {
         match self {
+            Self::MacTex if cfg!(windows) => "https://miktex.org/download",
             Self::MacTex => "https://tug.org/mactex/mactex-download.html",
             Self::Tectonic => "https://github.com/tectonic-typesetting/tectonic/releases",
             Self::Typst => "https://github.com/typst/typst/releases",
@@ -142,6 +151,7 @@ impl Tool {
     pub fn note(self) -> Option<&'static str> {
         match self {
             Self::Tectonic => Some("The first PDF downloads the LaTeX packages it uses, so it needs the internet and takes a minute."),
+            Self::MacTex if cfg!(windows) => Some("Installs for you alone, without a password. The first PDF of a document fetches the packages it uses."),
             Self::MacTex => Some("macOS asks for your password once the download is done, to install into /Library/TeX."),
             _ => None,
         }
@@ -149,6 +159,16 @@ impl Tool {
 
     /// Installed to the system with a password, never into the app's folder.
     pub fn package(self) -> Option<Package> {
+        if cfg!(windows) {
+            // MiKTeX's own installer, for this user only, so no administrator.
+            return (self == Self::MacTex).then_some(Package {
+                url: "https://mirror.ctan.org/systems/win32/miktex/setup/windows-x64/basic-miktex-25.12-x64.exe",
+                sha512_url: None,
+                sha256: Some("14b42dd9f4b4a7813a8bfd69c8f99316c2888cc4ee26f631f397e163d85d6c62"),
+                signer: None,
+                bytes: 148_882_184,
+            });
+        }
         match self {
             Self::MacTex => Some(Package {
                 url: "https://mirror.ctan.org/systems/mac/mactex/MacTeX.pkg",
@@ -170,6 +190,9 @@ impl Tool {
 
     fn release(self) -> Option<Release> {
         let arm = cfg!(target_arch = "aarch64");
+        if cfg!(windows) {
+            return windows_release(self);
+        }
         if !cfg!(target_os = "macos") {
             return None;
         }
@@ -222,12 +245,21 @@ impl Tool {
 
     /// Whether the app can install it on this computer, itself or through Homebrew.
     pub fn installable(self) -> bool {
-        cfg!(target_os = "macos") && (self.release().is_some() || self.package().is_some() || self.formula().is_some())
+        (cfg!(target_os = "macos") || cfg!(windows)) && (self.release().is_some() || self.package().is_some() || (cfg!(target_os = "macos") && self.formula().is_some()))
     }
 
     /// The Homebrew formula with the same program. MacTeX has none: the app
     /// installs its package directly, which is what Homebrew's cask does too.
     pub fn formula(self) -> Option<&'static str> {
+        // winget's names; it has no Tectonic.
+        if cfg!(windows) {
+            return match self {
+                Self::Typst => Some("Typst.Typst"),
+                Self::Pandoc => Some("JohnMacFarlane.Pandoc"),
+                Self::MacTex => Some("MiKTeX.MiKTeX"),
+                Self::Tectonic | Self::Homebrew => None,
+            };
+        }
         match self {
             Self::Tectonic => Some("tectonic"),
             Self::Typst => Some("typst"),
@@ -245,6 +277,7 @@ impl Tool {
     /// What it takes on the disk once installed, in megabytes, roughly.
     pub fn installed_megabytes(self) -> u64 {
         match self {
+            Self::MacTex if cfg!(windows) => 900,
             Self::MacTex => 9_000,
             Self::Tectonic => 60,
             Self::Typst => 45,
@@ -252,6 +285,39 @@ impl Tool {
             Self::Homebrew => 600,
         }
     }
+}
+
+/// The 64-bit Windows builds of the programs, from their official releases.
+fn windows_release(tool: Tool) -> Option<Release> {
+    Some(match tool {
+        Tool::Tectonic => Release {
+            version: "0.17.0",
+            url: "https://github.com/tectonic-typesetting/tectonic/releases/download/tectonic%400.17.0/tectonic-0.17.0-x86_64-pc-windows-msvc.zip",
+            sha256: "f61ce51f0b0ade1015b7de7ef368541c5424e9756ecbd0d7af97d6d48030845f",
+            bytes: 21_060_223,
+            program: "tectonic.exe",
+        },
+        Tool::Typst => Release {
+            version: "0.15.1",
+            url: "https://github.com/typst/typst/releases/download/v0.15.1/typst-x86_64-pc-windows-msvc.zip",
+            sha256: "19ce3551153c2fe7ee9fa2f95208310c8f4d3209fedb699e0333faf8913f6736",
+            bytes: 22_463_684,
+            program: "typst-x86_64-pc-windows-msvc/typst.exe",
+        },
+        Tool::Pandoc => Release {
+            version: "3.14",
+            url: "https://github.com/jgm/pandoc/releases/download/3.14/pandoc-3.14-windows-x86_64.zip",
+            sha256: "0144b96e8c7b023fd382ec5ef5bdc475e873f1019d6fa72502492df2c9a94a3b",
+            bytes: 43_614_099,
+            program: "pandoc-3.14/pandoc.exe",
+        },
+        Tool::MacTex | Tool::Homebrew => return None,
+    })
+}
+
+/// A program's file name: `typst`, or `typst.exe` on Windows.
+fn executable(name: &str) -> String {
+    format!("{name}{}", std::env::consts::EXE_SUFFIX)
 }
 
 pub fn tools_directory() -> Option<PathBuf> {
@@ -287,7 +353,7 @@ pub fn register_installed() {
         build::set_cache_directories(tectonic, typst);
     }
     if let Some(tools) = tools_directory() {
-        for tool in Tool::ALL {
+        for &tool in Tool::ALL {
             if let Some(release) = tool.release() {
                 let folder = folder(&tools, tool, &release);
                 if folder.join(tool.program()).is_file() {
@@ -297,7 +363,7 @@ pub fn register_installed() {
         }
     }
     if let Some(manual) = manual_directory().filter(|manual| manual.is_dir()) {
-        for tool in Tool::ALL {
+        for &tool in Tool::ALL {
             if let Some(program) = program_in(&manual, tool.program())
                 && let Some(folder) = program.parent() {
                     build::add_directory(folder.to_path_buf());
@@ -311,12 +377,14 @@ pub fn register_installed() {
 fn program_in(folder: &Path, name: &str) -> Option<PathBuf> {
     fn search(folder: &Path, name: &str, depth: usize) -> Option<PathBuf> {
         let entries: Vec<_> = std::fs::read_dir(folder).ok()?.flatten().map(|entry| entry.path()).collect();
-        if let Some(program) = entries.iter().find(|path| path.file_name().is_some_and(|file| file == name) && path.is_file()) {
+        let name = executable(name);
+        if let Some(program) = entries.iter().find(|path| path.file_name().is_some_and(|file| file.eq_ignore_ascii_case(name.as_str())) && path.is_file()) {
             return Some(program.clone());
         }
         if depth == 0 {
             return None;
         }
+        let name = name.trim_end_matches(std::env::consts::EXE_SUFFIX);
         entries.iter().filter(|path| path.is_dir()).find_map(|path| search(path, name, depth - 1))
     }
     search(folder, name, 3)
@@ -487,6 +555,8 @@ fn found_program(program: &str, tools: Option<&Path>) -> Found {
 
 pub fn find(tool: Tool) -> Found {
     match tool {
+        // MiKTeX or TeX Live, wherever its installer put it.
+        Tool::MacTex if cfg!(windows) => found_program("pdflatex", tools_directory().as_deref()),
         Tool::MacTex => {
             let pdflatex = Path::new(MACTEX_TEXBIN).join("pdflatex");
             if pdflatex.is_file() && !build::pretend_fresh() { Found::Own(pdflatex) } else { Found::Missing }
@@ -524,9 +594,15 @@ pub fn language_ready(tool: Tool) -> bool {
 }
 
 /// Where Homebrew is, if the user has it.
+/// The package manager: Homebrew on the Mac, and on Windows winget, which
+/// comes with Windows 10 and 11 as part of the App Installer.
 pub fn homebrew() -> Option<PathBuf> {
     if build::pretend_fresh() {
         return None;
+    }
+    if cfg!(windows) {
+        let alias = PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("Microsoft\\WindowsApps\\winget.exe");
+        return alias.is_file().then_some(alias).or_else(|| build::find_tool("winget"));
     }
     ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"].into_iter().map(PathBuf::from).find(|path| path.is_file())
 }
@@ -626,20 +702,20 @@ fn unpack_release(tool: Tool, release: &Release, archive: &Path, workspace: &Pat
     if file_digest::<sha2::Sha256>(archive)? != release.sha256 {
         return Err(format!("The download of {name} is not the expected file, so it was not installed."));
     }
-    let listing = marketplace::run_tar(crate::platform::command("tar").arg("-tf").arg(archive))?;
+    let listing = marketplace::run_tar(crate::platform::command(crate::platform::system_program("tar")).arg("-tf").arg(archive))?;
     if !marketplace::archive_paths_stay_inside(&String::from_utf8_lossy(&listing.stdout)) {
         return Err(format!("The download of {name} leads outside its folder, so it was not installed."));
     }
     let unpacked = workspace.join("unpacked");
     std::fs::create_dir(&unpacked).map_err(|error| format!("Cannot unpack the download: {error}"))?;
-    marketplace::run_tar(crate::platform::command("tar").arg("-xf").arg(archive).arg("--no-same-owner").arg("-C").arg(&unpacked))?;
+    marketplace::run_tar(crate::platform::command(crate::platform::system_program("tar")).arg("-xf").arg(archive).arg("--no-same-owner").arg("-C").arg(&unpacked))?;
     let program = unpacked.join(release.program);
     if !program.is_file() {
         return Err(format!("The download of {name} has no program."));
     }
     let staged = workspace.join("staged");
     std::fs::create_dir(&staged).map_err(|error| format!("Cannot unpack the download: {error}"))?;
-    let target = staged.join(tool.program());
+    let target = staged.join(executable(tool.program()));
     std::fs::rename(&program, &target).map_err(|error| format!("Cannot unpack the download: {error}"))?;
     make_executable(&target)?;
     let destination = folder(tools, tool, release);
@@ -648,7 +724,7 @@ fn unpack_release(tool: Tool, release: &Release, archive: &Path, workspace: &Pat
     }
     std::fs::rename(&staged, &destination).map_err(|error| format!("Cannot install {name}: {error}"))?;
     build::add_directory(destination.clone());
-    Ok(destination.join(tool.program()))
+    Ok(destination.join(executable(tool.program())))
 }
 
 /// Downloads a package, checks it and installs it with macOS's own password
@@ -684,6 +760,9 @@ fn install_package(tool: Tool, package: &Package, tools: &Path, received: &Atomi
     if cancel.load(Ordering::Relaxed) {
         return Err("Stopped.".to_string());
     }
+    if cfg!(windows) {
+        return install_miktex(&file, &set_stage);
+    }
     // Said before the dialog comes up, so that it does not come out of nowhere.
     let place = if tool == Tool::MacTex { "/Library/TeX" } else { "a folder for the whole Mac" };
     set_stage(&format!("macOS asks for your password next, since {name} goes into {place}. Editor never sees it."));
@@ -708,6 +787,22 @@ fn install_package(tool: Tool, package: &Package, tools: &Path, received: &Atomi
         return Err(if error.contains("-128") { format!("{name} was not installed, since the password dialog was closed.") } else { format!("Cannot install {name}: {error}") });
     }
     std::fs::remove_file(&file).ok();
+    Ok(())
+}
+
+/// Runs MiKTeX's own installer for this user, without questions and without
+/// an administrator, and lets it fetch missing packages without asking. Blocks.
+fn install_miktex(installer: &Path, set_stage: &dyn Fn(&str)) -> Result<(), String> {
+    set_stage("Installing MiKTeX. This takes a few minutes.");
+    let output = crate::platform::command(installer)
+        .args(["--unattended", "--private", "--auto-install=yes"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("Cannot start the MiKTeX installer: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("Cannot install MiKTeX: {}", marketplace::failure(&output)));
+    }
+    std::fs::remove_file(installer).ok();
     Ok(())
 }
 
@@ -810,7 +905,7 @@ pub fn remove(tool: Tool, tools: &Path) -> Result<(), String> {
 /// of the pinned version leaves behind. Only folders named after a program the
 /// app installs itself go, so downloads and anything else stay.
 pub fn remove_old_versions(tools: &Path) {
-    let pinned: Vec<(&str, &str)> = Tool::ALL.into_iter().filter_map(|tool| Some((tool.program(), tool.release()?.version))).collect();
+    let pinned: Vec<(&str, &str)> = Tool::ALL.iter().copied().filter_map(|tool| Some((tool.program(), tool.release()?.version))).collect();
     remove_versions_except(tools, &pinned);
 }
 
@@ -833,10 +928,15 @@ fn remove_versions_except(tools: &Path, pinned: &[(&str, &str)]) {
 /// Runs `brew install` for the tool. Blocks. `line` holds Homebrew's last line
 /// of output, to show what it is doing, and `cancel` stops it.
 pub fn install_with_homebrew(brew: &Path, tool: Tool, line: &Arc<Mutex<String>>, cancel: &AtomicBool) -> Result<(), String> {
-    let formula = tool.formula().ok_or_else(|| format!("Homebrew does not install {} here.", tool.name()))?;
+    let formula = tool.formula().ok_or_else(|| format!("{} does not install {} here.", Tool::Homebrew.name(), tool.name()))?;
     let mut command = crate::platform::command(brew);
+    if cfg!(windows) {
+        // For this user, so without an administrator, and without questions.
+        command.args(["install", "--id", formula, "--exact", "--scope", "user", "--silent", "--disable-interactivity", "--accept-package-agreements", "--accept-source-agreements"]);
+    } else {
+        command.args(["install", formula]);
+    }
     command
-        .args(["install", formula])
         .env("NONINTERACTIVE", "1")
         .env("HOMEBREW_NO_ENV_HINTS", "1")
         .stdin(Stdio::null())
@@ -844,7 +944,7 @@ pub fn install_with_homebrew(brew: &Path, tool: Tool, line: &Arc<Mutex<String>>,
         .stderr(Stdio::piped());
     // Its own group, so that stopping also stops the downloads it started.
     build::prepare_group(&mut command);
-    let mut child = command.spawn().map_err(|error| format!("Cannot start Homebrew: {error}"))?;
+    let mut child = command.spawn().map_err(|error| format!("Cannot start {}: {error}", Tool::Homebrew.name()))?;
     let group = build::Group::of(child.id()).ok();
     let readers: Vec<_> = [child.stdout.take().map(|out| Box::new(out) as Box<dyn std::io::Read + Send>), child.stderr.take().map(|err| Box::new(err) as Box<dyn std::io::Read + Send>)]
         .into_iter()
@@ -1028,6 +1128,8 @@ impl Toolchain {
 
     fn method(&self, tool: Tool) -> Method {
         match tool {
+            // winget installs MiKTeX for this user, as the app's own way does.
+            Tool::MacTex if cfg!(windows) && self.use_homebrew && homebrew().is_some() => Method::Homebrew,
             Tool::MacTex | Tool::Homebrew => Method::Package,
             _ if self.use_homebrew && tool.formula().is_some() => Method::Homebrew,
             _ => Method::Release,
@@ -1623,7 +1725,7 @@ mod tests {
 
     #[test]
     fn every_release_is_pinned() {
-        for tool in Tool::ALL {
+        for &tool in Tool::ALL {
             if let Some(release) = tool.release() {
                 assert!(release.url.starts_with("https://github.com/"));
                 assert_eq!(release.sha256.len(), 64);

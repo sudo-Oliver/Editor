@@ -63,7 +63,7 @@ struct CreatedRepository {
 /// Talks to GitHub. `header` goes through stdin, so that no token shows up
 /// in the list of processes.
 fn request(method: &str, url: &str, header: Option<&str>, form: &[(&str, &str)], json: Option<&str>) -> Result<(u16, String), String> {
-    let mut command = crate::platform::command("curl");
+    let mut command = crate::platform::command(crate::platform::system_program("curl"));
     command.args(["--silent", "--show-error", "--location", "--max-time", SECONDS, "--proto", "=https", "--proto-redir", "=https"]);
     command.args(["--request", method, "--header", "Accept: application/json", "--write-out", "\n%{http_code}"]);
     if header.is_some() {
