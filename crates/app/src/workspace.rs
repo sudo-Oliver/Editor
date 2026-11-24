@@ -47,6 +47,7 @@ use crate::{
     outline::{self, LINE as OUTLINE_LINE, OutlineItem, PILL as OUTLINE_PILL, SPINE as OUTLINE_SPINE},
     image_view::{ImageView, ImageViewEvent, include_snippet, is_image, relative_path},
     keymap::{self, Keymap},
+    markdown_preview::{MarkdownPreview, MarkdownPreviewEvent},
     pdf_view::{PdfView, PdfViewEvent, ZOOM_STEP},
     nvim_themes, package_commands,
     picker::{self, FontSlot, Picker, PickerItem, PickerKind},
@@ -110,6 +111,8 @@ const TREE_INSET: f32 = 12.0;
 const TREE_INDENT: f32 = 20.0;
 const TREE_ICON: f32 = 16.0;
 const FOLLOW_DEBOUNCE: Duration = Duration::from_millis(150);
+/// Long enough to read a burst of keys once, short enough to feel live.
+const MARKDOWN_DEBOUNCE: Duration = Duration::from_millis(30);
 /// Oldest output is dropped beyond this size.
 const MAX_LOG_BYTES: usize = 2 << 20;
 const PACKAGE_CHECK_FILE_LIMIT: u64 = 4 << 20;
@@ -526,6 +529,10 @@ pub struct Workspace {
     menu_focus: FocusHandle,
     status: Option<SharedString>,
     pdf: Entity<PdfView>,
+    /// The preview of a Markdown file, which needs no build.
+    markdown: Entity<MarkdownPreview>,
+    /// Reads the edited Markdown again once typing pauses a moment.
+    markdown_task: Option<Task<()>>,
     build: BuildManager,
     config: Config,
     building: bool,
@@ -615,6 +622,7 @@ pub struct Workspace {
     debounce_task: Option<Task<()>>,
     synctex_task: Option<Task<()>>,
     _pdf_subscription: Subscription,
+    _markdown_subscription: Subscription,
     _watcher: Option<RecommendedWatcher>,
     _watch_task: Option<Task<()>>,
     refresh_task: Option<Task<()>>,
@@ -627,6 +635,15 @@ pub struct Workspace {
 impl Workspace {
     pub fn new(root: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let pdf = cx.new(PdfView::new);
+        let markdown = cx.new(MarkdownPreview::new);
+        let markdown_subscription = cx.subscribe_in(&markdown, window, |this, _, event, window, cx| match event {
+            MarkdownPreviewEvent::Clicked(offset) => {
+                if let Some(view) = this.active_view() {
+                    let offset = *offset;
+                    view.update(cx, |view, cx| view.select_range(offset..offset, window, cx));
+                }
+            }
+        });
         let pdf_subscription = cx.subscribe_in(&pdf, window, |this, _, event, window, cx| match event {
             PdfViewEvent::BackwardSearch { page, x, y } => this.backward_search(*page, *x, *y, window, cx),
             PdfViewEvent::Failed(message) => this.set_status(message.clone(), cx),
@@ -815,6 +832,8 @@ impl Workspace {
             menu_focus: cx.focus_handle(),
             status: None,
             pdf,
+            markdown,
+            markdown_task: None,
             build: BuildManager::new(),
             config: Config::default(),
             building: false,
@@ -882,6 +901,7 @@ impl Workspace {
             debounce_task: None,
             synctex_task: None,
             _pdf_subscription: pdf_subscription,
+            _markdown_subscription: markdown_subscription,
             _watcher: None,
             _watch_task: None,
             refresh_task: None,
@@ -1093,7 +1113,7 @@ impl Workspace {
             });
         if let Some(path) = first {
             self.open_file(path, window, cx);
-            self.recompile(cx);
+            self.build_when_free(cx);
         }
         self.forget_saved_recovery(cx);
         let swept = root.clone();
@@ -1277,6 +1297,7 @@ impl Workspace {
                 this.collab_edited(&view, cx);
                 this.schedule_recovery(cx);
                 this.schedule_type_build(cx);
+                this.schedule_markdown(cx);
                 if view.read(cx).path.as_deref().is_some_and(citation_index::matters) {
                     this.schedule_citations(cx);
                 }
@@ -1288,6 +1309,7 @@ impl Workspace {
                 this.addon_document_changed(&view, cx);
                 this.schedule_recovery(cx);
                 this.schedule_type_build(cx);
+                this.schedule_markdown(cx);
                 cx.notify();
             }
             EditorEvent::CursorClicked { line } => {
@@ -1439,6 +1461,7 @@ impl Workspace {
         let view = self.documents[index].view.clone();
         window.focus(&view.read(cx).focus_handle(cx), cx);
         self.compile_if_document_changed(cx);
+        self.refresh_markdown(cx);
         self.schedule_citations(cx);
         // The others see the switch, also before the cursor moves.
         #[cfg(feature = "collab")]
@@ -2330,6 +2353,9 @@ impl Workspace {
     /// A folder of standalone notes has one PDF per file, so switching files
     /// must not leave the PDF of the previous file on screen.
     fn compile_if_document_changed(&mut self, cx: &mut Context<Self>) {
+        if self.markdown_view(cx).is_some() {
+            return;
+        }
         let (Some(root), Some(last_main)) = (&self.root, &self.last_main) else {
             return;
         };
@@ -2338,6 +2364,47 @@ impl Workspace {
         if main.is_some_and(|main| main != *last_main) {
             self.recompile(cx);
         }
+    }
+
+    /// The active document when it is Markdown that the preview shows as a page,
+    /// rather than through a PDF build. A compiler chosen in the settings wins.
+    fn markdown_view(&self, cx: &App) -> Option<Entity<EditorView>> {
+        if self.config.engine.is_some() || self.active_language(cx) != Some(Language::Markdown) {
+            return None;
+        }
+        self.active_view()
+    }
+
+    fn schedule_markdown(&mut self, cx: &mut Context<Self>) {
+        if self.markdown_view(cx).is_none() || self.markdown_task.is_some() {
+            return;
+        }
+        self.markdown_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(MARKDOWN_DEBOUNCE).await;
+            this.update(cx, |this, cx| {
+                this.markdown_task = None;
+                this.refresh_markdown(cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// Hands the active Markdown text to the preview, if it changed and shows.
+    fn refresh_markdown(&mut self, cx: &mut Context<Self>) {
+        let Some(view) = self.markdown_view(cx) else {
+            return;
+        };
+        if self.focus_mode || self.layout == PaneLayout::EditorOnly {
+            return;
+        }
+        let (id, version) = (view.entity_id(), view.read(cx).state.version());
+        if self.markdown.read(cx).shows(id, version) {
+            return;
+        }
+        let view = view.read(cx);
+        let text = view.state.buffer().to_string();
+        let path = view.path.clone();
+        self.markdown.update(cx, |preview, cx| preview.show(id, version, path.as_deref(), &text, cx));
     }
 
     fn schedule_type_build(&mut self, cx: &mut Context<Self>) {
@@ -2354,6 +2421,9 @@ impl Workspace {
     /// For builds nobody asked for by hand. Stopping a run for every pause in typing
     /// would mean that a long document never gets a new preview.
     fn build_when_free(&mut self, cx: &mut Context<Self>) {
+        if self.markdown_view(cx).is_some() {
+            return;
+        }
         if self.building {
             self.build_queued = true;
         } else {
@@ -2783,6 +2853,11 @@ impl Workspace {
     }
 
     fn follow_cursor(&mut self, cx: &mut Context<Self>) {
+        if let Some(view) = self.markdown_view(cx) {
+            let head = view.read(cx).state.selections().primary().head;
+            self.markdown.update(cx, |preview, cx| preview.reveal(head, cx));
+            return;
+        }
         if !self.settings.auto_scroll_pdf || self.synctex_unavailable_reason().is_some() {
             return;
         }
@@ -2931,6 +3006,7 @@ impl Workspace {
         self.pdf_tab_shown = layout == PaneLayout::PdfTab;
         self.focus_mode = false;
         self.focus_main(window, cx);
+        self.refresh_markdown(cx);
         cx.notify();
     }
 
@@ -2943,6 +3019,7 @@ impl Workspace {
     fn toggle_focus_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.focus_mode = !self.focus_mode;
         self.focus_main(window, cx);
+        self.refresh_markdown(cx);
         cx.notify();
     }
 
@@ -6709,7 +6786,10 @@ impl Workspace {
             .child(div().flex_none().text_color(theme::color(theme::palette().ui_muted)).child("Go to line"))
     }
 
-    fn render_preview_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_preview_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.markdown_view(cx).is_some() {
+            return self.render_markdown_toolbar(cx);
+        }
         let open = self.open_menu == Some(Menu::Compile);
         let errors = self.error_count();
         let warnings = self.diagnostics.len() - errors;
@@ -6869,6 +6949,37 @@ impl Workspace {
                         }
                     })),
             )
+            .into_any_element()
+    }
+
+    /// The preview of Markdown has no build: its bar shows the status and
+    /// whether the page follows the cursor.
+    fn render_markdown_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(8.))
+            .h(px(PREVIEW_TOOLBAR_HEIGHT))
+            .px(px(8.))
+            .bg(theme::color(theme::palette().panel))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(theme::color(theme::palette().ui_muted))
+                    .child(self.status.clone().unwrap_or_else(|| "Markdown preview. Double-click a block to go to its source.".into())),
+            )
+            .child(
+                div()
+                    .rounded(px(4.))
+                    .when(self.settings.auto_scroll_pdf, |element| element.bg(theme::color(theme::palette().accent_soft)))
+                    .child(self.icon_button("auto-scroll-markdown", "position", cx, |this, window, cx| {
+                        this.toggle_auto_scroll(window, cx);
+                    })),
+            )
+            .into_any_element()
     }
 
     fn panel_button(
@@ -8709,7 +8820,9 @@ impl Workspace {
     /// The logs or the PDF with the errors of the last build above it.
     fn render_preview_body(&self, cx: &mut Context<Self>) -> AnyElement {
         let has_errors = self.error_count() > 0;
-        if self.show_logs {
+        if self.markdown_view(cx).is_some() {
+            self.markdown.clone().into_any_element()
+        } else if self.show_logs {
             self.render_logs(cx).into_any_element()
         } else {
             div()
