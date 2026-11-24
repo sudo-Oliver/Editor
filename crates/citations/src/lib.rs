@@ -5,6 +5,8 @@
 
 use std::ops::Range;
 
+// Not `aux.rs`: Windows reserves AUX as a device name, also with an extension.
+#[path = "aux_file.rs"]
 pub mod aux;
 pub mod bib;
 pub mod fuzzy;
