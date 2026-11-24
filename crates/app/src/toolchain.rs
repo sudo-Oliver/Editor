@@ -298,11 +298,10 @@ pub fn register_installed() {
     }
     if let Some(manual) = manual_directory().filter(|manual| manual.is_dir()) {
         for tool in Tool::ALL {
-            if let Some(program) = program_in(&manual, tool.program()) {
-                if let Some(folder) = program.parent() {
+            if let Some(program) = program_in(&manual, tool.program())
+                && let Some(folder) = program.parent() {
                     build::add_directory(folder.to_path_buf());
                 }
-            }
         }
     }
 }
@@ -755,11 +754,10 @@ pub(crate) fn as_administrator(prompt: &str, program: &Path, args: &[&std::ffi::
 }
 
 fn check_package(package: &Package, file: &Path) -> Result<(), String> {
-    if let Some(expected) = package.sha256 {
-        if file_digest::<sha2::Sha256>(file)? != expected {
+    if let Some(expected) = package.sha256
+        && file_digest::<sha2::Sha256>(file)? != expected {
             return Err("Its checksum differs.".to_string());
         }
-    }
     if let Some(url) = package.sha512_url {
         let output = marketplace::curl("60").arg(url).output().map_err(|error| format!("Cannot run curl: {error}"))?;
         let listed = String::from_utf8_lossy(&output.stdout);
@@ -855,11 +853,10 @@ pub fn install_with_homebrew(brew: &Path, tool: Tool, line: &Arc<Mutex<String>>,
             std::thread::spawn(move || {
                 for text in BufReader::new(stream).lines().map_while(Result::ok) {
                     let text = text.trim().to_string();
-                    if !text.is_empty() {
-                        if let Ok(mut last) = line.lock() {
+                    if !text.is_empty()
+                        && let Ok(mut last) = line.lock() {
                             *last = text;
                         }
-                    }
                 }
             })
         })
@@ -1194,11 +1191,10 @@ impl Toolchain {
 
     pub fn remove(&mut self, tool: Tool, cx: &mut Context<Self>) {
         self.forget_found();
-        if let Some(tools) = tools_directory() {
-            if let Err(error) = remove(tool, &tools) {
+        if let Some(tools) = tools_directory()
+            && let Err(error) = remove(tool, &tools) {
                 self.errors.insert(tool, error);
             }
-        }
         cx.notify();
     }
 }

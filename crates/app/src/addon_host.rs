@@ -1053,7 +1053,7 @@ pub(super) fn pdf_page_width(width: Option<u32>) -> u32 {
 }
 
 fn save_png(width: u32, height: u32, mut bgra: Vec<u8>, page: usize) -> Result<PathBuf, String> {
-    for pixel in bgra.chunks_exact_mut(4) {
+    for pixel in bgra.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
     let image = image::RgbaImage::from_raw(width, height, bgra).ok_or("The page came out broken.")?;

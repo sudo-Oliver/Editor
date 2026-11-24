@@ -157,11 +157,10 @@ fn check_bundle(new: &Path, running: &Path, version: &str) -> Result<(), String>
     if !verify.status.success() {
         return Err("The download is damaged, so it was not installed.".to_string());
     }
-    if let Some(expected) = team(running) {
-        if team(new).as_deref() != Some(expected.as_str()) {
+    if let Some(expected) = team(running)
+        && team(new).as_deref() != Some(expected.as_str()) {
             return Err("The download is not signed by Editor's developer, so it was not installed.".to_string());
         }
-    }
     Ok(())
 }
 

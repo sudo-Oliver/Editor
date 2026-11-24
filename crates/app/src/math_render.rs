@@ -205,7 +205,7 @@ mod tests {
         assert_eq!((mask.width, mask.height), (7, 6));
         assert_eq!(mask.alpha[2 * 7 + 2], 255);
         assert_eq!(mask.tinted(0x102030)[..4], [0x30, 0x20, 0x10, 0]);
-        assert!(crop(&vec![255u8; 16 * 4], 4, 4).is_none());
+        assert!(crop(&[255u8; 16 * 4], 4, 4).is_none());
     }
 
     /// Needs `pdflatex`: cargo test -p app math_render -- --ignored

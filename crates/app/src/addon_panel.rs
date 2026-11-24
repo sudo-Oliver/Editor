@@ -366,11 +366,10 @@ impl AddonPanel {
                     return;
                 };
                 if let Some((last, parent)) = path.split_last() {
-                    if let Some(children) = node_at_mut(&mut self.view, parent).and_then(Node::children_mut) {
-                        if *last < children.len() {
+                    if let Some(children) = node_at_mut(&mut self.view, parent).and_then(Node::children_mut)
+                        && *last < children.len() {
                             children.remove(*last);
                         }
-                    }
                     self.view_changed(cx);
                 }
             }
@@ -764,12 +763,11 @@ impl AddonPanel {
                             }))
                             .capture_key_down(move |event: &KeyDownEvent, _, cx| {
                                 let modifiers = event.keystroke.modifiers;
-                                if event.keystroke.key == "enter" && modifiers.shift && !modifiers.platform && !modifiers.control {
-                                    if let Some(input) = &line_break {
+                                if event.keystroke.key == "enter" && modifiers.shift && !modifiers.platform && !modifiers.control
+                                    && let Some(input) = &line_break {
                                         input.update(cx, |input, cx| input.insert_text("\n", cx));
                                         cx.stop_propagation();
                                     }
-                                }
                             })
                     })
                     .rounded(px(4.))

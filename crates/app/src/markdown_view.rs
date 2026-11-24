@@ -1,7 +1,7 @@
 //! Draws the blocks of `markdown`, for add-on panels and for the preview of
 //! Markdown files. Math comes as Unicode text, so no layout engine is needed.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use gpui::{AnyElement, FontStyle, FontWeight, HighlightStyle, InteractiveText, UnderlineStyle, ObjectFit, SharedString, StyledText, div, img, prelude::*, px, relative};
 
@@ -140,7 +140,7 @@ fn image(alt: &SharedString, url: &str, base: Option<&Path>, look: Look) -> AnyE
             .flex_none()
             .items_center()
             .gap(px(4.))
-            .child(img(PathBuf::from(path)).max_w(relative(1.)).max_h(px(480.)).object_fit(ObjectFit::Contain))
+            .child(img(path).max_w(relative(1.)).max_h(px(480.)).object_fit(ObjectFit::Contain))
             .children(caption)
             .into_any_element(),
         None => div().flex_none().italic().text_color(theme::color(palette.ui_muted)).child(if alt.is_empty() { SharedString::from(url.to_string()) } else { alt.clone() }).into_any_element(),

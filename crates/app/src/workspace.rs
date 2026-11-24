@@ -9277,6 +9277,45 @@ impl Render for Workspace {
     }
 }
 
+/// One picker row per version: when, and how much it differs from now.
+fn history_items(versions: &[history::Version], current: &str) -> Vec<PickerItem> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs());
+    versions
+        .iter()
+        .map(|version| {
+            let text = history::read(&version.file).ok().and_then(|bytes| text_file::decode(bytes).ok()).map(|loaded| loaded.text);
+            let changes = match text.as_deref().map(|text| editor_core::line_diff::line_diff(current, text)) {
+                Some(Some(hunks)) if hunks.is_empty() => "Same as now".to_string(),
+                Some(Some(hunks)) => {
+                    let lines: usize = hunks.iter().map(|hunk| hunk.lines.len().max(1)).sum();
+                    format!("{lines} line{} differ from now", if lines == 1 { "" } else { "s" })
+                }
+                _ => "Differs from now".to_string(),
+            };
+            PickerItem {
+                path: version.file.clone(),
+                label: projects::ago(now, version.time),
+                position: None,
+                summary: None,
+                detail: Some(changes),
+            }
+        })
+        .collect()
+}
+
+/// Why a save failed, in words that say what to do. The file on disk is
+/// always whole, since saves replace it in one step.
+fn save_failed(error: &std::io::Error) -> String {
+    use std::io::ErrorKind;
+    let advice = match error.kind() {
+        ErrorKind::StorageFull | ErrorKind::QuotaExceeded => "The disk is full. Free some space and save again",
+        ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem => "This file or folder cannot be changed. Save a copy somewhere else",
+        ErrorKind::NotFound => "Its folder is gone. Save a copy somewhere else",
+        _ => return format!("Cannot save: {error}. Your text is still here and kept safe."),
+    };
+    format!("Cannot save: {advice}. Your text is still here and kept safe.")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9332,43 +9371,4 @@ mod tests {
         assert!(tab_edges(0, 3, None).0);
         assert!(!tab_edges(2, 3, None).1);
     }
-}
-
-/// One picker row per version: when, and how much it differs from now.
-fn history_items(versions: &[history::Version], current: &str) -> Vec<PickerItem> {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs());
-    versions
-        .iter()
-        .map(|version| {
-            let text = history::read(&version.file).ok().and_then(|bytes| text_file::decode(bytes).ok()).map(|loaded| loaded.text);
-            let changes = match text.as_deref().map(|text| editor_core::line_diff::line_diff(current, text)) {
-                Some(Some(hunks)) if hunks.is_empty() => "Same as now".to_string(),
-                Some(Some(hunks)) => {
-                    let lines: usize = hunks.iter().map(|hunk| hunk.lines.len().max(1)).sum();
-                    format!("{lines} line{} differ from now", if lines == 1 { "" } else { "s" })
-                }
-                _ => "Differs from now".to_string(),
-            };
-            PickerItem {
-                path: version.file.clone(),
-                label: projects::ago(now, version.time),
-                position: None,
-                summary: None,
-                detail: Some(changes),
-            }
-        })
-        .collect()
-}
-
-/// Why a save failed, in words that say what to do. The file on disk is
-/// always whole, since saves replace it in one step.
-fn save_failed(error: &std::io::Error) -> String {
-    use std::io::ErrorKind;
-    let advice = match error.kind() {
-        ErrorKind::StorageFull | ErrorKind::QuotaExceeded => "The disk is full. Free some space and save again",
-        ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem => "This file or folder cannot be changed. Save a copy somewhere else",
-        ErrorKind::NotFound => "Its folder is gone. Save a copy somewhere else",
-        _ => return format!("Cannot save: {error}. Your text is still here and kept safe."),
-    };
-    format!("Cannot save: {advice}. Your text is still here and kept safe.")
 }
