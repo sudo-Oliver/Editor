@@ -954,12 +954,7 @@ impl Render for SetupView {
 
 /// Free space on the disk with the home folder, in megabytes.
 fn free_megabytes() -> Option<u64> {
-    let home = std::ffi::CString::new(std::env::var("HOME").ok()?).ok()?;
-    let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(home.as_ptr(), &mut stats) } != 0 {
-        return None;
-    }
-    Some(stats.f_bavail as u64 * stats.f_frsize as u64 / 1_000_000)
+    crate::platform::free_megabytes(&crate::platform::home()?)
 }
 
 fn title(text: &'static str) -> AnyElement {

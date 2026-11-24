@@ -10,7 +10,6 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     io::{BufRead, BufReader},
-    os::unix::process::CommandExt,
     process::{Command, Stdio},
     sync::{
         Arc, Mutex,
@@ -834,17 +833,18 @@ fn remove_versions_except(tools: &Path, pinned: &[(&str, &str)]) {
 /// of output, to show what it is doing, and `cancel` stops it.
 pub fn install_with_homebrew(brew: &Path, tool: Tool, line: &Arc<Mutex<String>>, cancel: &AtomicBool) -> Result<(), String> {
     let formula = tool.formula().ok_or_else(|| format!("Homebrew does not install {} here.", tool.name()))?;
-    let mut child = Command::new(brew)
+    let mut command = Command::new(brew);
+    command
         .args(["install", formula])
         .env("NONINTERACTIVE", "1")
         .env("HOMEBREW_NO_ENV_HINTS", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // Its own group, so that stopping also stops the downloads it started.
-        .process_group(0)
-        .spawn()
-        .map_err(|error| format!("Cannot start Homebrew: {error}"))?;
+        .stderr(Stdio::piped());
+    // Its own group, so that stopping also stops the downloads it started.
+    build::prepare_group(&mut command);
+    let mut child = command.spawn().map_err(|error| format!("Cannot start Homebrew: {error}"))?;
+    let group = build::Group::of(child.id()).ok();
     let readers: Vec<_> = [child.stdout.take().map(|out| Box::new(out) as Box<dyn std::io::Read + Send>), child.stderr.take().map(|err| Box::new(err) as Box<dyn std::io::Read + Send>)]
         .into_iter()
         .flatten()
@@ -863,8 +863,8 @@ pub fn install_with_homebrew(brew: &Path, tool: Tool, line: &Arc<Mutex<String>>,
         .collect();
     let status = loop {
         if cancel.load(Ordering::Relaxed) {
-            unsafe {
-                libc::kill(-(child.id() as i32), libc::SIGTERM);
+            if let Some(group) = &group {
+                group.terminate();
             }
             let _ = child.wait();
             return Err("Stopped.".to_string());
@@ -1460,6 +1460,7 @@ mod tests {
 
     use super::*;
 
+    #[cfg(unix)]
     fn fake_brew(directory: &Path, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let brew = directory.join("brew");
@@ -1469,6 +1470,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn homebrew_installs_and_reports_its_last_line() {
         let directory = tempfile::tempdir().unwrap();
         let cancel = AtomicBool::new(false);
@@ -1483,6 +1485,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_stopped_homebrew_install_ends() {
         let directory = tempfile::tempdir().unwrap();
         let brew = fake_brew(directory.path(), "sleep 30");

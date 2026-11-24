@@ -50,6 +50,10 @@ pub fn install_into(script: &Path, folders: &[PathBuf]) -> Result<Outcome, Strin
                 Ok(()) => {}
             }
         }
+        // Windows gets the command from its installer instead.
+        #[cfg(not(unix))]
+        return Err(format!("Cannot link {} here.", link.display()));
+        #[cfg(unix)]
         match std::os::unix::fs::symlink(script, &link) {
             Ok(()) => return Ok(Outcome::Installed(link)),
             Err(error) if error.kind() == ErrorKind::PermissionDenied => continue,
@@ -93,6 +97,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(unix)]
     fn the_command_goes_into_the_first_folder_that_works() {
         let directory = tempfile::tempdir().unwrap();
         let app = directory.path().join("Editor.app/Contents/Resources/bin");

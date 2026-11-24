@@ -9,7 +9,6 @@
 //! Only a real app bundle updates itself: a build run with cargo never asks.
 
 use std::{
-    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -173,11 +172,22 @@ impl Drop for Mounted {
     }
 }
 
+#[cfg(unix)]
 pub(crate) fn writable(path: &Path) -> bool {
     let Ok(path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
         return false;
     };
+    // SAFETY: access only reads a valid C string.
     unsafe { libc::access(path.as_ptr(), libc::W_OK) == 0 }
+}
+
+/// Windows has no cheap check for the right to write: trying is the check.
+#[cfg(not(unix))]
+pub(crate) fn writable(path: &Path) -> bool {
+    let probe = path.join(format!(".editor-write-{}", std::process::id()));
+    let writable = std::fs::write(&probe, b"").is_ok();
+    std::fs::remove_file(&probe).ok();
+    writable
 }
 
 /// Copies `source` to `bundle` through `staged`, keeping the app that is
@@ -261,20 +271,21 @@ pub fn install_from_dmg(dmg: &Path, bundle: &Path, version: &str) -> Result<(), 
 
 /// Runs `brew upgrade` for the cask. Blocks.
 fn upgrade_with_homebrew(brew: &Path, bundle: &Path, version: &str, cancel: &AtomicBool) -> Result<(), String> {
-    let mut child = Command::new(brew)
+    let mut command = Command::new(brew);
+    command
         .args(["upgrade", "--cask", CASK])
         .env("NONINTERACTIVE", "1")
         .env("HOMEBREW_NO_ENV_HINTS", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .map_err(|error| format!("Cannot start Homebrew: {error}"))?;
+        .stderr(Stdio::piped());
+    build::prepare_group(&mut command);
+    let mut child = command.spawn().map_err(|error| format!("Cannot start Homebrew: {error}"))?;
+    let group = build::Group::of(child.id()).ok();
     loop {
         if cancel.load(Ordering::Relaxed) {
-            unsafe {
-                libc::kill(-(child.id() as i32), libc::SIGTERM);
+            if let Some(group) = &group {
+                group.terminate();
             }
             child.wait().ok();
             return Err("Stopped.".to_string());
@@ -297,16 +308,17 @@ fn upgrade_with_homebrew(brew: &Path, bundle: &Path, version: &str, cancel: &Ato
 
 /// Starts the app at `bundle` once this process has ended.
 pub(crate) fn relaunch(bundle: &Path) {
-    Command::new("/bin/sh")
+    let mut command = Command::new("/bin/sh");
+    command
         .args(["-c", "while kill -0 \"$1\" 2>/dev/null; do sleep 0.2; done; exec /usr/bin/open \"$2\"", "sh"])
         .arg(std::process::id().to_string())
         .arg(bundle)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()
-        .ok();
+        .stderr(Stdio::null());
+    // A group of its own, so that it outlives this app.
+    build::prepare_group(&mut command);
+    command.spawn().ok();
 }
 
 struct Job {

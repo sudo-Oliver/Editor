@@ -5,7 +5,6 @@
 //! app to Applications, starts it from there and ejects the dmg.
 
 use std::{
-    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::OnceLock,
@@ -101,7 +100,8 @@ fn copy_to_applications(bundle: &Path) -> Result<PathBuf, String> {
 
 /// Once this process has ended: ejects `mount`, if any, and starts `bundle`.
 fn relaunch_and_eject(bundle: &Path, mount: Option<&Path>) {
-    Command::new("/bin/sh")
+    let mut command = Command::new("/bin/sh");
+    command
         .args([
             "-c",
             "while kill -0 \"$1\" 2>/dev/null; do sleep 0.2; done; [ -n \"$3\" ] && /usr/bin/hdiutil detach -quiet \"$3\"; exec /usr/bin/open \"$2\"",
@@ -112,10 +112,10 @@ fn relaunch_and_eject(bundle: &Path, mount: Option<&Path>) {
         .arg(mount.map(Path::as_os_str).unwrap_or_default())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()
-        .ok();
+        .stderr(Stdio::null());
+    // A group of its own, so that it outlives this app.
+    build::prepare_group(&mut command);
+    command.spawn().ok();
 }
 
 pub enum MoverEvent {

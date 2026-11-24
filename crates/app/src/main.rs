@@ -1,3 +1,6 @@
+// A window app on Windows, without a console beside it.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod actions;
 mod addon_panel;
 mod addon_reports;
@@ -32,6 +35,7 @@ mod package_commands;
 mod pdf_text;
 mod pdf_view;
 mod picker;
+mod platform;
 mod problems;
 mod problem_report;
 mod projects;
@@ -53,7 +57,7 @@ mod tour;
 mod updater;
 mod workspace;
 
-use std::{ffi::OsString, os::unix::ffi::OsStringExt, path::PathBuf};
+use std::path::PathBuf;
 
 use gpui::{
     App, Bounds, Menu, MenuItem, TitlebarOptions, WindowBounds, WindowOptions, point, prelude::*,
@@ -145,7 +149,21 @@ fn path_from_url(url: &str) -> Option<PathBuf> {
             }
         }
     }
-    Some(PathBuf::from(OsString::from_vec(decoded)))
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Some(PathBuf::from(std::ffi::OsString::from_vec(decoded)))
+    }
+    // `file:///C:/x` holds `/C:/x`, a drive path with a slash in front.
+    #[cfg(not(unix))]
+    {
+        let text = String::from_utf8(decoded).ok()?;
+        let text = match text.as_bytes() {
+            [b'/', _, b':', ..] => &text[1..],
+            _ => &text,
+        };
+        Some(PathBuf::from(text.replace('/', "\\")))
+    }
 }
 
 #[cfg(test)]

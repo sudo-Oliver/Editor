@@ -4,7 +4,6 @@
 use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
-    os::unix::process::CommandExt,
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     sync::mpsc as std_mpsc,
@@ -55,9 +54,13 @@ pub fn private_directory() -> Result<PathBuf, String> {
     static DIRECTORY: std::sync::OnceLock<Result<PathBuf, String>> = std::sync::OnceLock::new();
     DIRECTORY
         .get_or_init(|| {
-            use std::os::unix::fs::DirBuilderExt;
             let path = std::env::temp_dir().join(format!("editor-addons-{}", std::process::id()));
-            match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+            #[cfg_attr(not(unix), allow(unused_mut))]
+            let mut builder = std::fs::DirBuilder::new();
+            // Windows keeps the temporary folder to its user already.
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            match builder.create(&path) {
                 Ok(()) => Ok(path),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(path),
                 Err(error) => Err(format!("Cannot make a folder for add-on files: {error}")),
@@ -256,22 +259,19 @@ pub enum ProcessEvent {
 /// A running add-on. Dropping it ends the program.
 pub struct AddonProcess {
     sender: Option<std_mpsc::Sender<HostMessage>>,
-    process_group: u32,
+    /// The add-on and the programs it started, which end with it.
+    group: Option<std::sync::Arc<build::Group>>,
 }
 
 impl AddonProcess {
     pub fn start(add_on: &Installed) -> Result<(Self, mpsc::Receiver<ProcessEvent>), String> {
         let program = add_on.program();
-        let mut child = Command::new(&program)
-            .current_dir(&add_on.directory)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // The add-on can start programs of its own, which should end with it.
-            .process_group(0)
-            .spawn()
-            .map_err(|error| format!("Cannot start {}: {error}", program.display()))?;
-        let process_group = child.id();
+        let mut command = Command::new(&program);
+        command.current_dir(&add_on.directory).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        // The add-on can start programs of its own, which should end with it.
+        build::prepare_group(&mut command);
+        let mut child = command.spawn().map_err(|error| format!("Cannot start {}: {error}", program.display()))?;
+        let group = build::Group::of(child.id()).ok().map(std::sync::Arc::new);
         let (Some(mut stdin), Some(stdout), Some(stderr)) = (child.stdin.take(), child.stdout.take(), child.stderr.take()) else {
             return Err("The add-on has no pipes.".to_string());
         };
@@ -321,7 +321,7 @@ impl AddonProcess {
             let reason = if last.is_empty() { code } else { format!("{code}: {last}") };
             events.blocking_send(ProcessEvent::Exited(reason)).ok();
         });
-        Ok((Self { sender: Some(sender), process_group }, receiver))
+        Ok((Self { sender: Some(sender), group }, receiver))
     }
 
     pub fn send(&self, message: HostMessage) {
@@ -333,16 +333,15 @@ impl AddonProcess {
     /// Ends the add-on before the app exits, since no thread outlives the app to do it.
     pub fn shut_down(&mut self) {
         self.sender = None;
-        let group = self.process_group as libc::pid_t;
-        // SAFETY: `killpg` takes plain values. The group holds only this add-on.
-        unsafe { libc::killpg(group, libc::SIGTERM) };
+        let Some(group) = &self.group else {
+            return;
+        };
+        group.terminate();
         let started = Instant::now();
-        // SAFETY: as above. Signal 0 only asks whether the group still exists.
-        while started.elapsed() < QUIT_GRACE && unsafe { libc::killpg(group, 0) } == 0 {
+        while started.elapsed() < QUIT_GRACE && group.alive() {
             thread::sleep(Duration::from_millis(10));
         }
-        // SAFETY: as above.
-        unsafe { libc::killpg(group, libc::SIGKILL) };
+        group.kill();
     }
 }
 
@@ -365,14 +364,14 @@ impl Drop for AddonProcess {
     fn drop(&mut self) {
         // Closing stdin asks it to exit. What is left after that gets a signal.
         self.sender = None;
-        let group = self.process_group as libc::pid_t;
+        let Some(group) = self.group.take() else {
+            return;
+        };
         thread::spawn(move || {
             thread::sleep(EXIT_GRACE);
-            // SAFETY: `killpg` takes plain values. The group holds only this add-on.
-            unsafe { libc::killpg(group, libc::SIGTERM) };
+            group.terminate();
             thread::sleep(EXIT_GRACE);
-            // SAFETY: as above.
-            unsafe { libc::killpg(group, libc::SIGKILL) };
+            group.kill();
         });
     }
 }
@@ -389,7 +388,7 @@ pub fn set_secret(add_on: &str, key: &str, value: &str) -> Result<(), String> {
     crate::secrets::set(KEYCHAIN_SERVICE, "Editor add-on", &format!("{add_on}/{key}"), value)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
