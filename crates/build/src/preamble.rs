@@ -5,7 +5,6 @@
 use std::{
     fs,
     hash::{DefaultHasher, Hasher},
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     time::SystemTime,
 };
@@ -200,7 +199,9 @@ fn recorded_inputs(recorded: &str) -> Vec<String> {
 
 fn input_line(path: &Path) -> Option<String> {
     let metadata = fs::metadata(path).ok()?;
-    Some(format!("{} {} {}", metadata.len(), metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000, path.display()))
+    // Nanoseconds since 1970 on every system; a file from before counts as 0.
+    let modified = metadata.modified().ok()?.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |since| since.as_nanos());
+    Some(format!("{} {modified} {}", metadata.len(), path.display()))
 }
 
 fn input_is_unchanged(line: &str) -> bool {

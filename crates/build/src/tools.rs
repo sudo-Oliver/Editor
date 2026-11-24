@@ -4,6 +4,7 @@ use std::{
     sync::RwLock,
 };
 
+#[cfg(not(windows))]
 const EXTRA_DIRECTORIES: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin", "/Library/TeX/texbin"];
 
 /// Folders of tools that the app installed itself. They come last, so that a
@@ -25,12 +26,60 @@ fn search_path() -> Vec<PathBuf> {
     let mut directories: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).collect())
         .unwrap_or_default();
-    directories.extend(EXTRA_DIRECTORIES.iter().map(PathBuf::from));
+    directories.extend(extra_directories());
+    directories.extend(ADDED_DIRECTORIES.read().map(|added| added.clone()).unwrap_or_default());
+    directories
+}
+
+/// The usual install places, for apps started without the shell's `PATH`.
+#[cfg(not(windows))]
+fn extra_directories() -> Vec<PathBuf> {
+    let mut directories: Vec<PathBuf> = EXTRA_DIRECTORIES.iter().map(PathBuf::from).collect();
     if let Some(home) = std::env::var_os("HOME") {
         directories.push(Path::new(&home).join(".cargo/bin"));
     }
-    directories.extend(ADDED_DIRECTORIES.read().map(|added| added.clone()).unwrap_or_default());
     directories
+}
+
+/// The usual install places on Windows, which installers do not always add
+/// to the `PATH` an app started from the Start menu sees: TeX Live, MiKTeX
+/// for everyone or for one user, and Git.
+#[cfg(windows)]
+fn extra_directories() -> Vec<PathBuf> {
+    let variable = |name: &str| std::env::var_os(name).map(PathBuf::from);
+    let mut directories = Vec::new();
+    // TeX Live puts each year in its own folder; the newest wins.
+    if let Ok(entries) = std::fs::read_dir("C:\\texlive") {
+        let mut years: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).filter(|path| path.join("bin\\windows").is_dir()).collect();
+        years.sort();
+        directories.extend(years.into_iter().rev().map(|year| year.join("bin\\windows")));
+    }
+    for base in [variable("ProgramFiles"), variable("LOCALAPPDATA").map(|local| local.join("Programs"))].into_iter().flatten() {
+        directories.push(base.join("MiKTeX\\miktex\\bin\\x64"));
+        directories.push(base.join("Git\\cmd"));
+        directories.push(base.join("Pandoc"));
+    }
+    if let Some(profile) = variable("USERPROFILE") {
+        directories.push(profile.join(".cargo\\bin"));
+    }
+    directories
+}
+
+/// Turns `\\?\C:\x` into `C:\x`, and `\\?\UNC\server\x` into `\\server\x`.
+/// `canonicalize` gives the long form on Windows, which TeX, Typst and Pandoc
+/// refuse and which never equals a path as typed. Elsewhere it does nothing.
+pub fn plain_path(path: PathBuf) -> PathBuf {
+    let Some(text) = path.to_str() else {
+        return path;
+    };
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    match text.strip_prefix(r"\\?\") {
+        // Only a drive path; others need the long form.
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => path,
+    }
 }
 
 /// Debug builds only: `EDITOR_PRETEND_FRESH=1` hides the tools of this Mac,
@@ -54,11 +103,25 @@ pub fn remove_directory(directory: &Path) {
     }
 }
 
+/// Finds a program by its name. On Windows, `pdflatex` is `pdflatex.exe`, and
+/// some programs are batch files, as `PATHEXT` lists them.
 pub fn find_tool(name: &str) -> Option<PathBuf> {
-    search_path()
-        .into_iter()
-        .map(|directory| directory.join(name))
-        .find(|path| path.is_file())
+    let names = program_names(name);
+    search_path().into_iter().find_map(|directory| names.iter().map(|name| directory.join(name)).find(|path| path.is_file()))
+}
+
+#[cfg(not(windows))]
+fn program_names(name: &str) -> Vec<String> {
+    vec![name.to_string()]
+}
+
+#[cfg(windows)]
+fn program_names(name: &str) -> Vec<String> {
+    if Path::new(name).extension().is_some() {
+        return vec![name.to_string()];
+    }
+    let extensions = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    extensions.split(';').filter(|extension| !extension.is_empty()).map(|extension| format!("{name}{}", extension.to_ascii_lowercase())).collect()
 }
 
 /// `PATH` for child processes, so that for example Pandoc finds Typst.
@@ -112,5 +175,17 @@ mod tests {
         let variables = child_env();
         assert!(variables.contains(&("TECTONIC_CACHE_DIR", OsString::from("/caches/tectonic"))));
         assert!(variables.contains(&("TYPST_PACKAGE_CACHE_PATH", OsString::from("/caches/typst"))));
+    }
+}
+
+#[cfg(test)]
+mod plain_tests {
+    use super::*;
+
+    #[test]
+    fn long_windows_paths_become_plain() {
+        assert_eq!(plain_path(PathBuf::from(r"\\?\C:\Users\Ada\Thesis")), PathBuf::from(r"C:\Users\Ada\Thesis"));
+        assert_eq!(plain_path(PathBuf::from(r"\\?\UNC\server\share\x")), PathBuf::from(r"\\server\share\x"));
+        assert_eq!(plain_path(PathBuf::from("/Users/ada/Thesis")), PathBuf::from("/Users/ada/Thesis"));
     }
 }
