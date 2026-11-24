@@ -4666,8 +4666,22 @@ impl Workspace {
             self.insert_snippet(&text, false, cx);
             return format!("Cited {key} at the cursor.");
         }
+        // The `[@` that opened the picker is already there.
+        if self.active_language(cx) == Some(Language::Markdown)
+            && let Some((_, before, after)) = self.active_view().and_then(|view| Self::around_cursor(view.read(cx)))
+            && snippets::opens_markdown_cite(&before)
+        {
+            let mut text = editor_core::snippet::literal(key);
+            if more {
+                text.push_str("; @");
+            } else if !after.starts_with(']') {
+                text.push(']');
+            }
+            self.insert_snippet(&text, false, cx);
+            return format!("Cited {key} at the cursor.");
+        }
         match self.active_language(cx) {
-            Some(language @ (Language::Latex | Language::Typst)) => {
+            Some(language @ (Language::Latex | Language::Typst | Language::Markdown)) => {
                 self.insert_snippet(&snippets::citation(language, key), false, cx);
                 format!("Cited {key} at the cursor.")
             }
@@ -4845,7 +4859,7 @@ impl Workspace {
     /// again at that place.
     fn check_citation_trigger(&mut self, view: &Entity<EditorView>, cx: &mut Context<Self>) {
         let language = self.active_language(cx);
-        if self.picker.is_some() || self.active_view().as_ref() != Some(view) || !matches!(language, Some(Language::Latex | Language::Typst)) {
+        if self.picker.is_some() || self.active_view().as_ref() != Some(view) || !matches!(language, Some(Language::Latex | Language::Typst | Language::Markdown)) {
             return;
         }
         let Some((head, before, _)) = Self::around_cursor(view.read(cx)) else {
@@ -4856,7 +4870,11 @@ impl Workspace {
             self.citation_trigger = None;
         }
         let after = Self::around_cursor(view.read(cx)).map(|(_, _, after)| after).unwrap_or_default();
-        let opens = if language == Some(Language::Typst) { snippets::opens_reference(&before) } else { snippets::cite_slot(&before, &after).is_some() };
+        let opens = match language {
+            Some(Language::Typst) => snippets::opens_reference(&before),
+            Some(Language::Markdown) => snippets::opens_markdown_cite(&before),
+            _ => snippets::cite_slot(&before, &after).is_some(),
+        };
         if !opens || self.citation_trigger == Some((id, head)) {
             return;
         }
@@ -4880,9 +4898,9 @@ impl Workspace {
             return;
         };
         let active = self.active_view().and_then(|view| view.read(cx).path.clone());
-        // Typst looks next to the current file, LaTeX next to the main file.
+        // Typst and Markdown look next to the current file, LaTeX next to the main file.
         let main = match language {
-            Language::Typst => active,
+            Language::Typst | Language::Markdown => active,
             _ => self.root.as_deref().and_then(|root| find_main(root, &self.config, active.as_deref())),
         };
         let directory = main.as_deref().and_then(Path::parent).or(self.root.as_deref());
@@ -6393,8 +6411,9 @@ impl Workspace {
         let separator = || div().w(px(1.)).h(px(14.)).mx(px(6.)).bg(theme::color(theme::palette().divider));
         let palette = theme::palette();
         let language = self.active_language(cx);
-        let markup = matches!(language, Some(Language::Latex | Language::Typst));
         let formats = matches!(language, Some(Language::Latex | Language::Typst | Language::Markdown));
+        // Markdown takes LaTeX math between dollars, as Pandoc reads it.
+        let markup = formats;
         // A capsule floating on the editor's paper rather than a bar across it;
         // it is a little see-through, so the grain of paper mode shows.
         let capsule = div()
