@@ -83,7 +83,7 @@ pub fn block(index: usize, block: &Block, look: Look, base: Option<&Path>, code_
                     .child(text.clone()),
             )
             .into_any_element(),
-        Block::Math(text) => div()
+        Block::Math { text, .. } => div()
             .flex_none()
             .flex()
             .flex_col()
