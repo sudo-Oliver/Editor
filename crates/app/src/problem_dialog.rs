@@ -178,7 +178,7 @@ impl Workspace {
             }
         }
         content.push(muted(
-            "GitHub opens in your browser with the report filled in. Without a GitHub account, create one there for free first; it takes a minute. Then press Submit new issue. If the form is empty after signing up, click into it and press Cmd+V: the report is also on your clipboard.",
+            if cfg!(windows) { "GitHub opens in your browser with the report filled in. Without a GitHub account, create one there for free first; it takes a minute. Then press Submit new issue. If the form is empty after signing up, click into it and press Ctrl+V: the report is also on your clipboard." } else { "GitHub opens in your browser with the report filled in. Without a GitHub account, create one there for free first; it takes a minute. Then press Submit new issue. If the form is empty after signing up, click into it and press Cmd+V: the report is also on your clipboard." },
         ));
         content.push(
             div()

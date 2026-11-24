@@ -69,6 +69,7 @@ use crate::{
     theme,
     toolchain::{self, Tool, Toolchain, ToolchainEvent},
     updater::{self, Updater},
+    window_controls,
     app_location::{self, Mover, MoverEvent},
 };
 
@@ -133,10 +134,7 @@ const CITATION_DETAIL_WIDTH: f32 = 300.0;
 /// A pause in typing before the project is searched for the query.
 const PICKER_SEARCH_DELAY: Duration = Duration::from_millis(120);
 
-#[cfg(target_os = "macos")]
-const TRAFFIC_LIGHT_SPACE: f32 = 78.0;
-#[cfg(not(target_os = "macos"))]
-const TRAFFIC_LIGHT_SPACE: f32 = 8.0;
+const TRAFFIC_LIGHT_SPACE: f32 = window_controls::LEFT_SPACE;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Divider {
@@ -4060,9 +4058,9 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let message = format!("Move “{name}” to the Trash?");
             let detail = if unsaved {
-                "Finder can put it back from the Trash. Unsaved changes stay in Earlier versions."
+                if cfg!(windows) { "Windows can put it back from the Recycle Bin. Unsaved changes stay in Earlier versions." } else { "Finder can put it back from the Trash. Unsaved changes stay in Earlier versions." }
             } else {
-                "Finder can put it back from the Trash."
+                if cfg!(windows) { "Windows can put it back from the Recycle Bin." } else { "Finder can put it back from the Trash." }
             };
             if ask(&this, cx, PromptLevel::Warning, &message, detail, &["Move to Trash", "Cancel"]).await != Some(0) {
                 return;
@@ -4176,7 +4174,7 @@ impl Workspace {
         }
         entries.push(menu_separator());
         let target = path.clone();
-        entries.push(entry("Reveal in Finder", "", move |_, _, cx| cx.reveal_path(&target)));
+        entries.push(entry(if cfg!(windows) { "Show in Explorer" } else { "Reveal in Finder" }, "", move |_, _, cx| cx.reveal_path(&target)));
         let target = path.clone();
         entries.push(entry("Copy path", "", move |this, _, cx| {
             let relative = this.relative_to_project(&target);
@@ -5491,14 +5489,13 @@ impl Workspace {
         )
     }
 
-    fn render_top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_top_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title = self
             .root
             .as_deref()
             .and_then(|root| root.file_name())
             .map_or_else(|| "No project".to_string(), |name| name.to_string_lossy().into_owned());
-        div()
-            .id("top-bar")
+        window_controls::drag_area(div().id("top-bar"))
             .relative()
             .flex()
             .flex_none()
@@ -5506,7 +5503,7 @@ impl Workspace {
             .justify_between()
             .h(px(TOP_BAR_HEIGHT))
             .pl(px(TRAFFIC_LIGHT_SPACE))
-            .pr(px(10.))
+            .pr(px(if cfg!(windows) { 0. } else { 10. }))
             .border_b_1()
             .border_color(theme::color(theme::palette().panel))
             .child(
@@ -5573,7 +5570,9 @@ impl Workspace {
                 div()
                     .flex()
                     .items_center()
-                    .child(self.menu_button(Menu::Layout, "Layout", cx)),
+                    .gap(px(6.))
+                    .child(self.menu_button(Menu::Layout, "Layout", cx))
+                    .children(window_controls::buttons(window, TOP_BAR_HEIGHT)),
             )
     }
 
@@ -8174,7 +8173,7 @@ impl Workspace {
                 Self::setting_row(
                     title,
                     shown(&folder),
-                    self.settings_button(id, "Show in Finder", cx, move |_, _, cx| cx.reveal_path(&folder)),
+                    self.settings_button(id, if cfg!(windows) { "Show in Explorer" } else { "Show in Finder" }, cx, move |_, _, cx| cx.reveal_path(&folder)),
                 )
                 .into_any_element(),
             );
@@ -9167,7 +9166,22 @@ impl Render for Workspace {
                 element.child(div().flex().flex_1().min_h_0().child(page))
             })
             .on_action(cx.listener(|this, _: &StartTour, window, cx| this.start_tour(window, cx)))
-            .when(!presenting && !focus && !hub, |element| element.child(self.render_top_bar(cx)))
+            .when(!presenting && !focus && !hub, |element| element.child(self.render_top_bar(window, cx)))
+            // In focus mode Windows still needs a way to move and close the window,
+            // as the Mac keeps its traffic lights.
+            .when(cfg!(windows) && focus && !presenting, |element| {
+                element.child(
+                    window_controls::drag_area(div().id("focus-bar"))
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .h(px(32.))
+                        .flex()
+                        .justify_end()
+                        .children(window_controls::buttons(window, 32.)),
+                )
+            })
             .when(presenting, |element| {
                 let controls = self.presenting.as_ref().is_some_and(|state| state.controls_shown);
                 element.child(

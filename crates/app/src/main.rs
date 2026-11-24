@@ -55,6 +55,7 @@ mod theme;
 mod toolchain;
 mod tour;
 mod updater;
+mod window_controls;
 mod workspace;
 
 use std::path::PathBuf;
