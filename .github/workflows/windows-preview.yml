@@ -30,7 +30,7 @@ jobs:
           mkdir -p target/windows
           cp target/release/editor.exe target/windows/
           cp vendor/pdfium/bin/pdfium.dll target/windows/
-          "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" "/DVersion=$version" "/DSource=$(cygpath -w "$PWD/target/windows")" packaging/windows/editor.iss
+          "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" "-DVersion=$version" "-DSource=$(cygpath -w "$PWD/target/windows")" packaging/windows/editor.iss
       - uses: actions/upload-artifact@v4
         with:
           name: Editor-windows-setup

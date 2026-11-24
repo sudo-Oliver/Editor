@@ -1,4 +1,4 @@
-; The Windows installer, built with Inno Setup: iscc /DVersion=0.1.0 /DSource=<folder> editor.iss
+; The Windows installer, built with Inno Setup: iscc -DVersion=0.1.0 -DSource=<folder> editor.iss
 ; It installs for the user alone, so it needs no administrator, and the
 ; updater can run it again silently.
 
