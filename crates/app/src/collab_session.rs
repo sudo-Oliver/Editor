@@ -1464,6 +1464,8 @@ impl Workspace {
             return panel
                 .child(div().flex_none().font_weight(FontWeight::SEMIBOLD).child("Work together"))
                 .child(Self::muted("Share this project with others on your network or over the internet. Nobody needs an account, and no server stores the project."))
+                // Windows asks once whether the editor may talk on the network.
+                .when(cfg!(windows), |panel| panel.child(Self::muted("The first time, Windows asks whether Editor may use the network. Allow it, so that others can reach you.")))
                 .child(Self::heading("Your name"))
                 .child(Self::field_box(&self.collab.name_field))
                 .child(self.check_row("collab-lan-visible", self.collab.visible_on_lan, "Visible on this network", cx, |this, _| {
