@@ -20,6 +20,7 @@ mod keymap;
 mod markdown;
 mod markdown_preview;
 mod markdown_view;
+mod math_render;
 mod math_text;
 mod marketplace;
 mod material_icons;

@@ -36,8 +36,8 @@ pub enum Block {
     Quote(Inline),
     Rule,
     Table { align: Vec<Align>, header: Vec<Inline>, rows: Vec<Vec<Inline>> },
-    /// `$$…$$`, as Unicode text.
-    Math(SharedString),
+    /// `$$…$$`: the LaTeX as written, and as Unicode text until it is typeset.
+    Math { source: SharedString, text: SharedString },
     /// An image alone in its paragraph, with the path as written.
     Image { alt: SharedString, url: SharedString },
 }
@@ -179,7 +179,10 @@ fn parse_from(text: &str, from: usize, blocks: &mut Vec<(usize, Block)>, mut sto
                     }
                 }
             }
-            Block::Math(math_text(math.join("\n").trim()).into())
+            {
+                let source = math.join("\n").trim().to_string();
+                Block::Math { text: math_text(&source).into(), source: source.into() }
+            }
         } else if let Some(fence) = fence(trimmed) {
             lines.next();
             let language = trimmed[fence.len()..].trim().to_string();
@@ -542,12 +545,12 @@ mod tests {
         assert_eq!(align, &[Align::Left, Align::Right]);
         assert_eq!(header[1].text, "b | c");
         assert_eq!(rows[0][1].text, "2");
-        assert_eq!(parsed[2], Block::Math("x²".into()));
+        assert_eq!(parsed[2], Block::Math { source: "x^2".into(), text: "x²".into() });
         assert_eq!(parsed[3], Block::Image { alt: "A frog".into(), url: "img/a frog.png".into() });
         let Block::Paragraph(paragraph) = &parsed[4] else { panic!() };
         let math: Vec<_> = paragraph.marks.iter().filter(|(_, marks)| marks.math).map(|(range, _)| &paragraph.text[range.clone()]).collect();
         assert_eq!(math, ["x₁"]);
-        assert_eq!(blocks("$$x$$\n"), [Block::Math("x".into())]);
+        assert_eq!(blocks("$$x$$\n"), [Block::Math { source: "x".into(), text: "x".into() }]);
     }
 
     /// Editing anywhere must end where reading the whole text at once does.
