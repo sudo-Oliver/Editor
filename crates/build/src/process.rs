@@ -5,8 +5,10 @@
 
 use std::io;
 
-/// Makes `command` start its own group, without a console window on Windows.
-pub fn prepare(command: &mut std::process::Command) {
+/// Starts `command` with everything it starts in one group, which `Group`
+/// ends together. On Windows the program starts paused and runs only once it
+/// is in its job, so that nothing it starts at once can slip out.
+pub fn spawn(command: &mut std::process::Command) -> io::Result<(std::process::Child, Option<Group>)> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -15,16 +17,33 @@ pub fn prepare(command: &mut std::process::Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        command.creation_flags(imp::CREATE_NO_WINDOW);
+        command.creation_flags(imp::CREATE_NO_WINDOW | imp::CREATE_SUSPENDED);
     }
+    let child = command.spawn()?;
+    let group = imp::Group::start(child.id()).ok().map(Group);
+    Ok((child, group))
 }
 
 /// The same for a tokio command.
-pub fn prepare_async(command: &mut tokio::process::Command) {
+pub fn spawn_async(command: &mut tokio::process::Command) -> io::Result<(tokio::process::Child, Option<Group>)> {
     #[cfg(unix)]
     command.process_group(0);
     #[cfg(windows)]
-    command.creation_flags(imp::CREATE_NO_WINDOW);
+    command.creation_flags(imp::CREATE_NO_WINDOW | imp::CREATE_SUSPENDED);
+    let child = command.spawn()?;
+    let group = child.id().and_then(|pid| imp::Group::start(pid).ok()).map(Group);
+    Ok((child, group))
+}
+
+/// For a helper that must outlive the app, such as one that starts it again
+/// after an update: a group of its own on Unix, no console on Windows.
+pub fn detach(command: &mut std::process::Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    no_window(command);
 }
 
 /// No console window on Windows, for a program that needs no group of its own.
@@ -37,15 +56,10 @@ pub fn no_window(command: &mut std::process::Command) -> &mut std::process::Comm
     command
 }
 
-/// The group of a started program, given by its process id.
+/// The programs of one start, which end together.
 pub struct Group(imp::Group);
 
 impl Group {
-    /// Takes in the program with `pid`, which `prepare` made ready.
-    pub fn of(pid: u32) -> io::Result<Self> {
-        imp::Group::of(pid).map(Self)
-    }
-
     /// Asks every program of the group to end. Windows has no polite way for
     /// programs without a window, so there it ends them at once.
     pub fn terminate(&self) {
@@ -74,7 +88,7 @@ mod imp {
     pub struct Group(libc::pid_t);
 
     impl Group {
-        pub fn of(pid: u32) -> io::Result<Self> {
+        pub fn start(pid: u32) -> io::Result<Self> {
             Ok(Self(pid as libc::pid_t))
         }
 
@@ -102,18 +116,20 @@ mod imp {
     use std::{io, mem, ptr};
 
     use windows_sys::Win32::{
-        Foundation::{CloseHandle, HANDLE, STILL_ACTIVE},
+        Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, STILL_ACTIVE},
         System::{
+            Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next},
             JobObjects::{
                 AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
                 JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
                 QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
             },
-            Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE},
+            Threading::{GetExitCodeProcess, OpenProcess, OpenThread, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE, ResumeThread, THREAD_SUSPEND_RESUME},
         },
     };
 
     pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    pub const CREATE_SUSPENDED: u32 = 0x0000_0004;
 
     pub struct Group(HANDLE);
 
@@ -122,7 +138,15 @@ mod imp {
     unsafe impl Sync for Group {}
 
     impl Group {
-        pub fn of(pid: u32) -> io::Result<Self> {
+        /// Puts the paused program with `pid` into a new job, then lets it run,
+        /// also when the job could not be made, so that it never stays paused.
+        pub fn start(pid: u32) -> io::Result<Self> {
+            let group = Self::assign(pid);
+            resume(pid);
+            group
+        }
+
+        fn assign(pid: u32) -> io::Result<Self> {
             // SAFETY: plain Win32 calls on handles this function owns and closes.
             unsafe {
                 let job = CreateJobObjectW(ptr::null(), ptr::null());
@@ -172,6 +196,32 @@ mod imp {
         }
     }
 
+    /// Lets every thread of a program started paused run.
+    fn resume(pid: u32) {
+        // SAFETY: a snapshot of the threads, walked with a struct of the size it
+        // says, and handles opened and closed here.
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if snapshot == INVALID_HANDLE_VALUE {
+                return;
+            }
+            let mut entry: THREADENTRY32 = mem::zeroed();
+            entry.dwSize = mem::size_of::<THREADENTRY32>() as u32;
+            let mut more = Thread32First(snapshot, &mut entry) != 0;
+            while more {
+                if entry.th32OwnerProcessID == pid {
+                    let thread = OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID);
+                    if !thread.is_null() {
+                        ResumeThread(thread);
+                        CloseHandle(thread);
+                    }
+                }
+                more = Thread32Next(snapshot, &mut entry) != 0;
+            }
+            CloseHandle(snapshot);
+        }
+    }
+
     pub fn running(pid: u32) -> bool {
         // SAFETY: a handle opened and closed here.
         unsafe {
@@ -205,9 +255,8 @@ mod tests {
             command.args(["/C", "ping -n 30 127.0.0.1 >NUL"]);
             command
         };
-        prepare(&mut command);
-        let mut child = command.spawn().unwrap();
-        let group = Group::of(child.id()).unwrap();
+        let (mut child, group) = spawn(&mut command).unwrap();
+        let group = group.unwrap();
         assert!(group.alive());
         assert!(running(child.id()));
         group.kill();

@@ -774,7 +774,7 @@ impl SetupView {
                         .gap(px(12.))
                         .child(link(("manual-folder", index), if cfg!(windows) { "Open the folder in Explorer" } else { "Open the folder in Finder" }, move |cx| {
                             std::fs::create_dir_all(&open).ok();
-                            cx.open_url(&format!("file://{}", open.display()));
+                            cx.open_with_system(&open);
                         }))
                         .child(link(("manual-copy", index), "Copy the path", move |cx| cx.write_to_clipboard(ClipboardItem::new_string(copy.display().to_string()))))
                         .into_any_element(),

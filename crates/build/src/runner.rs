@@ -611,9 +611,8 @@ async fn run_process(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    process::prepare_async(&mut command);
-    let mut child = match command.spawn() {
-        Ok(child) => child,
+    let (mut child, group) = match process::spawn_async(&mut command) {
+        Ok(started) => started,
         Err(error) => {
             return Some(RunResult {
                 success: false,
@@ -621,7 +620,7 @@ async fn run_process(
             });
         }
     };
-    let group = child.id().and_then(|id| Group::of(id).ok()).map(Arc::new);
+    let group = group.map(Arc::new);
     let store = |group: Option<Arc<Group>>| *running_group.lock().expect("the group lock is not poisoned") = group;
     store(group.clone());
     let stdout = child.stdout.take().expect("stdout is piped");

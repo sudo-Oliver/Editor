@@ -269,9 +269,8 @@ impl AddonProcess {
         let mut command = crate::platform::command(&program);
         command.current_dir(&add_on.directory).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         // The add-on can start programs of its own, which should end with it.
-        build::prepare_group(&mut command);
-        let mut child = command.spawn().map_err(|error| format!("Cannot start {}: {error}", program.display()))?;
-        let group = build::Group::of(child.id()).ok().map(std::sync::Arc::new);
+        let (mut child, group) = build::spawn_group(&mut command).map_err(|error| format!("Cannot start {}: {error}", program.display()))?;
+        let group = group.map(std::sync::Arc::new);
         let (Some(mut stdin), Some(stdout), Some(stderr)) = (child.stdin.take(), child.stdout.take(), child.stderr.take()) else {
             return Err("The add-on has no pipes.".to_string());
         };
@@ -336,7 +335,11 @@ impl AddonProcess {
         let Some(group) = &self.group else {
             return;
         };
-        group.terminate();
+        // On Windows terminating is killing, so the add-on first gets the time
+        // that closing its input gives it to save and exit.
+        if !cfg!(windows) {
+            group.terminate();
+        }
         let started = Instant::now();
         while started.elapsed() < QUIT_GRACE && group.alive() {
             thread::sleep(Duration::from_millis(10));
