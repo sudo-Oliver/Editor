@@ -15,6 +15,12 @@ The `addons` cargo feature of `crates/app` is off by default, which hides the
 Add-ons panel, the "Cite from a DOI" command and starts no installed add-on.
 `cargo run -p app --features addons` brings it all back for development.
 
+Known Windows problems, to fix first:
+
+- "Set up git" in the git panel calls `xcode-select --install`
+  (`toolchain::install_developer_tools`), which does not exist on Windows. It
+  should install Git for Windows (winget `Git.Git`) or say where to get it.
+
 ## Rules for the project
 
 - **Lightweight, no bloat.** Keep the features that were asked for, drop the
