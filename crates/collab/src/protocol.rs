@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 pub const ALPN: &[u8] = b"editor/collab/1";
 
 /// Larger frames come only from a broken or hostile peer.
-const MAX_FRAME: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_FRAME: usize = 64 * 1024 * 1024;
 
 const SECRET_LENGTH: usize = 16;
 
