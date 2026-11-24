@@ -8191,7 +8191,7 @@ impl Workspace {
                 .into_any_element(),
         ];
         elements.extend(toolchain::installer_choice(&self.toolchain, cx));
-        elements.extend(toolchain::tool_rows(&self.toolchain, &Tool::ALL, true, cx));
+        elements.extend(toolchain::tool_rows(&self.toolchain, Tool::ALL, true, cx));
         elements.extend(texlive::section(&self.texlive, &self.toolchain, cx));
         elements.push(div().flex_none().pt(px(4.)).text_size(px(11.)).text_color(theme::color(theme::palette().ui_muted)).child(toolchain::promise(&self.toolchain, cx)).into_any_element());
         elements

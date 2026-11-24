@@ -109,7 +109,12 @@ impl SetupView {
         let (has_latex, has_typst) = { let state = toolchain.read(cx); (state.ready(Tool::Tectonic), state.ready(Tool::Typst)) };
         // Homebrew only for people who have it: everyone else would first get
         // Apple's developer tools, gigabytes they never asked for.
-        let way = { let state = toolchain.read(cx); if state.use_homebrew && state.found(Tool::Homebrew) != Found::Missing { Way::Homebrew } else { Way::AppFolder } };
+        // winget is part of Windows, so there it is the first choice whenever it is there.
+        let way = {
+            let state = toolchain.read(cx);
+            let found = state.found(Tool::Homebrew) != Found::Missing;
+            if found && (state.use_homebrew || cfg!(windows)) { Way::Homebrew } else { Way::AppFolder }
+        };
         Self {
             step: if again { Step::Choose } else { Step::Welcome },
             latex: has_latex || !has_typst,
@@ -238,7 +243,12 @@ impl SetupView {
             started.insert(0, Tool::Homebrew);
         }
         self.started = started;
+        // The way shown is the way used, also when it was only the default.
+        let homebrew = self.way == Way::Homebrew;
         self.toolchain.update(cx, |toolchain, cx| {
+            if toolchain.use_homebrew != homebrew {
+                toolchain.choose_homebrew(homebrew, cx);
+            }
             for tool in tools {
                 toolchain.start(tool, cx);
             }
@@ -509,7 +519,9 @@ impl SetupView {
     /// The ways to install, for people who have Homebrew or ask for them.
     fn render_ways(&self, cx: &mut Context<Self>) -> AnyElement {
         let has_homebrew = self.ready(Tool::Homebrew, cx);
-        let (homebrew_label, homebrew_text) = if has_homebrew {
+        let (homebrew_label, homebrew_text) = if cfg!(windows) {
+            ("With winget (recommended)", "winget comes with Windows. It installs and later updates everything, for you alone and without a password.".to_string())
+        } else if has_homebrew {
             ("With Homebrew (recommended)", "You have Homebrew. It installs and later updates everything.".to_string())
         } else {
             (
@@ -525,7 +537,8 @@ impl SetupView {
             .flex()
             .flex_col()
             .gap(px(8.))
-            .child(self.option("setup-way-brew", homebrew_label, homebrew_text, self.way == Way::Homebrew, cx, |this, cx| this.choose_way(Way::Homebrew, cx)))
+            // On Windows winget is there or not: nothing to install first.
+            .when(!cfg!(windows) || has_homebrew, |ways| ways.child(self.option("setup-way-brew", homebrew_label, homebrew_text, self.way == Way::Homebrew, cx, |this, cx| this.choose_way(Way::Homebrew, cx))))
             .child(self.option(
                 "setup-way-app",
                 app_label,
@@ -570,7 +583,8 @@ impl SetupView {
         let needed = self.megabytes_needed(cx);
         let free = self.free;
         let enough = free.is_none_or(|free| free >= needed);
-        let passwords = (self.way != Way::Manual && needs_homebrew) as usize + to_install.contains(&Tool::MacTex) as usize;
+        // MiKTeX installs for one user on Windows, without a password.
+        let passwords = (self.way != Way::Manual && needs_homebrew) as usize + (to_install.contains(&Tool::MacTex) && cfg!(target_os = "macos")) as usize;
         elements.push(
             div()
                 .flex()
@@ -603,14 +617,16 @@ impl SetupView {
             elements.push(
                 div()
                     .text_color(theme::color(palette.error))
-                    .child(format!("Your Mac needs {} more free space for this. Free some up, or go back and choose the small LaTeX.", toolchain::size(missing)))
+                    .child(format!("Your {} needs {} more free space for this. Free some up, or go back and choose the small LaTeX.", if cfg!(windows) { "PC" } else { "Mac" }, toolchain::size(missing)))
                     .into_any_element(),
             );
         }
         if to_install.contains(&Tool::MacTex) {
-            elements.push(paragraph(
-                "The complete LaTeX is one long download: on a fast connection about 15 minutes, on a slow one longer. The setup shows how long it still takes. After that, everything works offline, and updates come from inside the app.",
-            ));
+            elements.push(paragraph(if cfg!(windows) {
+                "MiKTeX is a download of about 150 MB and installs in a few minutes. The first PDF of a document fetches the packages it uses, so that one takes a little longer."
+            } else {
+                "The complete LaTeX is one long download: on a fast connection about 15 minutes, on a slow one longer. The setup shows how long it still takes. After that, everything works offline, and updates come from inside the app."
+            }));
         }
         if passwords > 0 && self.way != Way::Manual {
             elements.push(paragraph(if passwords == 1 {
@@ -619,7 +635,11 @@ impl SetupView {
                 "macOS asks for your Mac password twice: for Homebrew now and for MacTeX after its download. Editor never sees it."
             }));
         } else if self.way == Way::AppFolder {
-            elements.push(paragraph("No password needed. Everything stays in the app's own folder, and nothing else on your Mac changes."));
+            elements.push(paragraph(if cfg!(windows) {
+                "No password needed. Everything stays in your own user folder, and nothing else on your PC changes."
+            } else {
+                "No password needed. Everything stays in the app's own folder, and nothing else on your Mac changes."
+            }));
         }
         let next: Option<(&'static str, fn(&mut Self, &mut Context<Self>))> = match (enough, self.way) {
             (false, _) => None,
@@ -733,7 +753,12 @@ impl SetupView {
         for (index, tool) in self.chosen().into_iter().enumerate() {
             let ready = self.ready(tool, cx);
             let mut steps: Vec<AnyElement> = Vec::new();
-            if tool == Tool::MacTex {
+            if tool == Tool::MacTex && cfg!(windows) {
+                let page = tool.download_page();
+                steps.push(numbered(1, format!("Download the MiKTeX installer ({}) from miktex.org.", toolchain::size(tool.megabytes().unwrap_or(0)))).into_any_element());
+                steps.push(link(("manual-page", index), "Open the download page", move |cx| cx.open_url(page)).into_any_element());
+                steps.push(numbered(2, "Open it from your Downloads folder, choose \"Only for me\" and keep the other answers as they are. No password is needed.").into_any_element());
+            } else if tool == Tool::MacTex {
                 let page = tool.download_page();
                 steps.push(numbered(1, format!("Download MacTeX.pkg ({}) from tug.org.", toolchain::size(tool.megabytes().unwrap_or(0)))).into_any_element());
                 steps.push(link(("manual-page", index), "Open the download page", move |cx| cx.open_url(page)).into_any_element());
@@ -747,9 +772,9 @@ impl SetupView {
                     div()
                         .flex()
                         .gap(px(12.))
-                        .child(link(("manual-folder", index), if cfg!(windows) { "Open the folder in Explorer" } else { "Open the folder in Finder" }, move |_| {
+                        .child(link(("manual-folder", index), if cfg!(windows) { "Open the folder in Explorer" } else { "Open the folder in Finder" }, move |cx| {
                             std::fs::create_dir_all(&open).ok();
-                            crate::platform::command("open").arg(&open).spawn().ok();
+                            cx.open_url(&format!("file://{}", open.display()));
                         }))
                         .child(link(("manual-copy", index), "Copy the path", move |cx| cx.write_to_clipboard(ClipboardItem::new_string(copy.display().to_string()))))
                         .into_any_element(),
@@ -812,7 +837,7 @@ impl SetupView {
                 if cfg!(windows) { "A test document just became a PDF on your PC. The complete LaTeX keeps downloading in the background and takes over on its own once it is there. Open the welcome document to see how it works." } else { "A test document just became a PDF on your Mac. The complete LaTeX keeps downloading in the background and takes over on its own once it is there. Open the welcome document to see how it works." }
             } else if ready {
                 if cfg!(windows) { "A test document just became a PDF on your PC. Open the welcome document to see how it works; a short tour shows each part of the editor." } else { "A test document just became a PDF on your Mac. Open the welcome document to see how it works; a short tour shows each part of the editor." }
-            } else if testing && chosen.contains(&Tool::Tectonic) && !toolchain::complete_latex() {
+            } else if testing && ((chosen.contains(&Tool::Tectonic) && !toolchain::complete_latex()) || (cfg!(windows) && chosen.contains(&Tool::MacTex))) {
                 "A small test document compiles with what was installed, so that your first PDF works. LaTeX fetches the packages it needs this first time, which takes two or three minutes."
             } else if testing {
                 "A small test document compiles with what was installed, so that your first PDF works. The first time takes a moment."

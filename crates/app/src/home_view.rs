@@ -2009,7 +2009,7 @@ impl HomeView {
                 .bg(theme::color(palette.panel))
                 .border_1()
                 .border_color(theme::color(palette.divider))
-                .children(toolchain::tool_rows(&self.toolchain, &Tool::ALL, true, cx))
+                .children(toolchain::tool_rows(&self.toolchain, Tool::ALL, true, cx))
                 .into_any_element(),
             div().text_size(px(11.)).text_color(theme::color(palette.ui_muted)).child(toolchain::promise(&self.toolchain, cx)).into_any_element(),
         ]
