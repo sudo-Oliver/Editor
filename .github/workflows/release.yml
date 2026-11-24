@@ -25,6 +25,12 @@ jobs:
           CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE_P12 }}
           CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
         run: |
+          # Without a certificate the app is signed ad hoc, and the dmg's
+          # "First open.txt" explains the warning macOS shows then.
+          if [ -z "$CERTIFICATE" ]; then
+            echo "No signing certificate in the secrets: the app gets an ad hoc signature."
+            exit 0
+          fi
           keychain="$RUNNER_TEMP/signing.keychain-db"
           password="$(uuidgen)"
           echo "$CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
