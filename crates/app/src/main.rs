@@ -45,6 +45,7 @@ mod settings;
 mod setup;
 mod shell_command;
 mod shortcuts;
+mod single_instance;
 mod smear;
 mod snippets;
 mod status_bar;
@@ -71,6 +72,10 @@ fn main() {
     problem_report::record_crashes();
     // Old macOS versions add a process serial number when Finder starts the app.
     let root = std::env::args_os().skip(1).find(|argument| !argument.to_string_lossy().starts_with("-psn_")).map(PathBuf::from);
+    // A second start on Windows hands its file to the editor that runs.
+    if single_instance::forward(root.as_deref()) {
+        return;
+    }
     // Before anything reads its settings or tools from the old place.
     storage::migrate();
     std::thread::spawn(storage::sweep);
@@ -79,6 +84,7 @@ fn main() {
     // Files and folders from Finder, the Dock and the `editor` command arrive
     // here, at the start as well as while the app runs.
     let (open_sender, mut opened) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+    single_instance::serve(open_sender.clone());
     let application = gpui_platform::application().with_assets(assets::Assets);
     application.on_open_urls(move |urls| {
         for path in urls.iter().filter_map(|url| path_from_url(url)) {
@@ -116,7 +122,10 @@ fn main() {
             cx.spawn(async move |cx| {
                 while let Some(path) = opened.recv().await {
                     let shown = window.update(cx, |workspace, window, cx| {
-                        workspace.open_path(path, window, cx);
+                        // Without a path, a second start only brings the window forward.
+                        if !path.as_os_str().is_empty() {
+                            workspace.open_path(path, window, cx);
+                        }
                         window.activate_window();
                     });
                     if shown.is_err() {
