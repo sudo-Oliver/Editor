@@ -599,7 +599,7 @@ impl EditorState {
                 if !selection.is_empty() {
                     snippet.fill_first(&self.buffer.slice(selection.range()));
                 }
-                if math && !self.syntax.in_math(start) {
+                if math && !self.syntax.in_math(self.buffer.rope(), start) {
                     snippet.surround("$", "$");
                 } else {
                     let before = self.char_before(start);
@@ -668,7 +668,7 @@ impl EditorState {
     }
 
     pub fn in_math(&self, offset: usize) -> bool {
-        self.syntax.in_math(offset)
+        self.syntax.in_math(self.buffer.rope(), offset)
     }
 
     /// Pastes one line per selection when the line count matches the cursor count.
@@ -1821,6 +1821,9 @@ mod tests {
             ("a $x$ b", Language::Typst, 3, true),
             ("a $x$ b", Language::Typst, 1, false),
             ("a $x$ b", Language::Typst, 5, false),
+            ("a $x$ b", Language::Markdown, 3, true),
+            ("a $x$ b", Language::Markdown, 1, false),
+            ("# T\n\n$$\nx\n$$\n", Language::Markdown, 9, true),
         ] {
             assert_eq!(parsed(text, language).in_math(offset), expected, "{text} at {offset}");
         }
