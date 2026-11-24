@@ -5,7 +5,7 @@
 
 use std::{
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     time::{Duration, Instant},
 };
 
@@ -120,7 +120,7 @@ pub fn typeset(engine: &Path, formulas: &[&str]) -> Result<(Vec<u8>, Vec<usize>)
     let (text, lines) = document(formulas);
     std::fs::write(directory.path().join("math.tex"), text).map_err(|error| error.to_string())?;
     let tectonic = engine.file_stem().is_some_and(|stem| stem == "tectonic");
-    let mut command = Command::new(engine);
+    let mut command = crate::platform::command(engine);
     if tectonic {
         command.args(["--keep-logs", "math.tex"]);
     } else {

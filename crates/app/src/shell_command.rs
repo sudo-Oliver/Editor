@@ -5,7 +5,6 @@
 use std::{
     io::ErrorKind,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 const NAME: &str = "editor";
@@ -16,7 +15,7 @@ const FOLDERS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin"];
 /// The script inside the running app. Builds made with cargo have none.
 pub fn script() -> Option<PathBuf> {
     let binary = std::env::current_exe().ok()?;
-    binary.parent()?.join("../Resources/bin").join(NAME).canonicalize().ok()
+    binary.parent()?.join("../Resources/bin").join(NAME).canonicalize().map(crate::platform::plain_path).ok()
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -38,7 +37,7 @@ pub fn install_into(script: &Path, folders: &[PathBuf]) -> Result<Outcome, Strin
     for folder in folders.iter().filter(|folder| folder.is_dir()) {
         let link = folder.join(NAME);
         if link.symlink_metadata().is_ok() {
-            if link.canonicalize().is_ok_and(|target| target == script) {
+            if link.canonicalize().map(crate::platform::plain_path).is_ok_and(|target| target == script) {
                 return Ok(Outcome::AlreadyThere(link));
             }
             if !ours(&link) {
@@ -73,7 +72,7 @@ pub fn install() -> Result<Outcome, String> {
         outcome => return Ok(outcome),
     }
     // The path goes in as an argument, so that nothing in it can change the command.
-    let status = Command::new("osascript")
+    let status = crate::platform::command("osascript")
         .args([
             "-e",
             "on run argv",

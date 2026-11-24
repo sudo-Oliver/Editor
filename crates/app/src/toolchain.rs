@@ -10,7 +10,7 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     io::{BufRead, BufReader},
-    process::{Command, Stdio},
+    process::Stdio,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -272,7 +272,8 @@ pub fn cache_directory(tool: Tool) -> Option<PathBuf> {
 /// The folder for programs downloaded by hand. Finder shows it, unlike the
 /// app's own folder, so that people can drag files into it.
 pub fn manual_directory() -> Option<PathBuf> {
-    Some(PathBuf::from(std::env::var_os("HOME")?).join("Applications/Editor Tools"))
+    let home = crate::platform::home()?;
+    Some(if cfg!(windows) { home.join("Editor Tools") } else { home.join("Applications/Editor Tools") })
 }
 
 fn folder(tools: &Path, tool: Tool, release: &Release) -> PathBuf {
@@ -332,7 +333,7 @@ pub fn adopt_manual(tool: Tool) -> Result<bool, String> {
         make_executable(&program)?;
         // Downloads from a browser carry a quarantine, and macOS refuses to
         // run an unsigned program that has one.
-        Command::new("xattr").args(["-dr", "com.apple.quarantine"]).arg(&manual).stderr(Stdio::null()).status().ok();
+        crate::platform::command("xattr").args(["-dr", "com.apple.quarantine"]).arg(&manual).stderr(Stdio::null()).status().ok();
         if let Some(folder) = program.parent() {
             build::add_directory(folder.to_path_buf());
         }
@@ -396,18 +397,18 @@ pub fn probe(language: Tool) -> Result<(), String> {
     let (file, mut command) = match language {
         Tool::Typst => {
             let program = build::find_tool("typst").ok_or("Typst is not installed.")?;
-            let mut command = Command::new(program);
+            let mut command = crate::platform::command(program);
             command.args(["compile", "probe.typ"]);
             ("probe.typ", command)
         }
         Tool::MacTex | Tool::Tectonic => {
             if let Some(pdflatex) = build::find_tool("pdflatex") {
-                let mut command = Command::new(pdflatex);
+                let mut command = crate::platform::command(pdflatex);
                 command.args(["-interaction=nonstopmode", "-halt-on-error", "probe.tex"]);
                 ("probe.tex", command)
             } else {
                 let tectonic = build::find_tool("tectonic").ok_or("LaTeX is not installed.")?;
-                let mut command = Command::new(tectonic);
+                let mut command = crate::platform::command(tectonic);
                 command.args(["--keep-logs", "probe.tex"]);
                 ("probe.tex", command)
             }
@@ -625,13 +626,13 @@ fn unpack_release(tool: Tool, release: &Release, archive: &Path, workspace: &Pat
     if file_digest::<sha2::Sha256>(archive)? != release.sha256 {
         return Err(format!("The download of {name} is not the expected file, so it was not installed."));
     }
-    let listing = marketplace::run_tar(Command::new("tar").arg("-tf").arg(archive))?;
+    let listing = marketplace::run_tar(crate::platform::command("tar").arg("-tf").arg(archive))?;
     if !marketplace::archive_paths_stay_inside(&String::from_utf8_lossy(&listing.stdout)) {
         return Err(format!("The download of {name} leads outside its folder, so it was not installed."));
     }
     let unpacked = workspace.join("unpacked");
     std::fs::create_dir(&unpacked).map_err(|error| format!("Cannot unpack the download: {error}"))?;
-    marketplace::run_tar(Command::new("tar").arg("-xf").arg(archive).arg("--no-same-owner").arg("-C").arg(&unpacked))?;
+    marketplace::run_tar(crate::platform::command("tar").arg("-xf").arg(archive).arg("--no-same-owner").arg("-C").arg(&unpacked))?;
     let program = unpacked.join(release.program);
     if !program.is_file() {
         return Err(format!("The download of {name} has no program."));
@@ -688,7 +689,7 @@ fn install_package(tool: Tool, package: &Package, tools: &Path, received: &Atomi
     set_stage(&format!("macOS asks for your password next, since {name} goes into {place}. Editor never sees it."));
     std::thread::sleep(Duration::from_secs(2));
     let prompt = format!("Editor wants to install {name} into {place}, which needs your Mac password.");
-    let output = Command::new("osascript")
+    let output = crate::platform::command("osascript")
         .args([
             "-e",
             "on run argv",
@@ -722,7 +723,7 @@ pub enum AdminError {
 /// dialog of macOS as the installer packages, which shows `prompt`. Each part
 /// is quoted on its own, so no argument is read by a shell. Blocks.
 pub(crate) fn as_administrator(prompt: &str, program: &Path, args: &[&std::ffi::OsStr]) -> Result<(), AdminError> {
-    let output = Command::new("osascript")
+    let output = crate::platform::command("osascript")
         .args([
             "-e",
             "on run argv",
@@ -766,7 +767,7 @@ fn check_package(package: &Package, file: &Path) -> Result<(), String> {
         }
     }
     if let Some(signer) = package.signer {
-        let output = Command::new("pkgutil").arg("--check-signature").arg(file).output().map_err(|error| format!("Cannot check its signature: {error}"))?;
+        let output = crate::platform::command("pkgutil").arg("--check-signature").arg(file).output().map_err(|error| format!("Cannot check its signature: {error}"))?;
         if !output.status.success() || !signed_by(&String::from_utf8_lossy(&output.stdout), signer) {
             return Err("It is not signed by its author.".to_string());
         }
@@ -833,7 +834,7 @@ fn remove_versions_except(tools: &Path, pinned: &[(&str, &str)]) {
 /// of output, to show what it is doing, and `cancel` stops it.
 pub fn install_with_homebrew(brew: &Path, tool: Tool, line: &Arc<Mutex<String>>, cancel: &AtomicBool) -> Result<(), String> {
     let formula = tool.formula().ok_or_else(|| format!("Homebrew does not install {} here.", tool.name()))?;
-    let mut command = Command::new(brew);
+    let mut command = crate::platform::command(brew);
     command
         .args(["install", formula])
         .env("NONINTERACTIVE", "1")
@@ -1225,7 +1226,7 @@ pub fn install_developer_tools(cancel: &AtomicBool) -> Result<(), String> {
     if developer_tools() {
         return Ok(());
     }
-    let output = Command::new("xcode-select").arg("--install").output().map_err(|error| format!("Cannot ask macOS for its developer tools: {error}"))?;
+    let output = crate::platform::command("xcode-select").arg("--install").output().map_err(|error| format!("Cannot ask macOS for its developer tools: {error}"))?;
     // Already there, only not where the check looks: nothing to wait for.
     if !output.status.success() && String::from_utf8_lossy(&output.stderr).contains("already installed") {
         return Ok(());
@@ -1499,7 +1500,7 @@ mod tests {
         fs::create_dir_all(&source).unwrap();
         fs::write(source.join("typst"), "#!/bin/sh\n").unwrap();
         let archive = directory.join("typst.tar.gz");
-        let status = Command::new("tar").arg("-czf").arg(&archive).arg("-C").arg(directory.join("source")).arg("inner").status().unwrap();
+        let status = std::process::Command::new("tar").arg("-czf").arg(&archive).arg("-C").arg(directory.join("source")).arg("inner").status().unwrap();
         assert!(status.success());
         let bytes = fs::read(&archive).unwrap();
         (format!("file://{}", archive.display()), marketplace::sha256_hex(&bytes), bytes.len() as u64)
@@ -1670,7 +1671,7 @@ mod live {
             let program = install_release(tool, &release, directory.path(), &received, &cancel).unwrap();
             let work = tempfile::tempdir().unwrap();
             std::fs::write(work.path().join(file), text).unwrap();
-            let output = Command::new(&program).args(&args).current_dir(work.path()).stdin(Stdio::null()).output().unwrap();
+            let output = std::process::Command::new(&program).args(&args).current_dir(work.path()).stdin(Stdio::null()).output().unwrap();
             assert!(output.status.success(), "{tool:?}: {}", String::from_utf8_lossy(&output.stderr));
             assert!(work.path().join(file.replace(".typ", ".pdf").replace(".tex", ".pdf")).is_file(), "{tool:?} made no PDF");
             println!("{tool:?}: installed and compiled in {:?}", started.elapsed());
@@ -1690,7 +1691,7 @@ mod live {
         let directory = tempfile::tempdir().unwrap();
         let (received, cancel) = (AtomicU64::new(0), AtomicBool::new(false));
         let program = install_release(Tool::Pandoc, &release, directory.path(), &received, &cancel).unwrap();
-        let output = Command::new(&program).arg("--version").output().unwrap();
+        let output = std::process::Command::new(&program).arg("--version").output().unwrap();
         assert!(String::from_utf8_lossy(&output.stdout).starts_with("pandoc 3.14"));
         build::remove_directory(program.parent().unwrap());
     }

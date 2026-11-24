@@ -749,7 +749,7 @@ impl SetupView {
                         .gap(px(12.))
                         .child(link(("manual-folder", index), "Open the folder in Finder", move |_| {
                             std::fs::create_dir_all(&open).ok();
-                            std::process::Command::new("open").arg(&open).spawn().ok();
+                            crate::platform::command("open").arg(&open).spawn().ok();
                         }))
                         .child(link(("manual-copy", index), "Copy the path", move |cx| cx.write_to_clipboard(ClipboardItem::new_string(copy.display().to_string()))))
                         .into_any_element(),

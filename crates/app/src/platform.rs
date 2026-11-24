@@ -12,6 +12,14 @@ pub fn home() -> Option<PathBuf> {
     home.filter(|home| !home.is_empty()).map(PathBuf::from)
 }
 
+/// A command for `program` that opens no console window on Windows, where
+/// every console program would otherwise flash one up.
+pub fn command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    build::no_window(&mut command);
+    command
+}
+
 /// How the system's file manager is called, for "Show in Finder" and the like.
 pub const FILE_MANAGER: &str = if cfg!(windows) { "Explorer" } else { "Finder" };
 

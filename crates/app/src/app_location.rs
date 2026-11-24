@@ -6,7 +6,7 @@
 
 use std::{
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     sync::OnceLock,
 };
 
@@ -49,7 +49,7 @@ fn mount_points(info: &str) -> Vec<PathBuf> {
 
 /// The mount points of the disk images. Blocks for a moment.
 fn disk_images() -> Vec<PathBuf> {
-    Command::new("hdiutil")
+    crate::platform::command("hdiutil")
         .arg("info")
         .stdin(Stdio::null())
         .output()
@@ -63,7 +63,7 @@ pub fn running() -> Option<&'static (PathBuf, Place)> {
     RUNNING
         .get_or_init(|| {
             let bundle = updater::running_bundle()?;
-            let home = PathBuf::from(std::env::var_os("HOME")?);
+            let home = crate::platform::home()?;
             // Asking hdiutil takes a moment, and only a volume can be a disk image.
             let images = if bundle.starts_with("/Volumes") { disk_images() } else { Vec::new() };
             let place = classify(&bundle, &home, &images)?;
@@ -83,7 +83,7 @@ fn applications() -> Result<PathBuf, String> {
     if updater::writable(&system) {
         return Ok(system);
     }
-    let home = std::env::var_os("HOME").ok_or("Cannot find your home folder.")?;
+    let home = crate::platform::home().ok_or("Cannot find your home folder.")?;
     let own = PathBuf::from(home).join("Applications");
     std::fs::create_dir_all(&own).map_err(|error| format!("Cannot make {}: {error}", own.display()))?;
     Ok(own)
@@ -100,7 +100,7 @@ fn copy_to_applications(bundle: &Path) -> Result<PathBuf, String> {
 
 /// Once this process has ended: ejects `mount`, if any, and starts `bundle`.
 fn relaunch_and_eject(bundle: &Path, mount: Option<&Path>) {
-    let mut command = Command::new("/bin/sh");
+    let mut command = crate::platform::command("/bin/sh");
     command
         .args([
             "-c",

@@ -21,7 +21,7 @@ impl Program {
 
     /// A setting of the user's own git, such as `user.email`, if set.
     pub fn global(&self, key: &str) -> Option<String> {
-        let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+        let home = home()?;
         let output = self.command(&home).args(["config", "--global", "--get", key]).output().ok()?;
         let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
         (output.status.success() && !value.is_empty()).then_some(value)
@@ -32,7 +32,7 @@ impl Program {
         if self.global(key).is_some() {
             return Ok(());
         }
-        let home = std::env::var_os("HOME").map(std::path::PathBuf::from).ok_or("Cannot find the home folder.")?;
+        let home = home().ok_or("Cannot find the home folder.")?;
         let output = self.command(&home).args(["config", "--global", key, value]).output().map_err(|error| format!("Cannot start git: {error}"))?;
         if output.status.success() { Ok(()) } else { Err(short_error(&output)) }
     }
@@ -415,4 +415,10 @@ mod tests {
         repository.status().unwrap();
         assert_eq!(fs::metadata(&index).unwrap().modified().unwrap(), before);
     }
+}
+
+/// The user's home folder, where `git config --global` runs.
+fn home() -> Option<std::path::PathBuf> {
+    let name = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    std::env::var_os(name).filter(|home| !home.is_empty()).map(std::path::PathBuf::from)
 }

@@ -136,7 +136,7 @@ pub fn now() -> u64 {
 }
 
 fn home() -> PathBuf {
-    std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from)
+    crate::platform::home().unwrap_or_else(|| PathBuf::from("/"))
 }
 
 fn folder_name(path: &Path) -> String {

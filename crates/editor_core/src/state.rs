@@ -1341,16 +1341,28 @@ fn plan_newline(buffer: &Buffer, language: Language, selection: &Selection) -> P
             (Some('{'), Some('}')) | (Some('['), Some(']')) | (Some('('), Some(')'))
         );
 
+    let ending = line_ending(buffer, line);
     if closes_directly {
         let inner = format!("{current_indent}{INDENT}");
-        let text = format!("\n{inner}\n{current_indent}");
-        return PlannedEdit::cursor_at(selection.range(), text, 1 + inner.len());
+        let text = format!("{ending}{inner}{ending}{current_indent}");
+        return PlannedEdit::cursor_at(selection.range(), text, ending.len() + inner.len());
     }
     let extra = if opens_block { INDENT } else { "" };
     PlannedEdit::cursor_after(
         selection.range(),
-        format!("\n{current_indent}{extra}"),
+        format!("{ending}{current_indent}{extra}"),
     )
+}
+
+/// The line ending the file uses around `line`, so that a file written on
+/// Windows keeps `\r\n` throughout: the one of this line, or of the one before
+/// for the last line.
+fn line_ending(buffer: &Buffer, line: usize) -> &'static str {
+    let ends_crlf = |line: usize| {
+        let end = buffer.line_start(line + 1);
+        end >= 2 && line + 1 < buffer.line_count() && buffer.slice(end - 2..end) == "\r\n"
+    };
+    if ends_crlf(line) || (line > 0 && line + 1 == buffer.line_count() && ends_crlf(line - 1)) { "\r\n" } else { "\n" }
 }
 
 fn opens_latex_environment(line: &str) -> bool {
@@ -1808,6 +1820,19 @@ mod tests {
         let job = state.start_parse().unwrap();
         state.finish_parse(job.run());
         state
+    }
+
+    #[test]
+    fn enter_keeps_the_line_endings_of_the_file() {
+        let mut state = state_at("a\r\nb\r\nc", &[1]);
+        state.newline();
+        assert_eq!(state.buffer().to_string(), "a\r\n\r\nb\r\nc");
+        let mut state = state_at("a\r\nb", &[4]);
+        state.newline();
+        assert_eq!(state.buffer().to_string(), "a\r\nb\r\n");
+        let mut state = state_at("a\nb", &[1]);
+        state.newline();
+        assert_eq!(state.buffer().to_string(), "a\n\nb");
     }
 
     #[test]
