@@ -63,7 +63,7 @@ impl Report {
         if base.len() + full.len() <= MAX_URL {
             return base + &full;
         }
-        let note = "\n\n**The whole report is on your clipboard. Click here, select this text and press Cmd+V to put it in place.**\n";
+        let note = if cfg!(windows) { "\n\n**The whole report is on your clipboard. Click here, select this text and press Ctrl+V to put it in place.**\n" } else { "\n\n**The whole report is on your clipboard. Click here, select this text and press Cmd+V to put it in place.**\n" };
         let room = MAX_URL - base.len() - encode(note).len();
         // Each byte takes one char encoded, or three: cut at a char boundary.
         let mut used = 0;

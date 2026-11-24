@@ -356,8 +356,8 @@ impl SetupView {
                 .child(svg().path("icons/logo.svg").size(px(38.)).text_color(theme::color(palette.on_accent)))
                 .into_any_element(),
             title("Welcome to Editor"),
-            paragraph("Write LaTeX or Typst on the left and see the PDF on the right, like on Overleaf. Everything runs on your Mac, also without internet."),
-            paragraph("The setup asks what you write and installs exactly what that needs, nothing else. You need nothing on your Mac beforehand."),
+            paragraph(if cfg!(windows) { "Write LaTeX or Typst on the left and see the PDF on the right, like on Overleaf. Everything runs on your PC, also without internet." } else { "Write LaTeX or Typst on the left and see the PDF on the right, like on Overleaf. Everything runs on your Mac, also without internet." }),
+            paragraph(if cfg!(windows) { "The setup asks what you write and installs exactly what that needs, nothing else. You need nothing on your PC beforehand." } else { "The setup asks what you write and installs exactly what that needs, nothing else. You need nothing on your Mac beforehand." }),
             div()
                 .flex()
                 .items_center()
@@ -553,7 +553,7 @@ impl SetupView {
         let muted = theme::color(palette.ui_muted);
         let has_homebrew = self.ready(Tool::Homebrew, cx);
         let ways_open = has_homebrew || self.show_ways;
-        let mut elements = vec![title("Ready to install"), paragraph("Here is what your Mac gets. Nothing happens until you click Install.")];
+        let mut elements = vec![title("Ready to install"), paragraph(if cfg!(windows) { "Here is what your PC gets. Nothing happens until you click Install." } else { "Here is what your Mac gets. Nothing happens until you click Install." })];
         if ways_open {
             elements.push(self.render_ways(cx));
         }
@@ -654,7 +654,7 @@ impl SetupView {
         let failed = tools.iter().any(|tool| self.toolchain.read(cx).errors.contains_key(tool));
         let mut elements = vec![
             title(if busy { "Installing" } else { "Install what you need" }),
-            paragraph("Your text becomes a PDF through a program called a compiler. Overleaf runs it on its servers. Here it runs on your Mac, so it is installed once."),
+            paragraph(if cfg!(windows) { "Your text becomes a PDF through a program called a compiler. Overleaf runs it on its servers. Here it runs on your PC, so it is installed once." } else { "Your text becomes a PDF through a program called a compiler. Overleaf runs it on its servers. Here it runs on your Mac, so it is installed once." }),
             div()
                 .flex()
                 .flex_col()
@@ -747,7 +747,7 @@ impl SetupView {
                     div()
                         .flex()
                         .gap(px(12.))
-                        .child(link(("manual-folder", index), "Open the folder in Finder", move |_| {
+                        .child(link(("manual-folder", index), if cfg!(windows) { "Open the folder in Explorer" } else { "Open the folder in Finder" }, move |_| {
                             std::fs::create_dir_all(&open).ok();
                             crate::platform::command("open").arg(&open).spawn().ok();
                         }))
@@ -809,9 +809,9 @@ impl SetupView {
                 "Almost there"
             }),
             paragraph(if ready && background {
-                "A test document just became a PDF on your Mac. The complete LaTeX keeps downloading in the background and takes over on its own once it is there. Open the welcome document to see how it works."
+                if cfg!(windows) { "A test document just became a PDF on your PC. The complete LaTeX keeps downloading in the background and takes over on its own once it is there. Open the welcome document to see how it works." } else { "A test document just became a PDF on your Mac. The complete LaTeX keeps downloading in the background and takes over on its own once it is there. Open the welcome document to see how it works." }
             } else if ready {
-                "A test document just became a PDF on your Mac. Open the welcome document to see how it works; a short tour shows each part of the editor."
+                if cfg!(windows) { "A test document just became a PDF on your PC. Open the welcome document to see how it works; a short tour shows each part of the editor." } else { "A test document just became a PDF on your Mac. Open the welcome document to see how it works; a short tour shows each part of the editor." }
             } else if testing && chosen.contains(&Tool::Tectonic) && !toolchain::complete_latex() {
                 "A small test document compiles with what was installed, so that your first PDF works. LaTeX fetches the packages it needs this first time, which takes two or three minutes."
             } else if testing {
@@ -936,7 +936,15 @@ impl Render for SetupView {
             .text_color(theme::color(theme::palette().ui_text))
             .text_size(px(theme::UI_FONT_SIZE))
             .when_some(theme::look().ui_font, |root, font| root.font_family(font))
-            .child(div().h(px(40.)).flex_none())
+            .child(
+                crate::window_controls::drag_area(div().id("setup-band"))
+                    .h(px(40.))
+                    .w_full()
+                    .flex_none()
+                    .flex()
+                    .justify_end()
+                    .children(crate::window_controls::buttons(window, 40.)),
+            )
             .child(
                 div()
                     .flex()

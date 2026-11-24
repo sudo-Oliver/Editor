@@ -881,7 +881,7 @@ impl GitPanel {
                     .flex()
                     .gap(px(6.))
                     .child(button("git-commit", "Commit", false, false, cx))
-                    .child(button("git-commit-push", "Commit & Push  ⌘↩", true, true, cx)),
+                    .child(button("git-commit-push", if cfg!(windows) { "Commit & Push  Ctrl+Enter" } else { "Commit & Push  ⌘↩" }, true, true, cx)),
             )
     }
 
@@ -1179,7 +1179,7 @@ impl Render for GitPanel {
                 .children(error)
                 .when(!self.has_remote, |panel| {
                     let button = self.primary_button("git-publish", cx, |this, cx| this.publish(cx));
-                    panel.child(self.render_message("This project is only on your Mac. Keep a private copy on GitHub, also to work on it with others.", Some(("Put it on GitHub", button))))
+                    panel.child(self.render_message(if cfg!(windows) { "This project is only on your PC. Keep a private copy on GitHub, also to work on it with others." } else { "This project is only on your Mac. Keep a private copy on GitHub, also to work on it with others." }, Some(("Put it on GitHub", button))))
                 })
                 .child(self.render_changes(cx))
                 .child(self.render_commit_box(cx))

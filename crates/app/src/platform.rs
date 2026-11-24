@@ -20,12 +20,6 @@ pub fn command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
     command
 }
 
-/// How the system's file manager is called, for "Show in Finder" and the like.
-pub const FILE_MANAGER: &str = if cfg!(windows) { "Explorer" } else { "Finder" };
-
-/// How people call this kind of computer, as in "on this Mac".
-pub const COMPUTER: &str = if cfg!(windows) { "PC" } else { "Mac" };
-
 /// Megabytes free on the disk that holds `path`.
 pub fn free_megabytes(path: &Path) -> Option<u64> {
     imp::free_bytes(path).map(|bytes| bytes / 1_000_000)
