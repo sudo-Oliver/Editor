@@ -1,12 +1,16 @@
 name: Windows preview
 
-# Builds the Windows installer from any branch, by hand, for testing on a PC
-# before a release. The installer is an artifact of the run, not a release.
+# Builds the Windows installer for testing on a PC before a release: by
+# hand, or for a pull request with the label windows-preview. The installer
+# is an artifact of the run, not a release.
 on:
   workflow_dispatch:
+  pull_request:
+    types: [labeled, synchronize]
 
 jobs:
   installer:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'windows-preview')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
