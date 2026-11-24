@@ -1859,6 +1859,9 @@ impl Workspace {
 
     /// Reads the add-on folder and keeps panels only for what is turned on.
     fn reload_addons(&mut self, cx: &mut Context<Self>) {
+        if !addons::ENABLED {
+            return;
+        }
         let Some(directory) = addons::default_directory() else {
             return;
         };
@@ -5628,7 +5631,7 @@ impl Workspace {
                     .gap(px(8.))
                     .child(rail_button("rail-files", "file", LeftPanel::Files, cx))
                     .child(rail_button("rail-git", "git-branch", LeftPanel::Git, cx))
-                    .child(rail_button("rail-addons", "addon", LeftPanel::Addons, cx))
+                    .when(addons::ENABLED, |rail| rail.child(rail_button("rail-addons", "addon", LeftPanel::Addons, cx)))
                     .children(collab_rail)
                     .children(self.addon_panels.iter().enumerate().map(|(index, entry)| {
                         let panel = LeftPanel::Addon(index);
@@ -7918,7 +7921,7 @@ impl Workspace {
         }
         for group in groups {
             elements.push(div().flex_none().pt(px(14.)).pb(px(4.)).font_weight(FontWeight::SEMIBOLD).child(group).into_any_element());
-            for command in COMMANDS.iter().filter(|command| command.group == group) {
+            for command in COMMANDS.iter().filter(|command| command.group == group && command.available()) {
                 let id = command.id;
                 let recording = self.recording_shortcut == Some(id);
                 let keys = self.keymap.keys(command);
@@ -8123,7 +8126,6 @@ impl Workspace {
             .into_any_element(),
             Self::setting_row("Installed tools", "Tectonic, Typst and Pandoc. Remove them under Writing tools.", row(None, size(|usage| usage.tools)))
                 .into_any_element(),
-            Self::setting_row("Add-ons", "Remove them in the Add-ons panel.", row(None, size(|usage| usage.addons))).into_any_element(),
             Self::setting_row("Templates", "Your own templates. Remove them on the Home screen under Templates.", row(None, size(|usage| usage.templates)))
                 .into_any_element(),
             Self::setting_row(
@@ -8151,6 +8153,9 @@ impl Workspace {
             )
             .into_any_element(),
         ];
+        if addons::ENABLED {
+            elements.push(Self::setting_row("Add-ons", "Remove them in the Add-ons panel.", row(None, size(|usage| usage.addons))).into_any_element());
+        }
         if let Some(root) = &self.root {
             let name = root.file_name().map_or_else(|| shown(root), |name| name.to_string_lossy().into_owned());
             elements.push(

@@ -10,6 +10,11 @@ No new features. The one goal before the first release (v0.1.0) is a
 Windows version that works perfectly and matches the Mac app. Work happens
 on the Windows PC from now on; test with [../windows-test.md](../windows-test.md).
 
+The first release ships without add-ons: they are not ready for users yet.
+The `addons` cargo feature of `crates/app` is off by default, which hides the
+Add-ons panel, the "Cite from a DOI" command and starts no installed add-on.
+`cargo run -p app --features addons` brings it all back for development.
+
 ## Rules for the project
 
 - **Lightweight, no bloat.** Keep the features that were asked for, drop the

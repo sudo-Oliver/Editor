@@ -15,6 +15,10 @@ use addon_api::{API_VERSION, AddonMessage, HostMessage, Manifest, OLDEST_API_VER
 use tokio::sync::mpsc;
 
 const MANIFEST: &str = "addon.toml";
+/// Whether this build offers add-ons at all. Without the `addons` feature the
+/// editor shows no add-on panel and starts no installed add-on.
+pub const ENABLED: bool = cfg!(feature = "addons");
+
 /// Marks an add-on as turned on. New ones start turned off.
 pub const ENABLED_MARKER: &str = ".enabled";
 /// How long a program gets to exit by itself after its stdin closes.

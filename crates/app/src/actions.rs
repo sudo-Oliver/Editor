@@ -127,10 +127,15 @@ pub struct Command {
 }
 
 impl Command {
+    /// Whether this build has it: citing from a DOI needs an add-on.
+    pub fn available(&self) -> bool {
+        crate::addons::ENABLED || self.id != "lookup_doi"
+    }
+
     /// Whether it makes sense to run from the palette, outside a special state
     /// such as an open completion list or a presentation.
     pub fn runs_anywhere(&self) -> bool {
-        self.id != "close_menu" && self.id != "command_palette" && self.context.is_none_or(|context| context == "Editor")
+        self.available() && self.id != "close_menu" && self.id != "command_palette" && self.context.is_none_or(|context| context == "Editor")
     }
 
     pub fn action(&self) -> Box<dyn Action> {
@@ -248,7 +253,7 @@ pub const COMMANDS: &[Command] = &[
 pub fn bind_keys(keymap: &Keymap, addon_commands: &[AddonBinding], cx: &mut App) -> Vec<String> {
     let mut problems = Vec::new();
     let mut bindings = Vec::new();
-    for command in COMMANDS {
+    for command in COMMANDS.iter().filter(|command| command.available()) {
         let predicate: Option<std::rc::Rc<KeyBindingContextPredicate>> =
             command.context.map(|context| KeyBindingContextPredicate::parse(context).expect("a valid context").into());
         for keys in keymap.keys(command) {
