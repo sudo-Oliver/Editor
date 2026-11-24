@@ -1,10 +1,7 @@
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{
-        Arc, Mutex as StdMutex,
-        atomic::{AtomicI32, Ordering},
-    },
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -17,6 +14,7 @@ use tokio::{
 
 use crate::{
     blg,
+    process::{self, Group},
     config::Engine,
     explain, fontmap,
     parse::{self, Diagnostic, Severity},
@@ -87,9 +85,11 @@ pub struct BuildManager {
     runtime: Handle,
     serial: Arc<Mutex<()>>,
     cancel: StdMutex<Option<oneshot::Sender<()>>>,
-    /// The process group of the running program, or 0.
-    group: Arc<AtomicI32>,
+    /// The running program and what it started.
+    group: Arc<Running>,
 }
+
+type Running = StdMutex<Option<Arc<Group>>>;
 
 impl Default for BuildManager {
     fn default() -> Self {
@@ -112,7 +112,7 @@ impl BuildManager {
             runtime: handle,
             serial: Arc::new(Mutex::new(())),
             cancel: StdMutex::new(None),
-            group: Arc::new(AtomicI32::new(0)),
+            group: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -153,9 +153,8 @@ impl BuildManager {
     /// build thread with it.
     pub fn shut_down(&self) {
         self.cancel();
-        let group = self.group.swap(0, Ordering::SeqCst);
-        if group > 0 {
-            signal_group(Some(group), libc::SIGKILL);
+        if let Some(group) = self.group.lock().expect("the group lock is not poisoned").take() {
+            group.kill();
         }
     }
 }
@@ -175,7 +174,7 @@ async fn build(
     request: &BuildRequest,
     events: &mpsc::Sender<BuildEvent>,
     cancelled: &mut oneshot::Receiver<()>,
-    group: &AtomicI32,
+    group: &Running,
 ) -> Option<BuildOutcome> {
     let started = Instant::now();
     let started_at = SystemTime::now();
@@ -455,7 +454,7 @@ async fn prepare_format(
     input: &str,
     events: &mpsc::Sender<BuildEvent>,
     cancelled: &mut oneshot::Receiver<()>,
-    group: &AtomicI32,
+    group: &Running,
 ) -> Option<Option<Preamble>> {
     let (Some(preamble), Some(compiler)) = (Preamble::of(main, output_directory), find_tool("pdflatex")) else {
         return Some(None);
@@ -596,7 +595,7 @@ async fn run_process(
     cwd: &Path,
     events: &mpsc::Sender<BuildEvent>,
     cancelled: &mut oneshot::Receiver<()>,
-    running_group: &AtomicI32,
+    running_group: &Running,
 ) -> Option<RunResult> {
     let program = find_tool(invocation.tool)?;
     let mut command = Command::new(program);
@@ -608,8 +607,8 @@ async fn run_process(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .process_group(0)
         .kill_on_drop(true);
+    process::prepare_async(&mut command);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -619,8 +618,9 @@ async fn run_process(
             });
         }
     };
-    let group = child.id().map(|id| id as libc::pid_t);
-    running_group.store(group.unwrap_or(0), Ordering::SeqCst);
+    let group = child.id().and_then(|id| Group::of(id).ok()).map(Arc::new);
+    let store = |group: Option<Arc<Group>>| *running_group.lock().expect("the group lock is not poisoned") = group;
+    store(group.clone());
     let stdout = child.stdout.take().expect("stdout is piped");
     let stderr = child.stderr.take().expect("stderr is piped");
     let out_task = tokio::spawn(forward_lines(stdout, events.clone()));
@@ -630,17 +630,17 @@ async fn run_process(
     let status = tokio::select! {
         status = child.wait() => status,
         _ = &mut *cancelled => {
-            stop_group(group, &mut child).await;
+            stop_group(group.as_deref(), &mut child).await;
             out_abort.abort();
             err_abort.abort();
-            running_group.store(0, Ordering::SeqCst);
+            store(None);
             return None;
         }
         _ = tokio::time::sleep(RUN_TIME_LIMIT) => {
-            stop_group(group, &mut child).await;
+            stop_group(group.as_deref(), &mut child).await;
             out_abort.abort();
             err_abort.abort();
-            running_group.store(0, Ordering::SeqCst);
+            store(None);
             return Some(RunResult {
                 success: false,
                 stderr: format!("{} ran for {} minutes and was stopped.", invocation.tool, RUN_TIME_LIMIT.as_secs() / 60),
@@ -656,33 +656,30 @@ async fn run_process(
     let stderr = match tokio::time::timeout(DRAIN_GRACE, drained).await {
         Ok(stderr) => stderr,
         Err(_) => {
-            signal_group(group, libc::SIGKILL);
+            if let Some(group) = &group {
+                group.kill();
+            }
             out_abort.abort();
             err_abort.abort();
             String::new()
         }
     };
-    running_group.store(0, Ordering::SeqCst);
+    store(None);
     Some(RunResult {
         success: status.is_ok_and(|status| status.success()),
         stderr,
     })
 }
 
-async fn stop_group(group: Option<libc::pid_t>, child: &mut tokio::process::Child) {
-    signal_group(group, libc::SIGTERM);
-    if tokio::time::timeout(KILL_GRACE, child.wait()).await.is_err() {
-        signal_group(group, libc::SIGKILL);
-        child.wait().await.ok();
-    }
-}
-
-fn signal_group(group: Option<libc::pid_t>, signal: libc::c_int) {
+async fn stop_group(group: Option<&Group>, child: &mut tokio::process::Child) {
     if let Some(group) = group {
-        // SAFETY: killpg only reads its two integer arguments.
-        unsafe {
-            libc::killpg(group, signal);
+        group.terminate();
+    }
+    if tokio::time::timeout(KILL_GRACE, child.wait()).await.is_err() {
+        if let Some(group) = group {
+            group.kill();
         }
+        child.kill().await.ok();
     }
 }
 
@@ -737,6 +734,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_program_left_behind_does_not_block_the_build() {
         let invocation = Invocation {
             tool: "sh",
@@ -745,13 +743,13 @@ mod tests {
         };
         let (events, mut receiver) = mpsc::channel(EVENT_CAPACITY);
         let (_cancel, mut cancelled) = oneshot::channel();
-        let group = AtomicI32::new(0);
+        let group = StdMutex::new(None);
         let directory = tempfile::tempdir().unwrap();
         let started = std::time::Instant::now();
         let result = block_on(run_process(&invocation, directory.path(), &events, &mut cancelled, &group)).unwrap();
         assert!(result.success);
         assert!(started.elapsed() < Duration::from_secs(20));
-        assert_eq!(group.load(Ordering::SeqCst), 0);
+        assert!(group.lock().unwrap().is_none());
         receiver.close();
     }
 
