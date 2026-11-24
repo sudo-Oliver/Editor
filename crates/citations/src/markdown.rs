@@ -38,7 +38,8 @@ pub fn scan(text: &str) -> Scan {
                 }
                 pos += 1;
             }
-            b'\\' => pos += 2,
+            // The escaped char whole, which may take several bytes.
+            b'\\' => pos += 1 + text[pos + 1..].chars().next().map_or(0, char::len_utf8),
             b'`' => {
                 let ticks = bytes[pos..].iter().take_while(|byte| **byte == b'`').count();
                 let fence = &text[pos..pos + ticks];
@@ -177,6 +178,11 @@ mod tests {
         let scan = scan(text);
         assert_eq!(names(&scan.cites), ["smith2020", "jones", "doe"]);
         assert_eq!(&text[scan.cites[0].range.clone()], "smith2020");
+    }
+
+    #[test]
+    fn escapes_before_umlauts_are_read_whole() {
+        assert_eq!(names(&scan("\\ü \\é [@a] \\").cites), ["a"]);
     }
 
     #[test]

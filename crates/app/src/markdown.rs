@@ -57,12 +57,19 @@ pub struct Document {
     /// Where each block starts in `source`.
     starts: Vec<usize>,
     source: String,
+    /// A Markdown file, whose YAML front matter is read for its title. In what
+    /// add-ons write, a `---` at the start is a rule.
+    file: bool,
 }
 
 impl Document {
+    pub fn file() -> Self {
+        Self { file: true, ..Self::default() }
+    }
+
     #[cfg(test)]
     pub fn new(text: &str) -> Self {
-        let mut document = Self::default();
+        let mut document = Self::file();
         document.update(text);
         document
     }
@@ -97,7 +104,7 @@ impl Document {
         let mut resume = None;
         let mut fresh = Vec::new();
         let starts = &self.starts;
-        parse_from(text, offset, &mut fresh, |start| {
+        parse_from(text, offset, self.file, &mut fresh, |start| {
             if start < new_end {
                 return false;
             }
@@ -141,15 +148,24 @@ fn after_blank_line(text: &str, start: usize) -> bool {
 
 pub fn parse(text: &str) -> Vec<(usize, Block)> {
     let mut blocks = Vec::new();
-    parse_from(text, 0, &mut blocks, |_| false);
+    parse_from(text, 0, false, &mut blocks, |_| false);
+    blocks
+}
+
+/// Like `parse`, for a Markdown file with its front matter.
+#[cfg(test)]
+fn parse_file(text: &str) -> Vec<(usize, Block)> {
+    let mut blocks = Vec::new();
+    parse_from(text, 0, true, &mut blocks, |_| false);
     blocks
 }
 
 /// Reads blocks from the line start `from` on, until `stop` says yes to where
 /// the next one starts. Offsets are in all of `text`.
-fn parse_from(text: &str, from: usize, blocks: &mut Vec<(usize, Block)>, mut stop: impl FnMut(usize) -> bool) {
+fn parse_from(text: &str, from: usize, file: bool, blocks: &mut Vec<(usize, Block)>, mut stop: impl FnMut(usize) -> bool) {
     let mut lines = Lines { text, at: from };
-    if from == 0
+    if file
+        && from == 0
         && let Some(title) = front_matter(&mut lines)
     {
         blocks.push((0, Block::Heading { level: 1, text: inline(&title) }));
@@ -163,26 +179,9 @@ fn parse_from(text: &str, from: usize, blocks: &mut Vec<(usize, Block)>, mut sto
         if stop(start) {
             return;
         }
-        let block = if let Some(rest) = trimmed.strip_prefix("$$") {
-            lines.next();
-            let mut math = Vec::new();
-            match rest.trim_end().strip_suffix("$$") {
-                Some(one_line) => math.push(one_line),
-                None => {
-                    math.push(rest);
-                    while let Some((_, line)) = lines.next() {
-                        if let Some(last) = line.trim_end().strip_suffix("$$") {
-                            math.push(last);
-                            break;
-                        }
-                        math.push(line);
-                    }
-                }
-            }
-            {
-                let source = math.join("\n").trim().to_string();
-                Block::Math { text: math_text(&source).into(), source: source.into() }
-            }
+        let block = if let Some((source, end)) = math_block(&lines) {
+            lines.at = end;
+            Block::Math { text: math_text(&source).into(), source: source.into() }
         } else if let Some(fence) = fence(trimmed) {
             lines.next();
             let language = trimmed[fence.len()..].trim().to_string();
@@ -245,7 +244,7 @@ fn parse_from(text: &str, from: usize, blocks: &mut Vec<(usize, Block)>, mut sto
                     || fence(trimmed).is_some()
                     || heading(trimmed).is_some()
                     || trimmed.starts_with('>')
-                    || trimmed.starts_with("$$")
+                    || math_block(&lines).is_some()
                     || (!paragraph.is_empty() && list_item(trimmed).is_some());
                 if starts_other {
                     break;
@@ -261,6 +260,40 @@ fn parse_from(text: &str, from: usize, blocks: &mut Vec<(usize, Block)>, mut sto
         };
         blocks.push((start, block));
     }
+}
+
+/// `$$…$$` from the line `lines` is at, as Pandoc reads display math: closed
+/// on that line or a later one, before a blank line, with nothing after the
+/// closing dollars. Returns the formula and where the lines go on, or nothing,
+/// so that dollars typed and not yet closed stay text.
+fn math_block(lines: &Lines) -> Option<(String, usize)> {
+    let mut ahead = Lines { text: lines.text, at: lines.at };
+    let (_, first) = ahead.next()?;
+    let rest = first.trim_start().strip_prefix("$$")?;
+    if let Some(inner) = rest.trim_end().strip_suffix("$$") {
+        return (!inner.contains("$$")).then(|| (inner.trim().to_string(), ahead.at));
+    }
+    if rest.contains("$$") {
+        return None;
+    }
+    let mut math = vec![rest];
+    while let Some((_, line)) = ahead.next() {
+        if line.trim().is_empty() {
+            return None;
+        }
+        if let Some(last) = line.trim_end().strip_suffix("$$") {
+            if last.contains("$$") {
+                return None;
+            }
+            math.push(last);
+            return Some((math.join("\n").trim().to_string(), ahead.at));
+        }
+        if line.contains("$$") {
+            return None;
+        }
+        math.push(line);
+    }
+    None
 }
 
 /// Skips a YAML front matter at the very start and returns its title.
@@ -539,7 +572,9 @@ mod tests {
     #[test]
     fn tables_math_images_and_front_matter() {
         let text = "---\ntitle: \"Notes\"\nbibliography: refs.bib\n---\n| a | b \\| c |\n|:--|--:|\n| 1 | 2 |\n\n$$\nx^2\n$$\n\n![A frog](<img/a frog.png>)\n\nCosts 5 $ and $x_1$ is math.\n";
-        let parsed = blocks(text);
+        let parsed: Vec<Block> = parse_file(text).into_iter().map(|(_, block)| block).collect();
+        // What an add-on writes has no front matter: the dashes are a rule.
+        assert_eq!(blocks(text)[0], Block::Rule);
         assert!(matches!(&parsed[0], Block::Heading { level: 1, text } if text.text == "Notes"));
         let Block::Table { align, header, rows } = &parsed[1] else { panic!("{:?}", parsed[1]) };
         assert_eq!(align, &[Align::Left, Align::Right]);
@@ -551,6 +586,10 @@ mod tests {
         let math: Vec<_> = paragraph.marks.iter().filter(|(_, marks)| marks.math).map(|(range, _)| &paragraph.text[range.clone()]).collect();
         assert_eq!(math, ["x₁"]);
         assert_eq!(blocks("$$x$$\n"), [Block::Math { source: "x".into(), text: "x".into() }]);
+        // Open dollars, or text after the closing ones, stay text.
+        assert!(matches!(&blocks("$$a$$ is the area\n")[..], [Block::Paragraph(_)]));
+        assert!(matches!(&blocks("$$\nx\n\n# Next\n")[..], [Block::Paragraph(_), Block::Heading { .. }]));
+        assert!(matches!(&blocks("$$\nx^2\n$$\n")[..], [Block::Math { .. }]));
     }
 
     /// Editing anywhere must end where reading the whole text at once does.
@@ -570,7 +609,7 @@ mod tests {
                 // What it says changed is all that changed.
                 assert_eq!(document.blocks[..replaced.start], before[..replaced.start]);
                 assert_eq!(document.blocks[replaced.start + count..], before[replaced.end..]);
-                assert_eq!(document.starts, parse(&edited).into_iter().map(|(start, _)| start).collect::<Vec<_>>());
+                assert_eq!(document.starts, parse_file(&edited).into_iter().map(|(start, _)| start).collect::<Vec<_>>());
                 document.update(text);
                 assert_eq!(document.blocks, Document::new(text).blocks, "{insert:?} taken back at {at}");
             }

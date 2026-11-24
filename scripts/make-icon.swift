@@ -51,13 +51,13 @@ context.setFillColor(CGColor(gray: 0, alpha: 1))
 context.fillPath()
 context.restoreGState()
 
-// The artwork fills the shape, a little enlarged so that the key carries it.
+// The artwork fills the shape, a little enlarged so that the pencil carries it.
 context.saveGState()
 context.addPath(outline)
 context.clip()
 context.setFillColor(CGColor(gray: 0, alpha: 1))
 context.fill(shape)
-let zoom = 1.18
+let zoom = 1.1
 let drawn = side * zoom
 context.draw(source, in: CGRect(x: shape.midX - drawn / 2, y: shape.midY - drawn / 2, width: drawn, height: drawn))
 context.restoreGState()

@@ -611,9 +611,13 @@ impl Actor {
     fn command(&mut self, command: Command) -> bool {
         match command {
             Command::Update(update) => {
+                // Every later update builds on this one, so leaving it out would
+                // silently stop all edits from here on: the session ends instead.
                 if update.len() > MAX_UPDATE {
-                    self.emit(Event::Warning("This change is too large to share live. Others get it once it is smaller, or as a file.".to_string()));
-                } else if self.replica.apply(&update).is_ok() {
+                    self.emit(Event::Ended("This change is too large to share live, so the session ended. Your files keep it; share again without it.".to_string()));
+                    return false;
+                }
+                if self.replica.apply(&update).is_ok() {
                     self.replica.forget_events();
                     self.broadcast(None, || Frame::Update(update.clone()));
                 }
@@ -692,6 +696,8 @@ impl Actor {
                     if update.len() > MAX_UPDATE {
                         let name = peer.guest.as_ref().map_or_else(|| "the host".to_string(), |guest| guest.name.clone());
                         self.emit(Event::Warning(format!("The project is too large to send to {name}. Leave out large files and share again.")));
+                        // The guest would wait for it forever: tell them, and let go.
+                        peer.sender.send(Frame::Denied).ok();
                     } else {
                         peer.sender.send(Frame::Update(update)).ok();
                     }
@@ -745,6 +751,11 @@ impl Actor {
                 return false;
             }
             Frame::Left(peer) => self.emit(Event::PeerLeft(peer)),
+            // After the welcome, a refusal means the project cannot come over.
+            Frame::Denied if !self.is_host() => {
+                self.emit(Event::Ended("The project is too large to share live. Ask the host to leave out large files.".to_string()));
+                return false;
+            }
             Frame::Hello(_) | Frame::Welcome(..) | Frame::Denied => {}
         }
         true

@@ -120,6 +120,11 @@ fn details_section(details: &Details) -> String {
 
 /// The macOS version and the processor, such as `macOS 15.1 (arm64)`.
 fn system() -> String {
+    static SYSTEM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SYSTEM.get_or_init(read_system).clone()
+}
+
+fn read_system() -> String {
     let version = Command::new("sw_vers").arg("-productVersion").output().ok().map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string()).filter(|version| !version.is_empty());
     let name = if cfg!(target_os = "macos") { "macOS" } else { std::env::consts::OS };
     match version {
@@ -169,6 +174,11 @@ pub fn record_crashes() {
     };
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // A worker thread that panics leaves the app running, so it is no crash to report.
+        if std::thread::current().name() != Some("main") {
+            previous(info);
+            return;
+        }
         let backtrace = std::backtrace::Backtrace::force_capture();
         let text = format!("Editor {}\n{info}\n\n{backtrace}", env!("CARGO_PKG_VERSION"));
         if let Some(directory) = path.parent() {

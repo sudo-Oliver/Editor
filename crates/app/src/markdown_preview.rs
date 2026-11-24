@@ -61,7 +61,7 @@ impl EventEmitter<MarkdownPreviewEvent> for MarkdownPreview {}
 impl MarkdownPreview {
     pub fn new(_cx: &mut Context<Self>) -> Self {
         Self {
-            document: Document::default(),
+            document: Document::file(),
             shown: None,
             base: None,
             list: ListState::new(0, ListAlignment::Top, px(600.)),
@@ -82,7 +82,7 @@ impl MarkdownPreview {
         self.shown = Some((view, version));
         self.base = path.and_then(Path::parent).map(Path::to_path_buf);
         if other {
-            self.document = Document::default();
+            self.document = Document::file();
         }
         let (replaced, count) = self.document.update(text);
         let fresh = if other { 0..self.document.blocks.len() } else { replaced.start..replaced.start + count };
@@ -131,7 +131,8 @@ impl MarkdownPreview {
                     (engine, typeset)
                 })
                 .await;
-            let no_latex = engine.is_none();
+            // Each formula alone would take as long again: they all keep their text.
+            let no_latex = engine.is_none() || matches!(&typeset, Some(Err(error)) if error == math_render::TOO_LONG);
             let pages = match typeset {
                 Some(Ok((pdf, failed))) => {
                     this.update(cx, |this, _| {

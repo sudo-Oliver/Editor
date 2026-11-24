@@ -17,11 +17,13 @@ pub(super) const KEPT_MESSAGES: usize = 12;
 impl Workspace {
     /// Opens the dialog, with `crash` from the last run attached if there is one.
     pub(super) fn open_report(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Read once here: the dialog draws on every key, and this looks at the disk.
+        self.report_snapshot = Some(self.report_details(cx));
         self.open_dialog(Dialog::ReportProblem, window, cx);
         window.focus(&self.report_field.read(cx).focus_handle(cx), cx);
     }
 
-    /// What the app knows that helps to find the cause. No document text.
+    /// What the app knows that helps to find the cause.
     fn report_details(&self, cx: &Context<Self>) -> Details {
         let shown = |found: Found| match found {
             Found::Installed => "installed by the editor".to_string(),
@@ -53,7 +55,8 @@ impl Workspace {
                 (false, false, PreviewState::Empty) => "failed, no PDF",
                 (false, false, _) => "failed",
             };
-            format!("{} with {} errors, {}", engine.label(), self.error_count(), outcome)
+            let errors = self.error_count();
+            format!("{} with {errors} error{}, {}", engine.label(), if errors == 1 { "" } else { "s" }, outcome)
         });
         let build_errors = self
             .problems
@@ -79,7 +82,7 @@ impl Workspace {
 
     fn report(&self, cx: &Context<Self>) -> Report {
         let description = self.report_field.read(cx).state.buffer().to_string();
-        let details = self.report_with_details.then(|| self.report_details(cx));
+        let details = self.report_with_details.then(|| self.report_snapshot.clone().unwrap_or_else(|| self.report_details(cx)));
         Report::new(&description, details.as_ref())
     }
 
@@ -139,7 +142,7 @@ impl Workspace {
                     this.report_with_details = !this.report_with_details;
                     cx.notify();
                 }))
-                .child(div().flex_1().min_w_0().child("Add technical details: version, writing tools and the last compile. No text of your documents, no user name."))
+                .child(div().flex_1().min_w_0().child("Add technical details: version, writing tools and the last compile, whose log can quote a few lines of your document. No user name. Show what is sent to check it."))
                 .into_any_element(),
         );
         if self.report_with_details {
