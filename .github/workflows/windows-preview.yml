@@ -1,0 +1,33 @@
+name: Windows preview
+
+# Builds the Windows installer from any branch, by hand, for testing on a PC
+# before a release. The installer is an artifact of the run, not a release.
+on:
+  workflow_dispatch:
+
+jobs:
+  installer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch PDFium
+        shell: bash
+        run: scripts/fetch-pdfium.sh
+      - name: Build
+        run: cargo build --release -p app
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+      - name: Build the installer
+        shell: bash
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)-preview"
+          mkdir -p target/windows
+          cp target/release/editor.exe target/windows/
+          cp vendor/pdfium/bin/pdfium.dll target/windows/
+          "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" "/DVersion=$version" "/DSource=$(cygpath -w "$PWD/target/windows")" packaging/windows/editor.iss
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Editor-windows-setup
+          path: target/Editor-*-windows-x64-setup.exe

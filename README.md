@@ -5,8 +5,10 @@ The editor, the compilers and the PDF preview all run on your machine.
 
 ## Install
 
-Download `Editor-<version>.dmg` from the [releases](https://github.com/sudo-Oliver/Editor/releases), open it and drag Editor into Applications.
+**Mac:** download `Editor-<version>.dmg` from the [releases](https://github.com/sudo-Oliver/Editor/releases), open it and drag Editor into Applications.
 It runs on Apple silicon and Intel Macs with macOS 11 or later.
+
+**Windows:** download `Editor-<version>-windows-x64-setup.exe` from the same page and open it. It installs for you alone, without an administrator, adds Editor to the Start menu and lets `.tex`, `.typ`, `.bib` and `.md` files open in it. It runs on 64-bit Windows 10 and 11. The setup inside the app then installs LaTeX or Typst: with winget, which comes with Windows, or into the app's folder, and MiKTeX as the complete LaTeX.
 With Homebrew, `brew install --cask sudo-oliver/tap/editor` does the same and adds the `editor` command.
 
 Files open from Finder (Open With, or drag them onto the Dock icon), and from the terminal like VS Code's `code`:
@@ -54,6 +56,16 @@ If you are at home in Terminal, this line does the same in one step:
 ```sh
 xattr -dr com.apple.quarantine /Applications/Editor.app
 ```
+
+### On Windows
+
+Editor is not signed with a paid certificate yet, so Windows SmartScreen warns the first time you open the installer. That is expected.
+
+1. Open `Editor-<version>-windows-x64-setup.exe` from your Downloads.
+2. Windows says "Windows protected your PC". Click **More info**.
+3. Click **Run anyway**. The installer starts; it needs no administrator password.
+
+The first time you start a live session, Windows asks whether Editor may use the network. Allow it, so that others can reach you.
 
 If Editor starts from the dmg or from Downloads, a bar offers to move it to Applications. It copies itself there, starts again and ejects the dmg; from Applications it can update itself.
 
