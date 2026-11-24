@@ -47,3 +47,7 @@ collab = ["dep:collab"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "sync", "time"] }
+
+# Builds on Windows only: the icon and the version in the program file.
+[build-dependencies]
+winresource = { version = "0.1", default-features = false }

@@ -38,7 +38,8 @@ pub struct Release {
     pub version: String,
     /// The release page, with what changed.
     pub page: String,
-    dmg_url: String,
+    /// The dmg on the Mac, the installer on Windows.
+    asset_url: String,
     bytes: u64,
     sha256: String,
 }
@@ -66,6 +67,9 @@ struct ApiAsset {
     digest: Option<String>,
 }
 
+/// What a release offers this system: the dmg, or the Windows installer.
+const ASSET_SUFFIX: &str = if cfg!(windows) { "-windows-x64-setup.exe" } else { ".dmg" };
+
 /// The release in GitHub's answer, if it has a dmg with a checksum. A dmg
 /// without one is never installed, since nothing could tell it was intact.
 fn parse_release(json: &str) -> Result<Option<Release>, String> {
@@ -73,7 +77,7 @@ fn parse_release(json: &str) -> Result<Option<Release>, String> {
     if release.draft || release.prerelease {
         return Ok(None);
     }
-    let Some(dmg) = release.assets.iter().find(|asset| asset.name.ends_with(".dmg")) else {
+    let Some(dmg) = release.assets.iter().find(|asset| asset.name.ends_with(ASSET_SUFFIX)) else {
         return Ok(None);
     };
     let Some(sha256) = dmg.digest.as_deref().and_then(|digest| digest.strip_prefix("sha256:")) else {
@@ -82,7 +86,7 @@ fn parse_release(json: &str) -> Result<Option<Release>, String> {
     Ok(Some(Release {
         version: release.tag_name.trim_start_matches('v').to_string(),
         page: release.html_url,
-        dmg_url: dmg.browser_download_url.clone(),
+        asset_url: dmg.browser_download_url.clone(),
         bytes: dmg.size,
         sha256: sha256.to_ascii_lowercase(),
     }))
@@ -118,9 +122,15 @@ pub fn check() -> Result<Option<Release>, String> {
     Ok(release.filter(|release| newer(&release.version, env!("CARGO_PKG_VERSION"))))
 }
 
-/// The Editor.app this program runs from, if it runs from one.
+/// The Editor.app this program runs from, if it runs from one. On Windows the
+/// folder the installer put it in, so that a build from elsewhere never updates.
 pub fn running_bundle() -> Option<PathBuf> {
     let program = std::env::current_exe().ok()?.canonicalize().map(crate::platform::plain_path).ok()?;
+    if cfg!(windows) {
+        let installed = PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("Programs\\Editor");
+        let folder = program.parent()?;
+        return folder.to_string_lossy().eq_ignore_ascii_case(&installed.to_string_lossy()).then(|| folder.to_path_buf());
+    }
     program.ancestors().find(|path| path.extension().is_some_and(|extension| extension == "app")).map(Path::to_path_buf)
 }
 
@@ -306,6 +316,24 @@ fn upgrade_with_homebrew(brew: &Path, bundle: &Path, version: &str, cancel: &Ato
     Err("Homebrew does not have the new version yet. Try again in an hour.".to_string())
 }
 
+/// On Windows: once this process has ended, runs the downloaded installer
+/// without questions, which replaces the program, and starts the new one.
+fn run_installer_after_exit(setup: &Path, folder: &Path) {
+    let quote = |path: &Path| path.display().to_string().replace('\'', "''");
+    let script = format!(
+        "Wait-Process -Id {} -ErrorAction SilentlyContinue; Start-Process -Wait -FilePath '{}' -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART'; Remove-Item -Force '{}'; Start-Process -FilePath '{}'",
+        std::process::id(),
+        quote(setup),
+        quote(setup),
+        quote(&folder.join("editor.exe")),
+    );
+    let mut command = crate::platform::command("powershell");
+    command.args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &script]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    // A group of its own, so that it outlives this app.
+    build::prepare_group(&mut command);
+    command.spawn().ok();
+}
+
 /// Starts the app at `bundle` once this process has ended.
 pub(crate) fn relaunch(bundle: &Path) {
     let mut command = crate::platform::command("/bin/sh");
@@ -384,6 +412,8 @@ impl Updater {
         let brew = cask_homebrew();
         let job = Job { received: Arc::default(), cancel: Arc::default(), homebrew: brew.is_some() };
         let (received, cancel) = (job.received.clone(), job.cancel.clone());
+        let installer: Arc<std::sync::Mutex<Option<PathBuf>>> = Arc::default();
+        let ready_installer = installer.clone();
         self.state = State::Installing(release.clone(), job);
         cx.notify();
         let install = cx.background_spawn({
@@ -392,13 +422,20 @@ impl Updater {
                 if let Some(brew) = brew {
                     return upgrade_with_homebrew(&brew, &bundle, &release.version, &cancel);
                 }
+                let installer = ready_installer;
                 let folder = tempfile::Builder::new().prefix("editor-update-").tempdir().map_err(|error| format!("Cannot prepare the download: {error}"))?;
-                let dmg = folder.path().join("Editor.dmg");
-                toolchain::download(&release.dmg_url, &dmg, false, DOWNLOAD_SECONDS, &received, &cancel)?;
-                if toolchain::file_digest::<sha2::Sha256>(&dmg)? != release.sha256 {
+                let download = folder.path().join(if cfg!(windows) { "Editor-setup.exe" } else { "Editor.dmg" });
+                toolchain::download(&release.asset_url, &download, false, DOWNLOAD_SECONDS, &received, &cancel)?;
+                if toolchain::file_digest::<sha2::Sha256>(&download)? != release.sha256 {
                     return Err("The download is not the expected file, so it was not installed.".to_string());
                 }
-                install_from_dmg(&dmg, &bundle, &release.version)
+                if cfg!(windows) {
+                    // The installer runs once the app has quit, so it must outlive this folder.
+                    folder.keep();
+                    *installer.lock().unwrap_or_else(|error| error.into_inner()) = Some(download);
+                    return Ok(());
+                }
+                install_from_dmg(&download, &bundle, &release.version)
             }
         });
         cx.spawn(async move |this, cx| {
@@ -423,7 +460,10 @@ impl Updater {
             this.update(cx, |this, cx| {
                 match result {
                     Ok(()) => {
-                        relaunch(&bundle);
+                        match installer.lock().unwrap_or_else(|error| error.into_inner()).take() {
+                            Some(setup) => run_installer_after_exit(&setup, &bundle),
+                            None => relaunch(&bundle),
+                        }
                         // Quitting saves every open file first.
                         cx.quit();
                     }
@@ -558,7 +598,7 @@ mod tests {
             {"name":"Editor-0.2.0.dmg","browser_download_url":"https://x/Editor-0.2.0.dmg","size":34000000,"digest":"sha256:ABCD"}]}"#;
         let release = parse_release(json).unwrap().unwrap();
         assert_eq!(release.version, "0.2.0");
-        assert_eq!(release.dmg_url, "https://x/Editor-0.2.0.dmg");
+        assert_eq!(release.asset_url, "https://x/Editor-0.2.0.dmg");
         assert_eq!(release.sha256, "abcd");
         let unchecked = json.replace(",\"digest\":\"sha256:ABCD\"", "");
         assert_eq!(parse_release(&unchecked).unwrap(), None);

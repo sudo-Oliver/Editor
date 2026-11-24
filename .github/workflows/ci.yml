@@ -16,3 +16,15 @@ jobs:
         run: scripts/fetch-pdfium.sh
       - name: Test
         run: cargo test --workspace
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch PDFium
+        shell: bash
+        run: scripts/fetch-pdfium.sh
+      - name: Test
+        run: cargo test --workspace
