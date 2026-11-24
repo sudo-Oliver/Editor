@@ -431,7 +431,7 @@ impl Updater {
                 }
                 if cfg!(windows) {
                     // The installer runs once the app has quit, so it must outlive this folder.
-                    folder.keep();
+                    let _kept = folder.keep();
                     *installer.lock().unwrap_or_else(|error| error.into_inner()) = Some(download);
                     return Ok(());
                 }

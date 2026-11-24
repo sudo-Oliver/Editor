@@ -84,7 +84,7 @@ fn applications() -> Result<PathBuf, String> {
         return Ok(system);
     }
     let home = crate::platform::home().ok_or("Cannot find your home folder.")?;
-    let own = PathBuf::from(home).join("Applications");
+    let own = home.join("Applications");
     std::fs::create_dir_all(&own).map_err(|error| format!("Cannot make {}: {error}", own.display()))?;
     Ok(own)
 }
