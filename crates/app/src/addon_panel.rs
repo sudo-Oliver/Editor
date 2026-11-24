@@ -12,8 +12,8 @@ use addon_api::{
     Tone,
 };
 use gpui::{
-    Anchor, AnyElement, App, ClipboardEntry, ClipboardItem, Context, ExternalPaths, ImageFormat, ElementId, Entity, EventEmitter, FocusHandle, Focusable, FontStyle, FontWeight, HighlightStyle,
-    InteractiveText, KeyDownEvent, MouseButton, ObjectFit, Pixels, Render, ScrollHandle, SharedString, Size, StyledText, Task, Window, anchored,
+    Anchor, AnyElement, App, ClipboardEntry, ClipboardItem, Context, ExternalPaths, ImageFormat, ElementId, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
+    KeyDownEvent, MouseButton, ObjectFit, Pixels, Render, ScrollHandle, SharedString, Size, Task, Window, anchored,
     deferred, div, img, point, prelude::*, px, size,
 };
 
@@ -21,7 +21,8 @@ use crate::{
     actions::{CloseMenu, Newline, Paste, Recompile},
     addons::{self, AddonProcess, Installed, ProcessEvent},
     editor_view::{DragContent, DragItem, DragPreview, EditorView},
-    markdown::{self, Block, Inline},
+    markdown::{self, Block},
+    markdown_view::{self, Look},
     theme,
 };
 
@@ -1038,128 +1039,38 @@ impl AddonPanel {
 
     fn render_block(&self, index: usize, block: &Block, cx: &mut Context<Self>) -> AnyElement {
         let palette = theme::palette();
-        match block {
-            Block::Heading { level, text } => {
-                let size = match level {
-                    1 => 18.,
-                    2 => 16.,
-                    _ => 14.,
-                };
-                div().flex_none().pt(px(4.)).text_size(px(size)).font_weight(FontWeight::SEMIBOLD).child(rich_text(index, text)).into_any_element()
-            }
-            Block::Paragraph(text) => div().flex_none().child(rich_text(index, text)).into_any_element(),
-            Block::Quote(text) => div()
-                .flex_none()
-                .pl(px(8.))
-                .border_l_2()
-                .border_color(theme::color(palette.divider))
-                .text_color(theme::color(palette.ui_muted))
-                .child(rich_text(index, text))
-                .into_any_element(),
-            Block::Rule => div().flex_none().h(px(1.)).bg(theme::color(palette.divider)).into_any_element(),
-            Block::List { ordered, start, items } => div()
-                .flex()
-                .flex_col()
-                .flex_none()
-                .gap(px(2.))
-                .children(items.iter().enumerate().map(|(position, item)| {
-                    let marker = if *ordered { format!("{}.", *start as usize + position) } else { "\u{2022}".to_string() };
-                    div()
-                        .flex()
-                        .gap(px(6.))
-                        .child(div().flex_none().min_w(px(14.)).text_color(theme::color(palette.ui_muted)).child(marker))
-                        .child(div().flex_1().min_w_0().child(rich_text(index * 1000 + position, item)))
-                }))
-                .into_any_element(),
-            Block::Code { language, text } => {
-                let (copy, insert) = (text.clone(), text.clone());
-                let action = |id: String, label: &'static str| {
-                    div()
-                        .id(SharedString::from(id))
-                        .px(px(6.))
-                        .rounded(px(4.))
-                        .cursor_pointer()
-                        .text_color(theme::color(palette.ui_muted))
-                        .hover(|style| style.bg(theme::color(palette.divider)).text_color(theme::color(palette.ui_text)))
-                        .child(label)
-                };
+        markdown_view::block(index, block, Look::PANEL, None, |language, text| {
+            let (copy, insert) = (text.clone(), text.clone());
+            let action = |id: String, label: &'static str| {
+                div()
+                    .id(SharedString::from(id))
+                    .px(px(6.))
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .text_color(theme::color(palette.ui_muted))
+                    .hover(|style| style.bg(theme::color(palette.divider)).text_color(theme::color(palette.ui_text)))
+                    .child(label)
+            };
+            Some(
                 div()
                     .flex()
-                    .flex_col()
-                    .flex_none()
-                    .rounded(px(6.))
-                    .bg(theme::color(palette.panel))
-                    .border_1()
-                    .border_color(theme::color(palette.divider))
+                    .items_center()
+                    .justify_between()
+                    .px(px(6.))
+                    .py(px(2.))
+                    .text_size(px(11.))
+                    .child(div().text_color(theme::color(palette.ui_muted)).child(language.clone()))
                     .child(
                         div()
                             .flex()
-                            .items_center()
-                            .justify_between()
-                            .px(px(6.))
-                            .py(px(2.))
-                            .text_size(px(11.))
-                            .child(div().text_color(theme::color(palette.ui_muted)).child(language.clone()))
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap(px(2.))
-                                    .child(action(format!("code-copy-{index}-{}", text.len()), "Copy").on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy.to_string()))))
-                                    .child(action(format!("code-insert-{index}-{}", text.len()), "Insert at cursor").on_click(cx.listener(move |_, _, _, cx| cx.emit(AddonPanelEvent::InsertText(insert.to_string()))))),
-                            ),
+                            .gap(px(2.))
+                            .child(action(format!("code-copy-{index}-{}", text.len()), "Copy").on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy.to_string()))))
+                            .child(action(format!("code-insert-{index}-{}", text.len()), "Insert at cursor").on_click(cx.listener(move |_, _, _, cx| cx.emit(AddonPanelEvent::InsertText(insert.to_string()))))),
                     )
-                    .child(
-                        div()
-                            .px(px(8.))
-                            .pb(px(6.))
-                            .font_family(theme::code_font())
-                            .text_size(px(theme::code_font_size()))
-                            .child(text.clone()),
-                    )
-                    .into_any_element()
-            }
-        }
-    }
-}
-
-/// Text with its marks, and links that open in the browser.
-fn rich_text(index: usize, text: &Inline) -> AnyElement {
-    let palette = theme::palette();
-    let highlights: Vec<_> = text
-        .marks
-        .iter()
-        .map(|(range, marks)| {
-            let mut style = HighlightStyle::default();
-            if marks.bold {
-                style.font_weight = Some(FontWeight::SEMIBOLD);
-            }
-            if marks.italic {
-                style.font_style = Some(FontStyle::Italic);
-            }
-            if marks.code {
-                style.background_color = Some(theme::color(palette.panel));
-            }
-            if marks.link.is_some() {
-                style.color = Some(theme::color(palette.accent));
-            }
-            (range.clone(), style)
+                    .into_any_element(),
+            )
         })
-        .collect();
-    let styled = StyledText::new(text.text.clone()).with_highlights(highlights);
-    let links: Vec<_> = text.marks.iter().filter_map(|(range, marks)| Some((range.clone(), marks.link.clone()?))).collect();
-    if links.is_empty() {
-        return styled.into_any_element();
     }
-    let ranges = links.iter().map(|(range, _)| range.clone()).collect();
-    InteractiveText::new(("markdown-text", index), styled)
-        .on_click(ranges, move |clicked, _, cx| {
-            if let Some((_, url)) = links.get(clicked) {
-                if url.starts_with("https://") || url.starts_with("http://") {
-                    cx.open_url(url);
-                }
-            }
-        })
-        .into_any_element()
 }
 
 fn relative_width(fraction: f32) -> gpui::DefiniteLength {
