@@ -118,11 +118,36 @@ fn details_section(details: &Details) -> String {
 }
 
 /// The user's name stays private: `/Users/ada/Thesis` becomes `~/Thesis`.
+/// On Windows also as TeX writes it, `C:/Users/Ada` or `c:/users/ada`.
 fn redact_home(text: &str) -> String {
-    match crate::platform::home().and_then(|home| home.to_str().map(str::to_string)).filter(|home| home.len() > 1) {
-        Some(home) => text.replace(&home, "~"),
-        None => text.to_string(),
+    let Some(home) = crate::platform::home().and_then(|home| home.to_str().map(str::to_string)).filter(|home| home.len() > 1) else {
+        return text.to_string();
+    };
+    if !cfg!(windows) {
+        return text.replace(&home, "~");
     }
+    let mut out = text.to_string();
+    for form in [home.clone(), home.replace('\\', "/")] {
+        out = replace_ignoring_case(&out, &form, "~");
+    }
+    out
+}
+
+/// Replaces `needle` in `text`, with ASCII letters of any case, as Windows
+/// names paths.
+fn replace_ignoring_case(text: &str, needle: &str, with: &str) -> String {
+    let (lower, needle) = (text.to_ascii_lowercase(), needle.to_ascii_lowercase());
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for (at, _) in lower.match_indices(&needle) {
+        if at >= last {
+            out.push_str(&text[last..at]);
+            out.push_str(with);
+            last = at + needle.len();
+        }
+    }
+    out.push_str(&text[last..]);
+    out
 }
 
 fn shorten(text: &str, chars: usize) -> String {
@@ -206,6 +231,11 @@ mod tests {
         assert!(!report.body.contains(&home));
         assert!(report.body.contains("line 99") && !report.body.contains("line 59\n"));
         assert!(Report::new("", None).title == "Problem report");
+    }
+
+    #[test]
+    fn paths_match_in_any_case() {
+        assert_eq!(replace_ignoring_case("C:/Users/Ada/x and c:/users/ada/y", "c:/users/ada", "~"), "~/x and ~/y");
     }
 
     #[test]

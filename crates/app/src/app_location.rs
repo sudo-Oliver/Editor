@@ -114,7 +114,7 @@ fn relaunch_and_eject(bundle: &Path, mount: Option<&Path>) {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     // A group of its own, so that it outlives this app.
-    build::prepare_group(&mut command);
+    build::detach(&mut command);
     command.spawn().ok();
 }
 

@@ -59,6 +59,11 @@ fn button(id: &'static str, glyph: &'static str, area: WindowControlArea, close:
 /// Windows 11 has Segoe Fluent Icons, Windows 10 the older MDL2 set with the
 /// same glyphs.
 fn icon_font() -> &'static str {
+    static FONT: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    FONT.get_or_init(read_icon_font)
+}
+
+fn read_icon_font() -> &'static str {
     let build = crate::platform::system().split('.').nth(2).and_then(|build| build.split(|ch: char| !ch.is_ascii_digit()).next()?.parse::<u32>().ok());
     if build.is_some_and(|build| build >= 22000) { "Segoe Fluent Icons" } else { "Segoe MDL2 Assets" }
 }

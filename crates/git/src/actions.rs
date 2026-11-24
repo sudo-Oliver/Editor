@@ -177,6 +177,13 @@ fn check_branch_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+
+/// The user's home folder, where `git config --global` runs.
+fn home() -> Option<std::path::PathBuf> {
+    let name = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    std::env::var_os(name).filter(|home| !home.is_empty()).map(std::path::PathBuf::from)
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -415,10 +422,4 @@ mod tests {
         repository.status().unwrap();
         assert_eq!(fs::metadata(&index).unwrap().modified().unwrap(), before);
     }
-}
-
-/// The user's home folder, where `git config --global` runs.
-fn home() -> Option<std::path::PathBuf> {
-    let name = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-    std::env::var_os(name).filter(|home| !home.is_empty()).map(std::path::PathBuf::from)
 }

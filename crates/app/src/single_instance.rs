@@ -26,27 +26,76 @@ mod imp {
         io::{BufRead, BufReader, Write},
         os::windows::{ffi::OsStrExt, io::FromRawHandle},
         path::{Path, PathBuf},
+        time::{Duration, Instant},
     };
 
     use windows_sys::Win32::{
-        Foundation::{GetLastError, INVALID_HANDLE_VALUE},
-        Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX},
-        System::Pipes::{ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT},
+        Foundation::{ERROR_ALREADY_EXISTS, GetLastError, INVALID_HANDLE_VALUE},
+        Storage::FileSystem::PIPE_ACCESS_DUPLEX,
+        System::{
+            Pipes::{ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW},
+            Threading::CreateMutexW,
+        },
         UI::WindowsAndMessaging::AllowSetForegroundWindow,
     };
 
     const ERROR_PIPE_CONNECTED: u32 = 535;
+    const ERROR_PIPE_BUSY: i32 = 231;
+    /// How long a second start waits for the first editor's pipe, as when
+    /// several files open at once or the first one is still starting.
+    const PATIENCE: Duration = Duration::from_secs(5);
 
-    /// One pipe per user, so that two people on one PC each have their own editor.
+    /// One editor per user, so that two people on one PC each have their own.
+    fn user() -> String {
+        std::env::var("USERNAME").unwrap_or_default().chars().filter(char::is_ascii_alphanumeric).collect()
+    }
+
     fn pipe_name() -> String {
-        let user: String = std::env::var("USERNAME").unwrap_or_default().chars().filter(char::is_ascii_alphanumeric).collect();
-        format!(r"\\.\pipe\editor-{user}")
+        format!(r"\\.\pipe\editor-{}", user())
+    }
+
+    fn wide(text: &str) -> Vec<u16> {
+        OsStr::new(text).encode_wide().chain(Some(0)).collect()
+    }
+
+    /// Whether this is the user's first editor. The mutex says so reliably,
+    /// also while the first one has not opened its pipe yet, and it stays as
+    /// long as this process runs.
+    fn first() -> bool {
+        let name = wide(&format!(r"Local\editor-{}", user()));
+        // SAFETY: a nul-terminated name; the handle is kept on purpose.
+        unsafe {
+            let mutex = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+            mutex.is_null() || GetLastError() != ERROR_ALREADY_EXISTS
+        }
+    }
+
+    /// The first editor's pipe, waited for while it is busy or not there yet.
+    fn connect() -> Option<File> {
+        let name = pipe_name();
+        let started = Instant::now();
+        loop {
+            match std::fs::OpenOptions::new().read(true).write(true).open(&name) {
+                Ok(pipe) => return Some(pipe),
+                Err(_) if started.elapsed() >= PATIENCE => return None,
+                Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                    // SAFETY: a nul-terminated name.
+                    unsafe {
+                        WaitNamedPipeW(wide(&name).as_ptr(), 500);
+                    }
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(100)),
+            }
+        }
     }
 
     /// Hands `path` to an editor that already runs. True when one took it, and
     /// this start should end.
     pub fn forward(path: Option<&Path>) -> bool {
-        let Ok(pipe) = std::fs::OpenOptions::new().read(true).write(true).open(pipe_name()) else {
+        if first() {
+            return false;
+        }
+        let Some(pipe) = connect() else {
             return false;
         };
         let mut writer = &pipe;
@@ -72,22 +121,18 @@ mod imp {
 
     /// Takes in what later starts hand over, as files to open, on a thread of its own.
     pub fn serve(opened: tokio::sync::mpsc::UnboundedSender<PathBuf>) {
-        let name: Vec<u16> = OsStr::new(&pipe_name()).encode_wide().chain(Some(0)).collect();
+        let name = wide(&pipe_name());
         std::thread::Builder::new()
             .name("single-instance".into())
             .spawn(move || {
-                let mut first = true;
                 loop {
-                    let flags = PIPE_ACCESS_DUPLEX | if first { FILE_FLAG_FIRST_PIPE_INSTANCE } else { 0 };
                     // SAFETY: a nul-terminated name; the handle goes into a File, which closes it.
                     let handle = unsafe {
-                        CreateNamedPipeW(name.as_ptr(), flags, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, PIPE_UNLIMITED_INSTANCES, 4096, 4096, 0, std::ptr::null())
+                        CreateNamedPipeW(name.as_ptr(), PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, PIPE_UNLIMITED_INSTANCES, 4096, 4096, 0, std::ptr::null())
                     };
                     if handle == INVALID_HANDLE_VALUE {
-                        // Another editor serves already, as when two started at once.
                         return;
                     }
-                    first = false;
                     // SAFETY: as above.
                     let connected = unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) } != 0 || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED;
                     // SAFETY: the handle is a valid pipe that nothing else owns.
@@ -95,24 +140,30 @@ mod imp {
                     if !connected {
                         continue;
                     }
-                    let mut writer = &pipe;
-                    let mut reader = BufReader::new(&pipe);
-                    let mut line = String::new();
-                    while reader.read_line(&mut line).is_ok_and(|read| read > 0) {
-                        let request = line.trim_end_matches(['\r', '\n']);
-                        if request == "pid" {
-                            writer.write_all(format!("{}\n", std::process::id()).as_bytes()).ok();
-                        } else if let Some(path) = request.strip_prefix("open ") {
-                            // An empty path only brings the window to the front.
-                            if opened.send(PathBuf::from(path)).is_err() {
-                                return;
-                            }
-                            break;
-                        }
-                        line.clear();
-                    }
+                    // Each start is answered on a thread of its own, so that the
+                    // next pipe is there at once for the start after it.
+                    let opened = opened.clone();
+                    std::thread::spawn(move || answer(pipe, opened));
                 }
             })
             .ok();
+    }
+
+    /// Tells a later start who runs, then takes its file.
+    fn answer(pipe: File, opened: tokio::sync::mpsc::UnboundedSender<PathBuf>) {
+        let mut writer = &pipe;
+        let mut reader = BufReader::new(&pipe);
+        let mut line = String::new();
+        while reader.read_line(&mut line).is_ok_and(|read| read > 0) {
+            let request = line.trim_end_matches(['\r', '\n']);
+            if request == "pid" {
+                writer.write_all(format!("{}\n", std::process::id()).as_bytes()).ok();
+            } else if let Some(path) = request.strip_prefix("open ") {
+                // An empty path only brings the window to the front.
+                opened.send(PathBuf::from(path)).ok();
+                return;
+            }
+            line.clear();
+        }
     }
 }

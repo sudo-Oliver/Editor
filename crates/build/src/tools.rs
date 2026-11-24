@@ -48,12 +48,14 @@ fn extra_directories() -> Vec<PathBuf> {
 fn extra_directories() -> Vec<PathBuf> {
     let variable = |name: &str| std::env::var_os(name).map(PathBuf::from);
     let mut directories = Vec::new();
-    // TeX Live puts each year in its own folder; the newest wins.
-    if let Ok(entries) = std::fs::read_dir("C:\\texlive") {
-        let mut years: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).filter(|path| path.join("bin\\windows").is_dir()).collect();
+    // TeX Live puts each year in its own folder; the newest wins. Read once,
+    // since every search for a program comes here.
+    static TEXLIVE: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
+    directories.extend(TEXLIVE.get_or_init(|| {
+        let mut years: Vec<PathBuf> = std::fs::read_dir("C:\\texlive").into_iter().flatten().flatten().map(|entry| entry.path()).filter(|path| path.join("bin\\windows").is_dir()).collect();
         years.sort();
-        directories.extend(years.into_iter().rev().map(|year| year.join("bin\\windows")));
-    }
+        years.into_iter().rev().map(|year| year.join("bin\\windows")).collect()
+    }).iter().cloned());
     for base in [variable("ProgramFiles"), variable("LOCALAPPDATA").map(|local| local.join("Programs"))].into_iter().flatten() {
         directories.push(base.join("MiKTeX\\miktex\\bin\\x64"));
         directories.push(base.join("Git\\cmd"));
@@ -159,12 +161,14 @@ mod tests {
     fn added_directories_come_last_and_can_go() {
         let directory = tempfile::tempdir().unwrap();
         let name = "editor-test-tool-that-exists-nowhere-else";
-        std::fs::write(directory.path().join(name), "").unwrap();
+        // A program on Windows has an extension, which find_tool adds.
+        let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+        std::fs::write(directory.path().join(&file), "").unwrap();
         assert_eq!(find_tool(name), None);
 
         add_directory(directory.path().to_path_buf());
         add_directory(directory.path().to_path_buf());
-        assert_eq!(find_tool(name), Some(directory.path().join(name)));
+        assert_eq!(find_tool(name), Some(directory.path().join(&file)));
         let path = search_path();
         assert_eq!(path.last(), Some(&directory.path().to_path_buf()));
         assert_eq!(path.iter().filter(|entry| *entry == directory.path()).count(), 1);

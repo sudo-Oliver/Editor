@@ -289,13 +289,12 @@ fn upgrade_with_homebrew(brew: &Path, bundle: &Path, version: &str, cancel: &Ato
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    build::prepare_group(&mut command);
-    let mut child = command.spawn().map_err(|error| format!("Cannot start Homebrew: {error}"))?;
-    let group = build::Group::of(child.id()).ok();
+    let (mut child, group) = build::spawn_group(&mut command).map_err(|error| format!("Cannot start Homebrew: {error}"))?;
     loop {
         if cancel.load(Ordering::Relaxed) {
-            if let Some(group) = &group {
-                group.terminate();
+            match &group {
+                Some(group) => group.terminate(),
+                None => drop(child.kill()),
             }
             child.wait().ok();
             return Err("Stopped.".to_string());
@@ -330,7 +329,7 @@ fn run_installer_after_exit(setup: &Path, folder: &Path) {
     let mut command = crate::platform::command("powershell");
     command.args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &script]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     // A group of its own, so that it outlives this app.
-    build::prepare_group(&mut command);
+    build::detach(&mut command);
     command.spawn().ok();
 }
 
@@ -345,7 +344,7 @@ pub(crate) fn relaunch(bundle: &Path) {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     // A group of its own, so that it outlives this app.
-    build::prepare_group(&mut command);
+    build::detach(&mut command);
     command.spawn().ok();
 }
 

@@ -356,7 +356,7 @@ pub fn register_installed() {
         for &tool in Tool::ALL {
             if let Some(release) = tool.release() {
                 let folder = folder(&tools, tool, &release);
-                if folder.join(tool.program()).is_file() {
+                if folder.join(executable(tool.program())).is_file() {
                     build::add_directory(folder);
                 }
             }
@@ -943,9 +943,7 @@ pub fn install_with_homebrew(brew: &Path, tool: Tool, line: &Arc<Mutex<String>>,
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // Its own group, so that stopping also stops the downloads it started.
-    build::prepare_group(&mut command);
-    let mut child = command.spawn().map_err(|error| format!("Cannot start {}: {error}", Tool::Homebrew.name()))?;
-    let group = build::Group::of(child.id()).ok();
+    let (mut child, group) = build::spawn_group(&mut command).map_err(|error| format!("Cannot start {}: {error}", Tool::Homebrew.name()))?;
     let readers: Vec<_> = [child.stdout.take().map(|out| Box::new(out) as Box<dyn std::io::Read + Send>), child.stderr.take().map(|err| Box::new(err) as Box<dyn std::io::Read + Send>)]
         .into_iter()
         .flatten()
@@ -964,8 +962,10 @@ pub fn install_with_homebrew(brew: &Path, tool: Tool, line: &Arc<Mutex<String>>,
         .collect();
     let status = loop {
         if cancel.load(Ordering::Relaxed) {
-            if let Some(group) = &group {
-                group.terminate();
+            // winget, started through its alias, may not be in a job: then the program itself.
+            match &group {
+                Some(group) => group.terminate(),
+                None => drop(child.kill()),
             }
             let _ = child.wait();
             return Err("Stopped.".to_string());
@@ -1204,7 +1204,15 @@ impl Toolchain {
             Method::Package if tool == Tool::Homebrew => install_homebrew(&tools, job),
             Method::Package => {
                 let package = tool.package().ok_or("Nothing to install.")?;
-                install_package(tool, &package, &tools, &job.received, &job.line, &job.cancel)
+                let installed = install_package(tool, &package, &tools, &job.received, &job.line, &job.cancel);
+                // A newer MiKTeX may have replaced the pinned installer on CTAN:
+                // winget always knows the current one.
+                match (installed, homebrew()) {
+                    (Err(error), Some(winget)) if cfg!(windows) && tool == Tool::MacTex && error != "Stopped." => {
+                        install_with_homebrew(&winget, tool, &job.line, &job.cancel).map_err(|_| error)
+                    }
+                    (installed, _) => installed,
+                }
             }
             Method::Homebrew => unreachable!(),
         });
