@@ -5,7 +5,6 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    process::Command,
     sync::{Arc, Mutex, OnceLock, PoisonError},
     time::Duration,
 };
@@ -67,7 +66,7 @@ fn system_bib(name: &str) -> Option<PathBuf> {
     if let Some(path) = found.lock().unwrap_or_else(PoisonError::into_inner).get(name) {
         return path.clone();
     }
-    let path = build::find_tool("kpsewhich").and_then(|kpsewhich| Command::new(kpsewhich).arg(name).output().ok()).and_then(|output| {
+    let path = build::find_tool("kpsewhich").and_then(|kpsewhich| crate::platform::command(kpsewhich).arg(name).output().ok()).and_then(|output| {
         let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
         (output.status.success() && !path.is_empty()).then(|| PathBuf::from(path))
     });

@@ -33,7 +33,7 @@ pub const STEPS: &[Step] = &[
     Step {
         anchor: TourAnchor::Editor,
         title: "Write here",
-        body: "This is your document. Type, or paste the LaTeX that Claude wrote for you. ⌘S saves and updates the PDF.",
+        body: if cfg!(windows) { "This is your document. Type, or paste the LaTeX that Claude wrote for you. Ctrl+S saves and updates the PDF." } else { "This is your document. Type, or paste the LaTeX that Claude wrote for you. ⌘S saves and updates the PDF." },
     },
     Step {
         anchor: TourAnchor::Toolbar,
@@ -48,7 +48,7 @@ pub const STEPS: &[Step] = &[
     Step {
         anchor: TourAnchor::Pdf,
         title: "Your PDF",
-        body: "The result, next to what you write. ⌘-click a spot to jump to its line in the text.",
+        body: if cfg!(windows) { "The result, next to what you write. Ctrl-click a spot to jump to its line in the text." } else { "The result, next to what you write. ⌘-click a spot to jump to its line in the text." },
     },
     Step {
         anchor: TourAnchor::Logs,

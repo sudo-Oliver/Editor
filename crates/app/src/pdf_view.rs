@@ -921,7 +921,8 @@ pub(crate) fn library_directory() -> PathBuf {
     let name = pdfium_file_name();
     let binary_directory = std::env::current_exe().ok().and_then(|binary| binary.parent().map(Path::to_path_buf));
     let candidates = binary_directory.iter().flat_map(|directory| [directory.clone(), directory.join("../Frameworks")]);
-    let vendor = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vendor/pdfium/lib");
+    // The Windows build of PDFium keeps its library in `bin`.
+    let vendor = Path::new(env!("CARGO_MANIFEST_DIR")).join(if cfg!(windows) { "../../vendor/pdfium/bin" } else { "../../vendor/pdfium/lib" });
     let found = candidates.chain(cfg!(debug_assertions).then_some(vendor.clone())).find(|directory| directory.join(name).is_file());
     found.unwrap_or(vendor)
 }
@@ -931,7 +932,12 @@ fn pdfium_file_name() -> &'static str {
     "libpdfium.dylib"
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+fn pdfium_file_name() -> &'static str {
+    "pdfium.dll"
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 fn pdfium_file_name() -> &'static str {
     "libpdfium.so"
 }

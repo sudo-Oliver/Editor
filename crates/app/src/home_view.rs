@@ -25,10 +25,7 @@ use crate::{
     toolchain::{self, Tool, Toolchain},
 };
 
-#[cfg(target_os = "macos")]
-const TRAFFIC_LIGHT_SPACE: f32 = 78.0;
-#[cfg(not(target_os = "macos"))]
-const TRAFFIC_LIGHT_SPACE: f32 = 8.0;
+const TRAFFIC_LIGHT_SPACE: f32 = crate::window_controls::LEFT_SPACE;
 const BAND_HEIGHT: f32 = 40.0;
 const CONTENT_WIDTH: f32 = 1100.0;
 const SIDEBAR_WIDTH: f32 = 220.0;
@@ -72,6 +69,7 @@ pub enum HomeEvent {
     InstallCommand,
     RunSetup,
     ShowShortcuts,
+    ReportProblem,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1035,19 +1033,21 @@ impl HomeView {
 
     // Rendering
 
-    fn render_band(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+    fn render_band(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::window_controls::drag_area(div().id("hub-band"))
             .flex()
             .flex_none()
             .items_center()
             .justify_end()
+            .gap(px(8.))
             .h(px(BAND_HEIGHT))
             .pl(px(TRAFFIC_LIGHT_SPACE))
-            .pr(px(10.))
+            .pr(px(if cfg!(windows) { 0. } else { 10. }))
             .bg(theme::color(theme::palette().panel))
             .when(self.has_project, |element| {
                 element.child(button("hub-back", "Back to project", false, cx, |_, _, cx| cx.emit(HomeEvent::Close)))
             })
+            .children(crate::window_controls::buttons(window, BAND_HEIGHT))
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1245,7 +1245,7 @@ impl HomeView {
                     .child(self.action_card("hub-start-typst", "file-typ", "Blank Typst", "A short document in the newer Typst language.", cx, move |this, window, cx| {
                         this.open_new_project(typst, window, cx)
                     }))
-                    .child(self.action_card("hub-start-open", "folder", "Open folder", "A project you already have on this Mac.", cx, |this, _, cx| {
+                    .child(self.action_card("hub-start-open", "folder", "Open folder", if cfg!(windows) { "A project you already have on this PC." } else { "A project you already have on this Mac." }, cx, |this, _, cx| {
                         this.prompt_open_folder(cx)
                     })),
             )
@@ -1795,7 +1795,7 @@ impl HomeView {
                         this.card_menu = None;
                         this.open_save_template(template_path.clone(), window, cx);
                     }))
-                    .child(menu_item(("hub-card-reveal", index), "Show in Finder", cx, move |this, _, cx| {
+                    .child(menu_item(("hub-card-reveal", index), if cfg!(windows) { "Show in Explorer" } else { "Show in Finder" }, cx, move |this, _, cx| {
                         this.card_menu = None;
                         cx.reveal_path(&reveal_path);
                     }))
@@ -1997,7 +1997,7 @@ impl HomeView {
             self.render_header("Writing tools", vec![setup]).into_any_element(),
             div()
                 .text_color(theme::color(palette.ui_muted))
-                .child("A compiler turns what you write into a PDF. You need the one for the language you write in. Overleaf has these on its servers, here they live on your Mac.")
+                .child(if cfg!(windows) { "A compiler turns what you write into a PDF. You need the one for the language you write in. Overleaf has these on its servers, here they live on your PC." } else { "A compiler turns what you write into a PDF. You need the one for the language you write in. Overleaf has these on its servers, here they live on your Mac." })
                 .into_any_element(),
             div().children(toolchain::installer_choice(&self.toolchain, cx)).into_any_element(),
             div()
@@ -2009,7 +2009,7 @@ impl HomeView {
                 .bg(theme::color(palette.panel))
                 .border_1()
                 .border_color(theme::color(palette.divider))
-                .children(toolchain::tool_rows(&self.toolchain, &Tool::ALL, true, cx))
+                .children(toolchain::tool_rows(&self.toolchain, Tool::ALL, true, cx))
                 .into_any_element(),
             div().text_size(px(11.)).text_color(theme::color(palette.ui_muted)).child(toolchain::promise(&self.toolchain, cx)).into_any_element(),
         ]
@@ -2030,6 +2030,9 @@ impl HomeView {
                 }))
                 .child(self.action_card("hub-help-command", "folder", "Terminal command", "Type editor . in Terminal to open a folder here.", cx, |_, _, cx| {
                     cx.emit(HomeEvent::InstallCommand)
+                }))
+                .child(self.action_card("hub-help-report", "log", "Report a problem", "Tell what went wrong. The editor adds the details.", cx, |_, _, cx| {
+                    cx.emit(HomeEvent::ReportProblem)
                 }))
                 .into_any_element(),
         ]
@@ -2186,7 +2189,7 @@ impl Render for HomeView {
                     cx.notify();
                 }
             }))
-            .child(self.render_band(cx))
+            .child(self.render_band(window, cx))
             .child(
                 div()
                     .flex()

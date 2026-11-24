@@ -1,6 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
@@ -47,10 +47,12 @@ use crate::{
     outline::{self, LINE as OUTLINE_LINE, OutlineItem, PILL as OUTLINE_PILL, SPINE as OUTLINE_SPINE},
     image_view::{ImageView, ImageViewEvent, include_snippet, is_image, relative_path},
     keymap::{self, Keymap},
+    markdown_preview::{MarkdownPreview, MarkdownPreviewEvent},
     pdf_view::{PdfView, PdfViewEvent, ZOOM_STEP},
     nvim_themes, package_commands,
     picker::{self, FontSlot, Picker, PickerItem, PickerKind},
     package_check::{self, PackageHint},
+    problem_report,
     problems::{self, Problem},
     recovery,
     settings::{self, Settings},
@@ -67,12 +69,15 @@ use crate::{
     theme,
     toolchain::{self, Tool, Toolchain, ToolchainEvent},
     updater::{self, Updater},
+    window_controls,
     app_location::{self, Mover, MoverEvent},
 };
 
 #[cfg(feature = "collab")]
 #[path = "collab_session.rs"]
 mod collab_session;
+#[path = "problem_dialog.rs"]
+mod problem_dialog;
 #[path = "git_sync.rs"]
 mod git_sync;
 #[path = "addon_host.rs"]
@@ -110,6 +115,8 @@ const TREE_INSET: f32 = 12.0;
 const TREE_INDENT: f32 = 20.0;
 const TREE_ICON: f32 = 16.0;
 const FOLLOW_DEBOUNCE: Duration = Duration::from_millis(150);
+/// Long enough to read a burst of keys once, short enough to feel live.
+const MARKDOWN_DEBOUNCE: Duration = Duration::from_millis(30);
 /// Oldest output is dropped beyond this size.
 const MAX_LOG_BYTES: usize = 2 << 20;
 const PACKAGE_CHECK_FILE_LIMIT: u64 = 4 << 20;
@@ -127,10 +134,7 @@ const CITATION_DETAIL_WIDTH: f32 = 300.0;
 /// A pause in typing before the project is searched for the query.
 const PICKER_SEARCH_DELAY: Duration = Duration::from_millis(120);
 
-#[cfg(target_os = "macos")]
-const TRAFFIC_LIGHT_SPACE: f32 = 78.0;
-#[cfg(not(target_os = "macos"))]
-const TRAFFIC_LIGHT_SPACE: f32 = 8.0;
+const TRAFFIC_LIGHT_SPACE: f32 = window_controls::LEFT_SPACE;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Divider {
@@ -223,6 +227,7 @@ enum Dialog {
     JoinSession,
     GitSignIn,
     CommitDiff,
+    ReportProblem,
 }
 
 /// How the PDF on screen relates to the last build.
@@ -525,7 +530,21 @@ pub struct Workspace {
     /// Held by the backdrop of an open menu, so that keys do not reach the editor.
     menu_focus: FocusHandle,
     status: Option<SharedString>,
+    /// The last status messages, for a problem report.
+    recent_messages: VecDeque<String>,
+    report_field: Entity<EditorView>,
+    report_with_details: bool,
+    report_preview: bool,
+    report_error: Option<SharedString>,
+    /// The details as the dialog opened, so that drawing it reads nothing.
+    report_snapshot: Option<problem_report::Details>,
+    /// What the app wrote when it quit unexpectedly last time, until reported.
+    crash_report: Option<String>,
     pdf: Entity<PdfView>,
+    /// The preview of a Markdown file, which needs no build.
+    markdown: Entity<MarkdownPreview>,
+    /// Reads the edited Markdown again once typing pauses a moment.
+    markdown_task: Option<Task<()>>,
     build: BuildManager,
     config: Config,
     building: bool,
@@ -615,6 +634,7 @@ pub struct Workspace {
     debounce_task: Option<Task<()>>,
     synctex_task: Option<Task<()>>,
     _pdf_subscription: Subscription,
+    _markdown_subscription: Subscription,
     _watcher: Option<RecommendedWatcher>,
     _watch_task: Option<Task<()>>,
     refresh_task: Option<Task<()>>,
@@ -627,6 +647,21 @@ pub struct Workspace {
 impl Workspace {
     pub fn new(root: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let pdf = cx.new(PdfView::new);
+        let markdown = cx.new(MarkdownPreview::new);
+        // A crash of the last run is offered for a report once the window shows.
+        cx.defer_in(window, |this, window, cx| {
+            if this.crash_report.is_some() {
+                this.open_report(window, cx);
+            }
+        });
+        let markdown_subscription = cx.subscribe_in(&markdown, window, |this, _, event, window, cx| match event {
+            MarkdownPreviewEvent::Clicked(offset) => {
+                if let Some(view) = this.active_view() {
+                    let offset = *offset;
+                    view.update(cx, |view, cx| view.select_range(offset..offset, window, cx));
+                }
+            }
+        });
         let pdf_subscription = cx.subscribe_in(&pdf, window, |this, _, event, window, cx| match event {
             PdfViewEvent::BackwardSearch { page, x, y } => this.backward_search(*page, *x, *y, window, cx),
             PdfViewEvent::Failed(message) => this.set_status(message.clone(), cx),
@@ -695,6 +730,7 @@ impl Workspace {
             HomeEvent::InstallCommand => this.install_shell_command(cx),
             HomeEvent::RunSetup => this.run_setup(window, cx),
             HomeEvent::ShowShortcuts => this.open_dialog(Dialog::Shortcuts, window, cx),
+            HomeEvent::ReportProblem => this.open_report(window, cx),
         });
         let workspace_handle = cx.entity().downgrade();
         let git_panel = cx.new(|cx| GitPanel::new(workspace_handle, cx));
@@ -814,7 +850,20 @@ impl Workspace {
             table_hover: (1, 1),
             menu_focus: cx.focus_handle(),
             status: None,
+            recent_messages: VecDeque::new(),
+            report_field: cx.new(|cx| {
+                let mut view = EditorView::new("", None, cx);
+                view.set_plain();
+                view
+            }),
+            report_with_details: true,
+            report_preview: false,
+            report_error: None,
+            report_snapshot: None,
+            crash_report: problem_report::take_crash(),
             pdf,
+            markdown,
+            markdown_task: None,
             build: BuildManager::new(),
             config: Config::default(),
             building: false,
@@ -882,6 +931,7 @@ impl Workspace {
             debounce_task: None,
             synctex_task: None,
             _pdf_subscription: pdf_subscription,
+            _markdown_subscription: markdown_subscription,
             _watcher: None,
             _watch_task: None,
             refresh_task: None,
@@ -934,7 +984,7 @@ impl Workspace {
     /// Opens a folder as the project, or a file in its project. Finder, the
     /// `editor` command and the command line all come here.
     pub fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        let path = match path.canonicalize() {
+        let path = match path.canonicalize().map(crate::platform::plain_path) {
             Ok(path) => path,
             Err(_) => return self.set_status(format!("Cannot find {}.", path.display()), cx),
         };
@@ -945,7 +995,7 @@ impl Workspace {
         let (root, file) = if path.is_dir() {
             (path, None)
         } else {
-            let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from);
+            let home = crate::platform::home().unwrap_or_else(|| PathBuf::from("/"));
             (projects::project_root_for(&path, self.root.as_deref(), &home), Some(path))
         };
         if self.root.as_deref() != Some(root.as_path()) {
@@ -1093,7 +1143,14 @@ impl Workspace {
             });
         if let Some(path) = first {
             self.open_file(path, window, cx);
-            self.recompile(cx);
+            // A build of the project before must not finish into this one.
+            if self.markdown_view(cx).is_some() {
+                self.build.cancel();
+                self.build_task = None;
+                self.building = false;
+            } else {
+                self.recompile(cx);
+            }
         }
         self.forget_saved_recovery(cx);
         let swept = root.clone();
@@ -1277,6 +1334,7 @@ impl Workspace {
                 this.collab_edited(&view, cx);
                 this.schedule_recovery(cx);
                 this.schedule_type_build(cx);
+                this.schedule_markdown(cx);
                 if view.read(cx).path.as_deref().is_some_and(citation_index::matters) {
                     this.schedule_citations(cx);
                 }
@@ -1288,6 +1346,7 @@ impl Workspace {
                 this.addon_document_changed(&view, cx);
                 this.schedule_recovery(cx);
                 this.schedule_type_build(cx);
+                this.schedule_markdown(cx);
                 cx.notify();
             }
             EditorEvent::CursorClicked { line } => {
@@ -1439,6 +1498,7 @@ impl Workspace {
         let view = self.documents[index].view.clone();
         window.focus(&view.read(cx).focus_handle(cx), cx);
         self.compile_if_document_changed(cx);
+        self.refresh_markdown(cx);
         self.schedule_citations(cx);
         // The others see the switch, also before the cursor moves.
         #[cfg(feature = "collab")]
@@ -1762,7 +1822,12 @@ impl Workspace {
     }
 
     fn set_status(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
-        self.status = Some(message.into());
+        let message = message.into();
+        if self.recent_messages.len() == problem_dialog::KEPT_MESSAGES {
+            self.recent_messages.pop_front();
+        }
+        self.recent_messages.push_back(message.to_string());
+        self.status = Some(message);
         cx.notify();
     }
 
@@ -1794,6 +1859,9 @@ impl Workspace {
 
     /// Reads the add-on folder and keeps panels only for what is turned on.
     fn reload_addons(&mut self, cx: &mut Context<Self>) {
+        if !addons::ENABLED {
+            return;
+        }
         let Some(directory) = addons::default_directory() else {
             return;
         };
@@ -1956,16 +2024,16 @@ impl Workspace {
     }
 
     fn document_at(&self, path: &Path, cx: &App) -> Option<usize> {
-        let wanted = path.canonicalize().ok();
+        let wanted = path.canonicalize().map(crate::platform::plain_path).ok();
         self.documents.iter().position(|document| {
             let open = document.view.read(cx).path.as_deref();
-            open == Some(path) || (wanted.is_some() && open.and_then(|open| open.canonicalize().ok()) == wanted)
+            open == Some(path) || (wanted.is_some() && open.and_then(|open| open.canonicalize().map(crate::platform::plain_path).ok()) == wanted)
         })
     }
 
     fn relative_to_project(&self, path: &Path) -> String {
-        let root = self.root.as_deref().and_then(|root| root.canonicalize().ok());
-        let real = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let root = self.root.as_deref().and_then(|root| root.canonicalize().map(crate::platform::plain_path).ok());
+        let real = path.canonicalize().map(crate::platform::plain_path).unwrap_or_else(|_| path.to_path_buf());
         root.and_then(|root| real.strip_prefix(root).ok().map(|inner| inner.display().to_string()))
             .unwrap_or_else(|| path.display().to_string())
     }
@@ -2330,6 +2398,9 @@ impl Workspace {
     /// A folder of standalone notes has one PDF per file, so switching files
     /// must not leave the PDF of the previous file on screen.
     fn compile_if_document_changed(&mut self, cx: &mut Context<Self>) {
+        if self.markdown_view(cx).is_some() {
+            return;
+        }
         let (Some(root), Some(last_main)) = (&self.root, &self.last_main) else {
             return;
         };
@@ -2338,6 +2409,47 @@ impl Workspace {
         if main.is_some_and(|main| main != *last_main) {
             self.recompile(cx);
         }
+    }
+
+    /// The active document when it is Markdown that the preview shows as a page,
+    /// rather than through a PDF build. A compiler chosen in the settings wins.
+    fn markdown_view(&self, cx: &App) -> Option<Entity<EditorView>> {
+        if self.config.engine.is_some() || self.active_language(cx) != Some(Language::Markdown) {
+            return None;
+        }
+        self.active_view()
+    }
+
+    fn schedule_markdown(&mut self, cx: &mut Context<Self>) {
+        if self.markdown_view(cx).is_none() || self.markdown_task.is_some() {
+            return;
+        }
+        self.markdown_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(MARKDOWN_DEBOUNCE).await;
+            this.update(cx, |this, cx| {
+                this.markdown_task = None;
+                this.refresh_markdown(cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// Hands the active Markdown text to the preview, if it changed and shows.
+    fn refresh_markdown(&mut self, cx: &mut Context<Self>) {
+        let Some(view) = self.markdown_view(cx) else {
+            return;
+        };
+        if self.focus_mode || self.layout == PaneLayout::EditorOnly {
+            return;
+        }
+        let (id, version) = (view.entity_id(), view.read(cx).state.version());
+        if self.markdown.read(cx).shows(id, version) {
+            return;
+        }
+        let view = view.read(cx);
+        let text = view.state.buffer().to_string();
+        let path = view.path.clone();
+        self.markdown.update(cx, |preview, cx| preview.show(id, version, path.as_deref(), &text, cx));
     }
 
     fn schedule_type_build(&mut self, cx: &mut Context<Self>) {
@@ -2354,6 +2466,9 @@ impl Workspace {
     /// For builds nobody asked for by hand. Stopping a run for every pause in typing
     /// would mean that a long document never gets a new preview.
     fn build_when_free(&mut self, cx: &mut Context<Self>) {
+        if self.markdown_view(cx).is_some() {
+            return;
+        }
         if self.building {
             self.build_queued = true;
         } else {
@@ -2783,6 +2898,11 @@ impl Workspace {
     }
 
     fn follow_cursor(&mut self, cx: &mut Context<Self>) {
+        if let Some(view) = self.markdown_view(cx) {
+            let head = view.read(cx).state.selections().primary().head;
+            self.markdown.update(cx, |preview, cx| preview.reveal(head, cx));
+            return;
+        }
         if !self.settings.auto_scroll_pdf || self.synctex_unavailable_reason().is_some() {
             return;
         }
@@ -2931,6 +3051,7 @@ impl Workspace {
         self.pdf_tab_shown = layout == PaneLayout::PdfTab;
         self.focus_mode = false;
         self.focus_main(window, cx);
+        self.refresh_markdown(cx);
         cx.notify();
     }
 
@@ -2943,6 +3064,7 @@ impl Workspace {
     fn toggle_focus_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.focus_mode = !self.focus_mode;
         self.focus_main(window, cx);
+        self.refresh_markdown(cx);
         cx.notify();
     }
 
@@ -3371,9 +3493,9 @@ impl Workspace {
             let counted = cx
                 .background_spawn(async move {
                     let open: HashMap<PathBuf, String> =
-                        open.into_iter().filter_map(|(path, text)| Some((path.canonicalize().ok()?, text))).collect();
+                        open.into_iter().filter_map(|(path, text)| Some((path.canonicalize().map(crate::platform::plain_path).ok()?, text))).collect();
                     let mut read = |path: &Path| {
-                        path.canonicalize()
+                        path.canonicalize().map(crate::platform::plain_path)
                             .ok()
                             .and_then(|path| open.get(&path).cloned().or_else(|| text_file::read(&path).ok().map(|loaded| loaded.text)))
                     };
@@ -3939,9 +4061,9 @@ impl Workspace {
         cx.spawn_in(window, async move |this, cx| {
             let message = format!("Move “{name}” to the Trash?");
             let detail = if unsaved {
-                "Finder can put it back from the Trash. Unsaved changes stay in Earlier versions."
+                if cfg!(windows) { "Windows can put it back from the Recycle Bin. Unsaved changes stay in Earlier versions." } else { "Finder can put it back from the Trash. Unsaved changes stay in Earlier versions." }
             } else {
-                "Finder can put it back from the Trash."
+                if cfg!(windows) { "Windows can put it back from the Recycle Bin." } else { "Finder can put it back from the Trash." }
             };
             if ask(&this, cx, PromptLevel::Warning, &message, detail, &["Move to Trash", "Cancel"]).await != Some(0) {
                 return;
@@ -4055,7 +4177,7 @@ impl Workspace {
         }
         entries.push(menu_separator());
         let target = path.clone();
-        entries.push(entry("Reveal in Finder", "", move |_, _, cx| cx.reveal_path(&target)));
+        entries.push(entry(if cfg!(windows) { "Show in Explorer" } else { "Reveal in Finder" }, "", move |_, _, cx| cx.reveal_path(&target)));
         let target = path.clone();
         entries.push(entry("Copy path", "", move |this, _, cx| {
             let relative = this.relative_to_project(&target);
@@ -4666,8 +4788,22 @@ impl Workspace {
             self.insert_snippet(&text, false, cx);
             return format!("Cited {key} at the cursor.");
         }
+        // The `[@` that opened the picker is already there.
+        if self.active_language(cx) == Some(Language::Markdown)
+            && let Some((_, before, after)) = self.active_view().and_then(|view| Self::around_cursor(view.read(cx)))
+            && snippets::opens_markdown_cite(&before)
+        {
+            let mut text = editor_core::snippet::literal(key);
+            if more {
+                text.push_str("; @");
+            } else if !after.starts_with(']') {
+                text.push(']');
+            }
+            self.insert_snippet(&text, false, cx);
+            return format!("Cited {key} at the cursor.");
+        }
         match self.active_language(cx) {
-            Some(language @ (Language::Latex | Language::Typst)) => {
+            Some(language @ (Language::Latex | Language::Typst | Language::Markdown)) => {
                 self.insert_snippet(&snippets::citation(language, key), false, cx);
                 format!("Cited {key} at the cursor.")
             }
@@ -4845,7 +4981,7 @@ impl Workspace {
     /// again at that place.
     fn check_citation_trigger(&mut self, view: &Entity<EditorView>, cx: &mut Context<Self>) {
         let language = self.active_language(cx);
-        if self.picker.is_some() || self.active_view().as_ref() != Some(view) || !matches!(language, Some(Language::Latex | Language::Typst)) {
+        if self.picker.is_some() || self.active_view().as_ref() != Some(view) || !matches!(language, Some(Language::Latex | Language::Typst | Language::Markdown)) {
             return;
         }
         let Some((head, before, _)) = Self::around_cursor(view.read(cx)) else {
@@ -4856,7 +4992,11 @@ impl Workspace {
             self.citation_trigger = None;
         }
         let after = Self::around_cursor(view.read(cx)).map(|(_, _, after)| after).unwrap_or_default();
-        let opens = if language == Some(Language::Typst) { snippets::opens_reference(&before) } else { snippets::cite_slot(&before, &after).is_some() };
+        let opens = match language {
+            Some(Language::Typst) => snippets::opens_reference(&before),
+            Some(Language::Markdown) => snippets::opens_markdown_cite(&before),
+            _ => snippets::cite_slot(&before, &after).is_some(),
+        };
         if !opens || self.citation_trigger == Some((id, head)) {
             return;
         }
@@ -4880,9 +5020,9 @@ impl Workspace {
             return;
         };
         let active = self.active_view().and_then(|view| view.read(cx).path.clone());
-        // Typst looks next to the current file, LaTeX next to the main file.
+        // Typst and Markdown look next to the current file, LaTeX next to the main file.
         let main = match language {
-            Language::Typst => active,
+            Language::Typst | Language::Markdown => active,
             _ => self.root.as_deref().and_then(|root| find_main(root, &self.config, active.as_deref())),
         };
         let directory = main.as_deref().and_then(Path::parent).or(self.root.as_deref());
@@ -5167,6 +5307,7 @@ impl Workspace {
                 }),
                 entry("Writing tools…", "", |this, window, cx| this.open_dialog(Dialog::Settings(SettingsPage::Tools), window, cx)),
                 entry("Add editor command for Terminal…", "", |this, _, cx| this.install_shell_command(cx)),
+                entry("Report a problem…", "", |this, window, cx| this.open_report(window, cx)),
             ],
             Menu::Compile => {
                 let trigger = self.config.trigger;
@@ -5351,14 +5492,13 @@ impl Workspace {
         )
     }
 
-    fn render_top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_top_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title = self
             .root
             .as_deref()
             .and_then(|root| root.file_name())
             .map_or_else(|| "No project".to_string(), |name| name.to_string_lossy().into_owned());
-        div()
-            .id("top-bar")
+        window_controls::drag_area(div().id("top-bar"))
             .relative()
             .flex()
             .flex_none()
@@ -5366,7 +5506,7 @@ impl Workspace {
             .justify_between()
             .h(px(TOP_BAR_HEIGHT))
             .pl(px(TRAFFIC_LIGHT_SPACE))
-            .pr(px(10.))
+            .pr(px(if cfg!(windows) { 0. } else { 10. }))
             .border_b_1()
             .border_color(theme::color(theme::palette().panel))
             .child(
@@ -5433,7 +5573,9 @@ impl Workspace {
                 div()
                     .flex()
                     .items_center()
-                    .child(self.menu_button(Menu::Layout, "Layout", cx)),
+                    .gap(px(6.))
+                    .child(self.menu_button(Menu::Layout, "Layout", cx))
+                    .children(window_controls::buttons(window, TOP_BAR_HEIGHT)),
             )
     }
 
@@ -5489,7 +5631,7 @@ impl Workspace {
                     .gap(px(8.))
                     .child(rail_button("rail-files", "file", LeftPanel::Files, cx))
                     .child(rail_button("rail-git", "git-branch", LeftPanel::Git, cx))
-                    .child(rail_button("rail-addons", "addon", LeftPanel::Addons, cx))
+                    .when(addons::ENABLED, |rail| rail.child(rail_button("rail-addons", "addon", LeftPanel::Addons, cx)))
                     .children(collab_rail)
                     .children(self.addon_panels.iter().enumerate().map(|(index, entry)| {
                         let panel = LeftPanel::Addon(index);
@@ -6393,8 +6535,9 @@ impl Workspace {
         let separator = || div().w(px(1.)).h(px(14.)).mx(px(6.)).bg(theme::color(theme::palette().divider));
         let palette = theme::palette();
         let language = self.active_language(cx);
-        let markup = matches!(language, Some(Language::Latex | Language::Typst));
         let formats = matches!(language, Some(Language::Latex | Language::Typst | Language::Markdown));
+        // Markdown takes LaTeX math between dollars, as Pandoc reads it.
+        let markup = formats;
         // A capsule floating on the editor's paper rather than a bar across it;
         // it is a little see-through, so the grain of paper mode shows.
         let capsule = div()
@@ -6690,7 +6833,10 @@ impl Workspace {
             .child(div().flex_none().text_color(theme::color(theme::palette().ui_muted)).child("Go to line"))
     }
 
-    fn render_preview_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_preview_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.markdown_view(cx).is_some() {
+            return self.render_markdown_toolbar(cx);
+        }
         let open = self.open_menu == Some(Menu::Compile);
         let errors = self.error_count();
         let warnings = self.diagnostics.len() - errors;
@@ -6850,6 +6996,37 @@ impl Workspace {
                         }
                     })),
             )
+            .into_any_element()
+    }
+
+    /// The preview of Markdown has no build: its bar shows the status and
+    /// whether the page follows the cursor.
+    fn render_markdown_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(8.))
+            .h(px(PREVIEW_TOOLBAR_HEIGHT))
+            .px(px(8.))
+            .bg(theme::color(theme::palette().panel))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(theme::color(theme::palette().ui_muted))
+                    .child(self.status.clone().unwrap_or_else(|| "Markdown preview. Double-click a block to go to its source.".into())),
+            )
+            .child(
+                div()
+                    .rounded(px(4.))
+                    .when(self.settings.auto_scroll_pdf, |element| element.bg(theme::color(theme::palette().accent_soft)))
+                    .child(self.icon_button("auto-scroll-markdown", "position", cx, |this, window, cx| {
+                        this.toggle_auto_scroll(window, cx);
+                    })),
+            )
+            .into_any_element()
     }
 
     fn panel_button(
@@ -6980,6 +7157,17 @@ impl Workspace {
                     errors - 1
                 )))
             })
+            .child(
+                div()
+                    .id("report-build-problem")
+                    .flex_none()
+                    .cursor_pointer()
+                    .text_size(px(12.))
+                    .text_color(theme::color(theme::palette().ui_muted))
+                    .hover(|style| style.text_color(theme::color(theme::palette().ui_text)))
+                    .on_click(cx.listener(|this, _, window, cx| this.open_report(window, cx)))
+                    .child("Looks like a fault of the editor? Report it"),
+            )
     }
 
     /// A one-line reminder after the user hides the card.
@@ -7733,7 +7921,7 @@ impl Workspace {
         }
         for group in groups {
             elements.push(div().flex_none().pt(px(14.)).pb(px(4.)).font_weight(FontWeight::SEMIBOLD).child(group).into_any_element());
-            for command in COMMANDS.iter().filter(|command| command.group == group) {
+            for command in COMMANDS.iter().filter(|command| command.group == group && command.available()) {
                 let id = command.id;
                 let recording = self.recording_shortcut == Some(id);
                 let keys = self.keymap.keys(command);
@@ -7904,7 +8092,7 @@ impl Workspace {
             )
         };
         let size = |part: fn(&storage::Usage) -> u64| usage.map(part);
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let home = crate::platform::home();
         let shown = |path: &Path| match home.as_deref().and_then(|home| path.strip_prefix(home).ok()) {
             Some(rest) => format!("~/{}", rest.display()),
             None => path.display().to_string(),
@@ -7938,7 +8126,6 @@ impl Workspace {
             .into_any_element(),
             Self::setting_row("Installed tools", "Tectonic, Typst and Pandoc. Remove them under Writing tools.", row(None, size(|usage| usage.tools)))
                 .into_any_element(),
-            Self::setting_row("Add-ons", "Remove them in the Add-ons panel.", row(None, size(|usage| usage.addons))).into_any_element(),
             Self::setting_row("Templates", "Your own templates. Remove them on the Home screen under Templates.", row(None, size(|usage| usage.templates)))
                 .into_any_element(),
             Self::setting_row(
@@ -7966,6 +8153,9 @@ impl Workspace {
             )
             .into_any_element(),
         ];
+        if addons::ENABLED {
+            elements.push(Self::setting_row("Add-ons", "Remove them in the Add-ons panel.", row(None, size(|usage| usage.addons))).into_any_element());
+        }
         if let Some(root) = &self.root {
             let name = root.file_name().map_or_else(|| shown(root), |name| name.to_string_lossy().into_owned());
             elements.push(
@@ -7988,7 +8178,7 @@ impl Workspace {
                 Self::setting_row(
                     title,
                     shown(&folder),
-                    self.settings_button(id, "Show in Finder", cx, move |_, _, cx| cx.reveal_path(&folder)),
+                    self.settings_button(id, if cfg!(windows) { "Show in Explorer" } else { "Show in Finder" }, cx, move |_, _, cx| cx.reveal_path(&folder)),
                 )
                 .into_any_element(),
             );
@@ -8006,7 +8196,7 @@ impl Workspace {
                 .into_any_element(),
         ];
         elements.extend(toolchain::installer_choice(&self.toolchain, cx));
-        elements.extend(toolchain::tool_rows(&self.toolchain, &Tool::ALL, true, cx));
+        elements.extend(toolchain::tool_rows(&self.toolchain, Tool::ALL, true, cx));
         elements.extend(texlive::section(&self.texlive, &self.toolchain, cx));
         elements.push(div().flex_none().pt(px(4.)).text_size(px(11.)).text_color(theme::color(theme::palette().ui_muted)).child(toolchain::promise(&self.toolchain, cx)).into_any_element());
         elements
@@ -8018,6 +8208,7 @@ impl Workspace {
         let subscription = cx.subscribe_in(&setup, window, |this, _, event, window, cx| match event {
             SetupEvent::Finished { example, guided } => this.finish_setup(*example, *guided, window, cx),
             SetupEvent::InstallCommand => this.install_shell_command(cx),
+            SetupEvent::ReportProblem => this.open_report(window, cx),
         });
         let focus = setup.read(cx).focus_handle(cx);
         window.focus(&focus, cx);
@@ -8367,6 +8558,7 @@ impl Workspace {
             Dialog::JoinSession => "Join a live session".into(),
             Dialog::GitSignIn => "Sign in".into(),
             Dialog::CommitDiff => self.commit_title(),
+            Dialog::ReportProblem => "Report a problem".into(),
         };
         let content = match dialog {
             Dialog::Settings(SettingsPage::Editor) => self.render_editor_settings(cx),
@@ -8380,6 +8572,7 @@ impl Workspace {
             Dialog::JoinSession => self.render_join_dialog(cx),
             Dialog::GitSignIn => self.render_sign_in(cx),
             Dialog::CommitDiff => self.render_commit_view(),
+            Dialog::ReportProblem => self.render_report_dialog(cx),
         };
         div()
             .id("dialog-backdrop")
@@ -8690,7 +8883,9 @@ impl Workspace {
     /// The logs or the PDF with the errors of the last build above it.
     fn render_preview_body(&self, cx: &mut Context<Self>) -> AnyElement {
         let has_errors = self.error_count() > 0;
-        if self.show_logs {
+        if self.markdown_view(cx).is_some() {
+            self.markdown.clone().into_any_element()
+        } else if self.show_logs {
             self.render_logs(cx).into_any_element()
         } else {
             div()
@@ -8976,7 +9171,22 @@ impl Render for Workspace {
                 element.child(div().flex().flex_1().min_h_0().child(page))
             })
             .on_action(cx.listener(|this, _: &StartTour, window, cx| this.start_tour(window, cx)))
-            .when(!presenting && !focus && !hub, |element| element.child(self.render_top_bar(cx)))
+            .when(!presenting && !focus && !hub, |element| element.child(self.render_top_bar(window, cx)))
+            // In focus mode Windows still needs a way to move and close the window,
+            // as the Mac keeps its traffic lights.
+            .when(cfg!(windows) && focus && !presenting, |element| {
+                element.child(
+                    window_controls::drag_area(div().id("focus-bar"))
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .h(px(32.))
+                        .flex()
+                        .justify_end()
+                        .children(window_controls::buttons(window, 32.)),
+                )
+            })
             .when(presenting, |element| {
                 let controls = self.presenting.as_ref().is_some_and(|state| state.controls_shown);
                 element.child(
@@ -9096,6 +9306,45 @@ impl Render for Workspace {
     }
 }
 
+/// One picker row per version: when, and how much it differs from now.
+fn history_items(versions: &[history::Version], current: &str) -> Vec<PickerItem> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs());
+    versions
+        .iter()
+        .map(|version| {
+            let text = history::read(&version.file).ok().and_then(|bytes| text_file::decode(bytes).ok()).map(|loaded| loaded.text);
+            let changes = match text.as_deref().map(|text| editor_core::line_diff::line_diff(current, text)) {
+                Some(Some(hunks)) if hunks.is_empty() => "Same as now".to_string(),
+                Some(Some(hunks)) => {
+                    let lines: usize = hunks.iter().map(|hunk| hunk.lines.len().max(1)).sum();
+                    format!("{lines} line{} differ from now", if lines == 1 { "" } else { "s" })
+                }
+                _ => "Differs from now".to_string(),
+            };
+            PickerItem {
+                path: version.file.clone(),
+                label: projects::ago(now, version.time),
+                position: None,
+                summary: None,
+                detail: Some(changes),
+            }
+        })
+        .collect()
+}
+
+/// Why a save failed, in words that say what to do. The file on disk is
+/// always whole, since saves replace it in one step.
+fn save_failed(error: &std::io::Error) -> String {
+    use std::io::ErrorKind;
+    let advice = match error.kind() {
+        ErrorKind::StorageFull | ErrorKind::QuotaExceeded => "The disk is full. Free some space and save again",
+        ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem => "This file or folder cannot be changed. Save a copy somewhere else",
+        ErrorKind::NotFound => "Its folder is gone. Save a copy somewhere else",
+        _ => return format!("Cannot save: {error}. Your text is still here and kept safe."),
+    };
+    format!("Cannot save: {advice}. Your text is still here and kept safe.")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9151,43 +9400,4 @@ mod tests {
         assert!(tab_edges(0, 3, None).0);
         assert!(!tab_edges(2, 3, None).1);
     }
-}
-
-/// One picker row per version: when, and how much it differs from now.
-fn history_items(versions: &[history::Version], current: &str) -> Vec<PickerItem> {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs());
-    versions
-        .iter()
-        .map(|version| {
-            let text = history::read(&version.file).ok().and_then(|bytes| text_file::decode(bytes).ok()).map(|loaded| loaded.text);
-            let changes = match text.as_deref().map(|text| editor_core::line_diff::line_diff(current, text)) {
-                Some(Some(hunks)) if hunks.is_empty() => "Same as now".to_string(),
-                Some(Some(hunks)) => {
-                    let lines: usize = hunks.iter().map(|hunk| hunk.lines.len().max(1)).sum();
-                    format!("{lines} line{} differ from now", if lines == 1 { "" } else { "s" })
-                }
-                _ => "Differs from now".to_string(),
-            };
-            PickerItem {
-                path: version.file.clone(),
-                label: projects::ago(now, version.time),
-                position: None,
-                summary: None,
-                detail: Some(changes),
-            }
-        })
-        .collect()
-}
-
-/// Why a save failed, in words that say what to do. The file on disk is
-/// always whole, since saves replace it in one step.
-fn save_failed(error: &std::io::Error) -> String {
-    use std::io::ErrorKind;
-    let advice = match error.kind() {
-        ErrorKind::StorageFull | ErrorKind::QuotaExceeded => "The disk is full. Free some space and save again",
-        ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem => "This file or folder cannot be changed. Save a copy somewhere else",
-        ErrorKind::NotFound => "Its folder is gone. Save a copy somewhere else",
-        _ => return format!("Cannot save: {error}. Your text is still here and kept safe."),
-    };
-    format!("Cannot save: {advice}. Your text is still here and kept safe.")
 }

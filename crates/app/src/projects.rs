@@ -136,7 +136,7 @@ pub fn now() -> u64 {
 }
 
 fn home() -> PathBuf {
-    std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from)
+    crate::platform::home().unwrap_or_else(|| PathBuf::from("/"))
 }
 
 fn folder_name(path: &Path) -> String {
@@ -679,6 +679,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_failed_template_copy_leaves_no_half_template() {
         let directory = tempfile::tempdir().unwrap();
         let project = directory.path().join("project");

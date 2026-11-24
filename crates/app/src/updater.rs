@@ -9,9 +9,8 @@
 //! Only a real app bundle updates itself: a build run with cargo never asks.
 
 use std::{
-    os::unix::process::CommandExt,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -39,7 +38,8 @@ pub struct Release {
     pub version: String,
     /// The release page, with what changed.
     pub page: String,
-    dmg_url: String,
+    /// The dmg on the Mac, the installer on Windows.
+    asset_url: String,
     bytes: u64,
     sha256: String,
 }
@@ -67,6 +67,9 @@ struct ApiAsset {
     digest: Option<String>,
 }
 
+/// What a release offers this system: the dmg, or the Windows installer.
+const ASSET_SUFFIX: &str = if cfg!(windows) { "-windows-x64-setup.exe" } else { ".dmg" };
+
 /// The release in GitHub's answer, if it has a dmg with a checksum. A dmg
 /// without one is never installed, since nothing could tell it was intact.
 fn parse_release(json: &str) -> Result<Option<Release>, String> {
@@ -74,7 +77,7 @@ fn parse_release(json: &str) -> Result<Option<Release>, String> {
     if release.draft || release.prerelease {
         return Ok(None);
     }
-    let Some(dmg) = release.assets.iter().find(|asset| asset.name.ends_with(".dmg")) else {
+    let Some(dmg) = release.assets.iter().find(|asset| asset.name.ends_with(ASSET_SUFFIX)) else {
         return Ok(None);
     };
     let Some(sha256) = dmg.digest.as_deref().and_then(|digest| digest.strip_prefix("sha256:")) else {
@@ -83,7 +86,7 @@ fn parse_release(json: &str) -> Result<Option<Release>, String> {
     Ok(Some(Release {
         version: release.tag_name.trim_start_matches('v').to_string(),
         page: release.html_url,
-        dmg_url: dmg.browser_download_url.clone(),
+        asset_url: dmg.browser_download_url.clone(),
         bytes: dmg.size,
         sha256: sha256.to_ascii_lowercase(),
     }))
@@ -119,9 +122,15 @@ pub fn check() -> Result<Option<Release>, String> {
     Ok(release.filter(|release| newer(&release.version, env!("CARGO_PKG_VERSION"))))
 }
 
-/// The Editor.app this program runs from, if it runs from one.
+/// The Editor.app this program runs from, if it runs from one. On Windows the
+/// folder the installer put it in, so that a build from elsewhere never updates.
 pub fn running_bundle() -> Option<PathBuf> {
-    let program = std::env::current_exe().ok()?.canonicalize().ok()?;
+    let program = std::env::current_exe().ok()?.canonicalize().map(crate::platform::plain_path).ok()?;
+    if cfg!(windows) {
+        let installed = PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("Programs\\Editor");
+        let folder = program.parent()?;
+        return folder.to_string_lossy().eq_ignore_ascii_case(&installed.to_string_lossy()).then(|| folder.to_path_buf());
+    }
     program.ancestors().find(|path| path.extension().is_some_and(|extension| extension == "app")).map(Path::to_path_buf)
 }
 
@@ -133,13 +142,13 @@ fn cask_homebrew() -> Option<PathBuf> {
 }
 
 fn plist_value(bundle: &Path, key: &str) -> Option<String> {
-    let output = Command::new("/usr/libexec/PlistBuddy").args(["-c", &format!("Print :{key}")]).arg(bundle.join("Contents/Info.plist")).output().ok()?;
+    let output = crate::platform::command("/usr/libexec/PlistBuddy").args(["-c", &format!("Print :{key}")]).arg(bundle.join("Contents/Info.plist")).output().ok()?;
     output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 /// The Apple team that signed a bundle, or `None` when it is signed ad hoc.
 fn team(bundle: &Path) -> Option<String> {
-    let output = Command::new("codesign").args(["-dv", "--verbose=2"]).arg(bundle).output().ok()?;
+    let output = crate::platform::command("codesign").args(["-dv", "--verbose=2"]).arg(bundle).output().ok()?;
     let report = String::from_utf8_lossy(&output.stderr);
     report.lines().find_map(|line| line.strip_prefix("TeamIdentifier=")).map(str::trim).filter(|team| *team != "not set").map(str::to_string)
 }
@@ -153,15 +162,14 @@ fn check_bundle(new: &Path, running: &Path, version: &str) -> Result<(), String>
     if plist_value(new, "CFBundleShortVersionString").as_deref() != Some(version) {
         return Err(format!("The download is not version {version}, so it was not installed."));
     }
-    let verify = Command::new("codesign").args(["--verify", "--deep", "--strict"]).arg(new).output().map_err(|error| format!("Cannot check the download: {error}"))?;
+    let verify = crate::platform::command("codesign").args(["--verify", "--deep", "--strict"]).arg(new).output().map_err(|error| format!("Cannot check the download: {error}"))?;
     if !verify.status.success() {
         return Err("The download is damaged, so it was not installed.".to_string());
     }
-    if let Some(expected) = team(running) {
-        if team(new).as_deref() != Some(expected.as_str()) {
+    if let Some(expected) = team(running)
+        && team(new).as_deref() != Some(expected.as_str()) {
             return Err("The download is not signed by Editor's developer, so it was not installed.".to_string());
         }
-    }
     Ok(())
 }
 
@@ -170,15 +178,26 @@ struct Mounted(PathBuf);
 
 impl Drop for Mounted {
     fn drop(&mut self) {
-        Command::new("hdiutil").args(["detach", "-force", "-quiet"]).arg(&self.0).status().ok();
+        crate::platform::command("hdiutil").args(["detach", "-force", "-quiet"]).arg(&self.0).status().ok();
     }
 }
 
+#[cfg(unix)]
 pub(crate) fn writable(path: &Path) -> bool {
     let Ok(path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
         return false;
     };
+    // SAFETY: access only reads a valid C string.
     unsafe { libc::access(path.as_ptr(), libc::W_OK) == 0 }
+}
+
+/// Windows has no cheap check for the right to write: trying is the check.
+#[cfg(not(unix))]
+pub(crate) fn writable(path: &Path) -> bool {
+    let probe = path.join(format!(".editor-write-{}", std::process::id()));
+    let writable = std::fs::write(&probe, b"").is_ok();
+    std::fs::remove_file(&probe).ok();
+    writable
 }
 
 /// Copies `source` to `bundle` through `staged`, keeping the app that is
@@ -191,13 +210,13 @@ pub(crate) fn put_in_place(source: &Path, bundle: &Path, staged: &Path, old: &Pa
             std::fs::remove_dir_all(leftover).map_err(|error| format!("Cannot clean up an earlier try: {error}"))?;
         }
     }
-    let copy = Command::new("ditto").arg(source).arg(staged).output().map_err(|error| format!("Cannot copy the app: {error}"))?;
+    let copy = crate::platform::command("ditto").arg(source).arg(staged).output().map_err(|error| format!("Cannot copy the app: {error}"))?;
     if !copy.status.success() {
         std::fs::remove_dir_all(staged).ok();
         return Err(format!("Cannot copy the app: {}", marketplace::failure(&copy)));
     }
     // Fails when there is no mark, which is fine.
-    Command::new("xattr").args(["-dr", "com.apple.quarantine"]).arg(staged).output().ok();
+    crate::platform::command("xattr").args(["-dr", "com.apple.quarantine"]).arg(staged).output().ok();
     if bundle.exists() {
         std::fs::rename(bundle, old).map_err(|error| format!("Cannot replace the app: {error}"))?;
     }
@@ -213,7 +232,7 @@ pub(crate) fn put_in_place(source: &Path, bundle: &Path, staged: &Path, old: &Pa
 /// until the new one is in place, so a failure leaves the old one working. Blocks.
 pub fn install_from_dmg(dmg: &Path, bundle: &Path, version: &str) -> Result<(), String> {
     let mount = tempfile::Builder::new().prefix("editor-update-").tempdir().map_err(|error| format!("Cannot open the download: {error}"))?;
-    let attach = Command::new("hdiutil")
+    let attach = crate::platform::command("hdiutil")
         .args(["attach", "-nobrowse", "-readonly", "-noautoopen", "-quiet", "-mountpoint"])
         .arg(mount.path())
         .arg(dmg)
@@ -237,7 +256,7 @@ pub fn install_from_dmg(dmg: &Path, bundle: &Path, version: &str) -> Result<(), 
     }
     // An app folder that belongs to another user: macOS asks for the password.
     let script = "/bin/rm -rf \"$3\" \"$4\" && /usr/bin/ditto \"$1\" \"$3\" && { /usr/bin/xattr -dr com.apple.quarantine \"$3\" || true; } && /bin/mv \"$2\" \"$4\" && { /bin/mv \"$3\" \"$2\" || { /bin/mv \"$4\" \"$2\"; exit 1; }; } && /bin/rm -rf \"$4\"";
-    let output = Command::new("osascript")
+    let output = crate::platform::command("osascript")
         .args([
             "-e",
             "on run argv",
@@ -262,20 +281,20 @@ pub fn install_from_dmg(dmg: &Path, bundle: &Path, version: &str) -> Result<(), 
 
 /// Runs `brew upgrade` for the cask. Blocks.
 fn upgrade_with_homebrew(brew: &Path, bundle: &Path, version: &str, cancel: &AtomicBool) -> Result<(), String> {
-    let mut child = Command::new(brew)
+    let mut command = crate::platform::command(brew);
+    command
         .args(["upgrade", "--cask", CASK])
         .env("NONINTERACTIVE", "1")
         .env("HOMEBREW_NO_ENV_HINTS", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .map_err(|error| format!("Cannot start Homebrew: {error}"))?;
+        .stderr(Stdio::piped());
+    let (mut child, group) = build::spawn_group(&mut command).map_err(|error| format!("Cannot start Homebrew: {error}"))?;
     loop {
         if cancel.load(Ordering::Relaxed) {
-            unsafe {
-                libc::kill(-(child.id() as i32), libc::SIGTERM);
+            match &group {
+                Some(group) => group.terminate(),
+                None => drop(child.kill()),
             }
             child.wait().ok();
             return Err("Stopped.".to_string());
@@ -296,18 +315,37 @@ fn upgrade_with_homebrew(brew: &Path, bundle: &Path, version: &str, cancel: &Ato
     Err("Homebrew does not have the new version yet. Try again in an hour.".to_string())
 }
 
+/// On Windows: once this process has ended, runs the downloaded installer
+/// without questions, which replaces the program, and starts the new one.
+fn run_installer_after_exit(setup: &Path, folder: &Path) {
+    let quote = |path: &Path| path.display().to_string().replace('\'', "''");
+    let script = format!(
+        "Wait-Process -Id {} -ErrorAction SilentlyContinue; Start-Process -Wait -FilePath '{}' -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART'; Remove-Item -Force '{}'; Start-Process -FilePath '{}'",
+        std::process::id(),
+        quote(setup),
+        quote(setup),
+        quote(&folder.join("editor.exe")),
+    );
+    let mut command = crate::platform::command("powershell");
+    command.args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &script]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    // A group of its own, so that it outlives this app.
+    build::detach(&mut command);
+    command.spawn().ok();
+}
+
 /// Starts the app at `bundle` once this process has ended.
 pub(crate) fn relaunch(bundle: &Path) {
-    Command::new("/bin/sh")
+    let mut command = crate::platform::command("/bin/sh");
+    command
         .args(["-c", "while kill -0 \"$1\" 2>/dev/null; do sleep 0.2; done; exec /usr/bin/open \"$2\"", "sh"])
         .arg(std::process::id().to_string())
         .arg(bundle)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()
-        .ok();
+        .stderr(Stdio::null());
+    // A group of its own, so that it outlives this app.
+    build::detach(&mut command);
+    command.spawn().ok();
 }
 
 struct Job {
@@ -373,6 +411,8 @@ impl Updater {
         let brew = cask_homebrew();
         let job = Job { received: Arc::default(), cancel: Arc::default(), homebrew: brew.is_some() };
         let (received, cancel) = (job.received.clone(), job.cancel.clone());
+        let installer: Arc<std::sync::Mutex<Option<PathBuf>>> = Arc::default();
+        let ready_installer = installer.clone();
         self.state = State::Installing(release.clone(), job);
         cx.notify();
         let install = cx.background_spawn({
@@ -381,13 +421,20 @@ impl Updater {
                 if let Some(brew) = brew {
                     return upgrade_with_homebrew(&brew, &bundle, &release.version, &cancel);
                 }
+                let installer = ready_installer;
                 let folder = tempfile::Builder::new().prefix("editor-update-").tempdir().map_err(|error| format!("Cannot prepare the download: {error}"))?;
-                let dmg = folder.path().join("Editor.dmg");
-                toolchain::download(&release.dmg_url, &dmg, false, DOWNLOAD_SECONDS, &received, &cancel)?;
-                if toolchain::file_digest::<sha2::Sha256>(&dmg)? != release.sha256 {
+                let download = folder.path().join(if cfg!(windows) { "Editor-setup.exe" } else { "Editor.dmg" });
+                toolchain::download(&release.asset_url, &download, false, DOWNLOAD_SECONDS, &received, &cancel)?;
+                if toolchain::file_digest::<sha2::Sha256>(&download)? != release.sha256 {
                     return Err("The download is not the expected file, so it was not installed.".to_string());
                 }
-                install_from_dmg(&dmg, &bundle, &release.version)
+                if cfg!(windows) {
+                    // The installer runs once the app has quit, so it must outlive this folder.
+                    let _kept = folder.keep();
+                    *installer.lock().unwrap_or_else(|error| error.into_inner()) = Some(download);
+                    return Ok(());
+                }
+                install_from_dmg(&download, &bundle, &release.version)
             }
         });
         cx.spawn(async move |this, cx| {
@@ -412,7 +459,10 @@ impl Updater {
             this.update(cx, |this, cx| {
                 match result {
                     Ok(()) => {
-                        relaunch(&bundle);
+                        match installer.lock().unwrap_or_else(|error| error.into_inner()).take() {
+                            Some(setup) => run_installer_after_exit(&setup, &bundle),
+                            None => relaunch(&bundle),
+                        }
                         // Quitting saves every open file first.
                         cx.quit();
                     }
@@ -547,7 +597,7 @@ mod tests {
             {"name":"Editor-0.2.0.dmg","browser_download_url":"https://x/Editor-0.2.0.dmg","size":34000000,"digest":"sha256:ABCD"}]}"#;
         let release = parse_release(json).unwrap().unwrap();
         assert_eq!(release.version, "0.2.0");
-        assert_eq!(release.dmg_url, "https://x/Editor-0.2.0.dmg");
+        assert_eq!(release.asset_url, "https://x/Editor-0.2.0.dmg");
         assert_eq!(release.sha256, "abcd");
         let unchecked = json.replace(",\"digest\":\"sha256:ABCD\"", "");
         assert_eq!(parse_release(&unchecked).unwrap(), None);
@@ -565,7 +615,7 @@ mod tests {
         let dmg = root.join(format!("Editor-{version}.dmg"));
         let folder = tempfile::tempdir().unwrap();
         let bundle = folder.path().join("Editor.app");
-        assert!(Command::new("ditto").arg(root.join("Editor.app")).arg(&bundle).status().unwrap().success());
+        assert!(std::process::Command::new("ditto").arg(root.join("Editor.app")).arg(&bundle).status().unwrap().success());
         std::fs::write(bundle.join("Contents/marker"), "old").unwrap();
         install_from_dmg(&dmg, &bundle, version).unwrap();
         assert!(!bundle.join("Contents/marker").exists());

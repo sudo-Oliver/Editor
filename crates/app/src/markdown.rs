@@ -1,17 +1,22 @@
-//! A small Markdown reader for what add-ons write: headings, paragraphs, bold,
-//! italic, inline code, code blocks, lists, quotes, rules and links. Tables
-//! stay as written, in a code block. Text that streams in is parsed again only
-//! from its last block on, since everything before it cannot change.
+//! A small Markdown reader for what add-ons write and for the preview of
+//! Markdown files: headings, paragraphs, bold, italic, inline code, math, code
+//! blocks, lists, quotes, rules, pipe tables, images and links. After an edit,
+//! the text is parsed again only from the block the change is in, since a
+//! block that follows a blank line cannot change what came before it.
 
 use std::ops::Range;
 
 use gpui::SharedString;
+
+use crate::math_text::math_text;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Marks {
     pub bold: bool,
     pub italic: bool,
     pub code: bool,
+    /// `$x$`, as Unicode text.
+    pub math: bool,
     pub link: Option<SharedString>,
 }
 
@@ -30,6 +35,19 @@ pub enum Block {
     List { ordered: bool, start: u32, items: Vec<Inline> },
     Quote(Inline),
     Rule,
+    Table { align: Vec<Align>, header: Vec<Inline>, rows: Vec<Vec<Inline>> },
+    /// `$$…$$`: the LaTeX as written, and as Unicode text until it is typeset.
+    Math { source: SharedString, text: SharedString },
+    /// An image alone in its paragraph, with the path as written.
+    Image { alt: SharedString, url: SharedString },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Align {
+    #[default]
+    Left,
+    Center,
+    Right,
 }
 
 /// The parsed form of a text that grows at its end.
@@ -39,35 +57,86 @@ pub struct Document {
     /// Where each block starts in `source`.
     starts: Vec<usize>,
     source: String,
+    /// A Markdown file, whose YAML front matter is read for its title. In what
+    /// add-ons write, a `---` at the start is a rule.
+    file: bool,
 }
 
 impl Document {
+    pub fn file() -> Self {
+        Self { file: true, ..Self::default() }
+    }
+
     #[cfg(test)]
     pub fn new(text: &str) -> Self {
-        let mut document = Self::default();
+        let mut document = Self::file();
         document.update(text);
         document
     }
 
-    /// Takes the new text. When it only grew, the blocks before the last blank
-    /// line stay: a blank line ends every block but a code block, which then
-    /// holds it, so nothing after it can change what came before.
-    pub fn update(&mut self, text: &str) {
-        let from = if text.starts_with(self.source.as_str()) {
-            (1..self.starts.len()).rev().find(|&index| after_blank_line(&self.source, self.starts[index])).unwrap_or(0)
-        } else {
-            0
-        };
-        let offset = self.starts.get(from).copied().unwrap_or(0);
+    /// Where each block starts in the text.
+    pub fn starts(&self) -> &[usize] {
+        &self.starts
+    }
+
+    /// Takes the new text. The blocks before the last blank line ahead of the
+    /// first change stay: a blank line ends every block but a code block,
+    /// which then holds it, so nothing after it can change what came before.
+    /// Reading stops where a block starts in the unchanged end of the text at
+    /// the place an old block started, since blocks do not depend on the ones
+    /// before them. Returns the old blocks that were replaced and how many new
+    /// ones took their place.
+    pub fn update(&mut self, text: &str) -> (Range<usize>, usize) {
+        if text == self.source {
+            return (self.blocks.len()..self.blocks.len(), 0);
+        }
+        let same = common_prefix(&self.source, text);
+        let suffix = self.source[same..].bytes().rev().zip(text[same..].bytes().rev()).take_while(|(a, b)| a == b).count();
+        let (old_len, new_end) = (self.source.len(), text.len() - suffix);
+        let mut from = self.starts.partition_point(|start| *start <= same).saturating_sub(1);
+        while from > 0 && !after_blank_line(&self.source, self.starts[from]) {
+            from -= 1;
+        }
+        let offset = if from == 0 { 0 } else { self.starts[from] };
+        // The old blocks that start in the unchanged end, where reading may stop.
+        // Not the first, which may be the title of a front matter.
+        let tail = self.starts.partition_point(|start| *start < old_len - suffix).max(1).min(self.starts.len());
+        let mut resume = None;
+        let mut fresh = Vec::new();
+        let starts = &self.starts;
+        parse_from(text, offset, self.file, &mut fresh, |start| {
+            if start < new_end {
+                return false;
+            }
+            let old = start + old_len - text.len();
+            resume = starts[tail..].binary_search(&old).ok().map(|index| tail + index);
+            resume.is_some()
+        });
+        let old_end = resume.unwrap_or(self.blocks.len());
+        let kept_blocks = self.blocks.split_off(old_end);
+        let kept_starts = self.starts.split_off(old_end);
         self.blocks.truncate(from);
         self.starts.truncate(from);
-        for (start, block) in parse(&text[offset..]) {
-            self.starts.push(offset + start);
+        let count = fresh.len();
+        for (start, block) in fresh {
+            self.starts.push(start);
             self.blocks.push(block);
         }
+        self.blocks.extend(kept_blocks);
+        self.starts.extend(kept_starts.into_iter().map(|start| start + text.len() - old_len));
         self.source.clear();
         self.source.push_str(text);
+        (from..old_end, count)
     }
+}
+
+/// How many bytes both texts start with, at a char boundary of both.
+fn common_prefix(left: &str, right: &str) -> usize {
+    let mut same = left.bytes().zip(right.bytes()).take_while(|(a, b)| a == b).count();
+    while !left.is_char_boundary(same) || !right.is_char_boundary(same) {
+        same -= 1;
+    }
+    same
 }
 
 /// Whether the line before `start` is empty.
@@ -79,14 +148,41 @@ fn after_blank_line(text: &str, start: usize) -> bool {
 
 pub fn parse(text: &str) -> Vec<(usize, Block)> {
     let mut blocks = Vec::new();
-    let mut lines = Lines::new(text);
+    parse_from(text, 0, false, &mut blocks, |_| false);
+    blocks
+}
+
+/// Like `parse`, for a Markdown file with its front matter.
+#[cfg(test)]
+fn parse_file(text: &str) -> Vec<(usize, Block)> {
+    let mut blocks = Vec::new();
+    parse_from(text, 0, true, &mut blocks, |_| false);
+    blocks
+}
+
+/// Reads blocks from the line start `from` on, until `stop` says yes to where
+/// the next one starts. Offsets are in all of `text`.
+fn parse_from(text: &str, from: usize, file: bool, blocks: &mut Vec<(usize, Block)>, mut stop: impl FnMut(usize) -> bool) {
+    let mut lines = Lines { text, at: from };
+    if file
+        && from == 0
+        && let Some(title) = front_matter(&mut lines)
+    {
+        blocks.push((0, Block::Heading { level: 1, text: inline(&title) }));
+    }
     while let Some((start, line)) = lines.peek() {
         let trimmed = line.trim_start();
         if trimmed.is_empty() {
             lines.next();
             continue;
         }
-        let block = if let Some(fence) = fence(trimmed) {
+        if stop(start) {
+            return;
+        }
+        let block = if let Some((source, end)) = math_block(&lines) {
+            lines.at = end;
+            Block::Math { text: math_text(&source).into(), source: source.into() }
+        } else if let Some(fence) = fence(trimmed) {
             lines.next();
             let language = trimmed[fence.len()..].trim().to_string();
             let mut code = Vec::new();
@@ -109,7 +205,13 @@ pub fn parse(text: &str) -> Vec<(usize, Block)> {
                 rows.push(line.trim());
                 lines.next();
             }
-            Block::Code { language: "table".into(), text: rows.join("\n").into() }
+            match rows.get(1).and_then(|rule| alignments(rule)) {
+                Some(align) => {
+                    let cells = |row: &str| cells(row).into_iter().map(inline).collect::<Vec<_>>();
+                    Block::Table { align, header: cells(rows[0]), rows: rows[2..].iter().map(|row| cells(row)).collect() }
+                }
+                None => Block::Code { language: "table".into(), text: rows.join("\n").into() },
+            }
         } else if let Some(rest) = trimmed.strip_prefix('>') {
             let mut quote = vec![rest.trim_start()];
             lines.next();
@@ -138,18 +240,124 @@ pub fn parse(text: &str) -> Vec<(usize, Block)> {
             let mut paragraph = Vec::new();
             while let Some((_, line)) = lines.peek() {
                 let trimmed = line.trim_start();
-                let starts_other = trimmed.is_empty() || fence(trimmed).is_some() || heading(trimmed).is_some() || trimmed.starts_with('>') || (!paragraph.is_empty() && list_item(trimmed).is_some());
+                let starts_other = trimmed.is_empty()
+                    || fence(trimmed).is_some()
+                    || heading(trimmed).is_some()
+                    || trimmed.starts_with('>')
+                    || math_block(&lines).is_some()
+                    || (!paragraph.is_empty() && list_item(trimmed).is_some());
                 if starts_other {
                     break;
                 }
                 paragraph.push(line);
                 lines.next();
             }
-            Block::Paragraph(inline(&join_lines(&paragraph)))
+            let joined = join_lines(&paragraph);
+            match image(&joined) {
+                Some((alt, url)) => Block::Image { alt: alt.into(), url: url.into() },
+                None => Block::Paragraph(inline(&joined)),
+            }
         };
         blocks.push((start, block));
     }
-    blocks
+}
+
+/// `$$…$$` from the line `lines` is at, as Pandoc reads display math: closed
+/// on that line or a later one, before a blank line, with nothing after the
+/// closing dollars. Returns the formula and where the lines go on, or nothing,
+/// so that dollars typed and not yet closed stay text.
+fn math_block(lines: &Lines) -> Option<(String, usize)> {
+    let mut ahead = Lines { text: lines.text, at: lines.at };
+    let (_, first) = ahead.next()?;
+    let rest = first.trim_start().strip_prefix("$$")?;
+    if let Some(inner) = rest.trim_end().strip_suffix("$$") {
+        return (!inner.contains("$$")).then(|| (inner.trim().to_string(), ahead.at));
+    }
+    if rest.contains("$$") {
+        return None;
+    }
+    let mut math = vec![rest];
+    while let Some((_, line)) = ahead.next() {
+        if line.trim().is_empty() {
+            return None;
+        }
+        if let Some(last) = line.trim_end().strip_suffix("$$") {
+            if last.contains("$$") {
+                return None;
+            }
+            math.push(last);
+            return Some((math.join("\n").trim().to_string(), ahead.at));
+        }
+        if line.contains("$$") {
+            return None;
+        }
+        math.push(line);
+    }
+    None
+}
+
+/// Skips a YAML front matter at the very start and returns its title.
+fn front_matter(lines: &mut Lines) -> Option<String> {
+    if lines.peek().map(|(_, line)| line) != Some("---") {
+        return None;
+    }
+    let mut ahead = Lines { text: lines.text, at: lines.at };
+    ahead.next();
+    let mut title = None;
+    while let Some((_, line)) = ahead.next() {
+        if line == "---" || line == "..." {
+            *lines = ahead;
+            return title;
+        }
+        if let Some(value) = line.strip_prefix("title:") {
+            title = Some(value.trim().trim_matches(['"', '\'']).to_string()).filter(|title| !title.is_empty());
+        }
+    }
+    None
+}
+
+/// The cells of a table row, without its outer pipes. `\|` stays in its cell.
+fn cells(row: &str) -> Vec<&str> {
+    let row = row.trim();
+    let row = row.strip_prefix('|').unwrap_or(row);
+    let row = if row.ends_with('|') && !row.ends_with("\\|") { &row[..row.len() - 1] } else { row };
+    let mut out = Vec::new();
+    let mut start = 0;
+    let bytes = row.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte == b'|' && (index == 0 || bytes[index - 1] != b'\\') {
+            out.push(row[start..index].trim());
+            start = index + 1;
+        }
+    }
+    out.push(row[start..].trim());
+    out
+}
+
+/// The alignments of a table's rule row, as `|:--|:-:|--:|`, or nothing if it is not one.
+fn alignments(rule: &str) -> Option<Vec<Align>> {
+    cells(rule)
+        .into_iter()
+        .map(|cell| {
+            let dashes = cell.trim_start_matches(':').trim_end_matches(':');
+            if dashes.is_empty() || !dashes.bytes().all(|byte| byte == b'-') {
+                return None;
+            }
+            Some(match (cell.starts_with(':'), cell.ends_with(':')) {
+                (true, true) => Align::Center,
+                (false, true) => Align::Right,
+                _ => Align::Left,
+            })
+        })
+        .collect()
+}
+
+/// `![alt](url)` as the whole paragraph.
+fn image(paragraph: &str) -> Option<(String, String)> {
+    let rest = paragraph.strip_prefix('!')?;
+    let chars: Vec<char> = rest.chars().collect();
+    let (alt, url, used) = link(&chars)?;
+    (used == chars.len()).then_some((alt, url))
 }
 
 /// Lines with the offset where each starts.
@@ -159,10 +367,6 @@ struct Lines<'a> {
 }
 
 impl<'a> Lines<'a> {
-    fn new(text: &'a str) -> Self {
-        Self { text, at: 0 }
-    }
-
     fn peek(&self) -> Option<(usize, &'a str)> {
         (self.at < self.text.len()).then(|| {
             let rest = &self.text[self.at..];
@@ -255,6 +459,28 @@ pub fn inline(source: &str) -> Inline {
                     continue;
                 }
             }
+            '$' if next.is_some_and(|next| !next.is_whitespace()) => {
+                // Pandoc's rule: no space inside the dollars, no digit right after.
+                let close = chars[index + 1..].iter().enumerate().position(|(at, &ch)| {
+                    ch == '$' && !chars[index + at].is_whitespace() && !chars.get(index + at + 2).is_some_and(char::is_ascii_digit)
+                });
+                if let Some(end) = close {
+                    flush(&text, &mut marks, &current, &mut run_start);
+                    text.push_str(&math_text(&chars[index + 1..index + end + 1].iter().collect::<String>()));
+                    marks.push((run_start..text.len(), Marks { math: true, ..current.clone() }));
+                    run_start = text.len();
+                    index += end + 2;
+                    continue;
+                }
+            }
+            '!' if next == Some('[') => {
+                // An image inside text shows its description.
+                if let Some((alt, _, used)) = link(&chars[index + 1..]) {
+                    text.push_str(&alt);
+                    index += used + 1;
+                    continue;
+                }
+            }
             '[' => {
                 if let Some((label, url, used)) = link(&chars[index..]) {
                     flush(&text, &mut marks, &current, &mut run_start);
@@ -312,7 +538,12 @@ fn link(chars: &[char]) -> Option<(String, String, usize)> {
     }
     let end = chars[close + 2..].iter().position(|&ch| ch == ')')? + close + 2;
     let url: String = chars[close + 2..end].iter().collect();
-    let url = url.split_whitespace().next()?.to_string();
+    let url = url.trim();
+    // `<path with spaces>` keeps them; otherwise a title may follow the url.
+    let url = match url.strip_prefix('<').and_then(|url| url.split_once('>')) {
+        Some((inside, _)) => inside.to_string(),
+        None => url.split_whitespace().next()?.to_string(),
+    };
     Some((chars[1..close].iter().collect(), url, end + 1))
 }
 
@@ -335,7 +566,54 @@ mod tests {
         assert!(matches!(&parsed[4], Block::List { ordered: true, start: 1, items } if items.len() == 2));
         assert!(matches!(&parsed[5], Block::Quote(inline) if inline.text == "quoted on"));
         assert_eq!(parsed[6], Block::Rule);
-        assert!(matches!(&parsed[7], Block::Code { language, .. } if language == "table"));
+        assert!(matches!(&parsed[7], Block::Table { header, rows, .. } if header.len() == 2 && rows.is_empty()));
+    }
+
+    #[test]
+    fn tables_math_images_and_front_matter() {
+        let text = "---\ntitle: \"Notes\"\nbibliography: refs.bib\n---\n| a | b \\| c |\n|:--|--:|\n| 1 | 2 |\n\n$$\nx^2\n$$\n\n![A frog](<img/a frog.png>)\n\nCosts 5 $ and $x_1$ is math.\n";
+        let parsed: Vec<Block> = parse_file(text).into_iter().map(|(_, block)| block).collect();
+        // What an add-on writes has no front matter: the dashes are a rule.
+        assert_eq!(blocks(text)[0], Block::Rule);
+        assert!(matches!(&parsed[0], Block::Heading { level: 1, text } if text.text == "Notes"));
+        let Block::Table { align, header, rows } = &parsed[1] else { panic!("{:?}", parsed[1]) };
+        assert_eq!(align, &[Align::Left, Align::Right]);
+        assert_eq!(header[1].text, "b | c");
+        assert_eq!(rows[0][1].text, "2");
+        assert_eq!(parsed[2], Block::Math { source: "x^2".into(), text: "x²".into() });
+        assert_eq!(parsed[3], Block::Image { alt: "A frog".into(), url: "img/a frog.png".into() });
+        let Block::Paragraph(paragraph) = &parsed[4] else { panic!() };
+        let math: Vec<_> = paragraph.marks.iter().filter(|(_, marks)| marks.math).map(|(range, _)| &paragraph.text[range.clone()]).collect();
+        assert_eq!(math, ["x₁"]);
+        assert_eq!(blocks("$$x$$\n"), [Block::Math { source: "x".into(), text: "x".into() }]);
+        // Open dollars, or text after the closing ones, stay text.
+        assert!(matches!(&blocks("$$a$$ is the area\n")[..], [Block::Paragraph(_)]));
+        assert!(matches!(&blocks("$$\nx\n\n# Next\n")[..], [Block::Paragraph(_), Block::Heading { .. }]));
+        assert!(matches!(&blocks("$$\nx^2\n$$\n")[..], [Block::Math { .. }]));
+    }
+
+    /// Editing anywhere must end where reading the whole text at once does.
+    #[test]
+    fn edits_match_reading_at_once() {
+        let text = "---\ntitle: T\n---\n# Plan\n\n---\n\nFirst **step** here.\n\n```tex\na\n\nb\n```\n\n- x\n- y\n\n| a |\n|---|\n| 1 |\n\n$$\nx\n\ny\n$$\n\nEnd.\n";
+        for at in 0..=text.len() {
+            if !text.is_char_boundary(at) {
+                continue;
+            }
+            for insert in ["x", "\n", "\n\n", "```", "$$", "| ", "---\n"] {
+                let edited = format!("{}{insert}{}", &text[..at], &text[at..]);
+                let mut document = Document::new(text);
+                let before = document.blocks.clone();
+                let (replaced, count) = document.update(&edited);
+                assert_eq!(document.blocks, Document::new(&edited).blocks, "{insert:?} at {at}");
+                // What it says changed is all that changed.
+                assert_eq!(document.blocks[..replaced.start], before[..replaced.start]);
+                assert_eq!(document.blocks[replaced.start + count..], before[replaced.end..]);
+                assert_eq!(document.starts, parse_file(&edited).into_iter().map(|(start, _)| start).collect::<Vec<_>>());
+                document.update(text);
+                assert_eq!(document.blocks, Document::new(text).blocks, "{insert:?} taken back at {at}");
+            }
+        }
     }
 
     #[test]
@@ -422,5 +700,26 @@ mod speed {
         let elapsed = started.elapsed();
         println!("{} bytes, {} blocks: {:?} in all, {:?} per piece", text.len(), document.blocks.len(), elapsed, elapsed / 4000);
         assert_eq!(document.blocks, parse(&text).into_iter().map(|(_, block)| block).collect::<Vec<_>>());
+    }
+
+    /// Typing into a 1 MB file, near its end and near its start, as the preview reads it:
+    /// cargo test -p app --release markdown::speed -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn editing_a_large_file() {
+        let section = "## Section\n\nSome **bold** text with `code`, $x^2$ and [a link](https://x.org) in a longer paragraph of words.\n\n- one\n- two\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```rust\nfn main() {}\n```\n\n";
+        let text = section.repeat(1_000_000 / section.len());
+        let started = std::time::Instant::now();
+        let mut document = Document::new(&text);
+        println!("{} bytes, {} blocks: first read {:?}", text.len(), document.blocks.len(), started.elapsed());
+        for (name, at) in [("end", text.len() - 40), ("start", 40)] {
+            let mut edited = text.clone();
+            let started = std::time::Instant::now();
+            for _ in 0..100 {
+                edited.insert(at, 'x');
+                document.update(&edited);
+            }
+            println!("typing near the {name}: {:?} per key", started.elapsed() / 100);
+        }
     }
 }

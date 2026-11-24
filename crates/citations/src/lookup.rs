@@ -7,7 +7,7 @@ use std::{ops::Range, path::PathBuf};
 use crate::{
     index::{CitationIndex, IndexedEntry, LabelDef},
     project::Language,
-    tex, typst,
+    markdown, tex, typst,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,6 +36,7 @@ pub fn target_at(language: Language, text: &str, offset: usize) -> Option<Target
     let scan = match language {
         Language::Latex => tex::scan(text),
         Language::Typst => typst::scan(text),
+        Language::Markdown => markdown::scan(text),
     };
     let found = |kind: TargetKind| move |key: &crate::scan::Key| (kind, key.name.clone(), key.range.clone());
     scan.cites

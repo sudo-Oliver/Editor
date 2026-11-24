@@ -716,7 +716,8 @@ impl EditorView {
         let language = match self.state.language() {
             Language::Latex => citations::project::Language::Latex,
             Language::Typst => citations::project::Language::Typst,
-            _ => return None,
+            Language::Markdown => citations::project::Language::Markdown,
+            Language::Plain => return None,
         };
         let buffer = self.state.buffer();
         let line = buffer.offset_to_line(offset);

@@ -22,11 +22,26 @@ icons!(
 );
 
 /// iA Writer Quattro for paper mode, under the SIL Open Font License, see `assets/fonts/LICENSE.md`.
+#[cfg(target_os = "macos")]
 pub const FONTS: &[&[u8]] = &[
     include_bytes!("../assets/fonts/iAWriterQuattroS-Regular.ttf"),
     include_bytes!("../assets/fonts/iAWriterQuattroS-Italic.ttf"),
     include_bytes!("../assets/fonts/iAWriterQuattroS-Bold.ttf"),
     include_bytes!("../assets/fonts/iAWriterQuattroS-BoldItalic.ttf"),
+];
+
+/// Elsewhere also DejaVu Sans Mono, which Menlo on the Mac is drawn from, so
+/// that code looks the same; see `assets/fonts/DejaVu-LICENSE.txt`.
+#[cfg(not(target_os = "macos"))]
+pub const FONTS: &[&[u8]] = &[
+    include_bytes!("../assets/fonts/iAWriterQuattroS-Regular.ttf"),
+    include_bytes!("../assets/fonts/iAWriterQuattroS-Italic.ttf"),
+    include_bytes!("../assets/fonts/iAWriterQuattroS-Bold.ttf"),
+    include_bytes!("../assets/fonts/iAWriterQuattroS-BoldItalic.ttf"),
+    include_bytes!("../assets/fonts/DejaVuSansMono.ttf"),
+    include_bytes!("../assets/fonts/DejaVuSansMono-Oblique.ttf"),
+    include_bytes!("../assets/fonts/DejaVuSansMono-Bold.ttf"),
+    include_bytes!("../assets/fonts/DejaVuSansMono-BoldOblique.ttf"),
 ];
 
 pub struct Assets;

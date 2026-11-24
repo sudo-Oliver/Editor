@@ -738,7 +738,7 @@ impl LanguageConfig {
                     None,
                     Some(Box::new(Self::new(
                         tree_sitter_md::INLINE_LANGUAGE.into(),
-                        tree_sitter_md::HIGHLIGHT_QUERY_INLINE,
+                        &format!("{}\n{}", tree_sitter_md::HIGHLIGHT_QUERY_INLINE, include_str!("../queries/markdown_inline.scm")),
                         None,
                         None,
                         None,
@@ -841,16 +841,22 @@ impl Syntax {
     }
 
     /// Whether `offset` lies inside a formula. Without a tree the answer is no.
-    pub fn in_math(&self, offset: usize) -> bool {
+    pub fn in_math(&self, rope: &Rope, offset: usize) -> bool {
         let Some(tree) = &self.tree else {
             return false;
         };
         let mut node = tree.root_node().descendant_for_byte_range(offset, offset);
         while let Some(current) = node {
-            if matches!(current.kind(), "inline_formula" | "displayed_equation" | "math_environment" | "math")
-                && current.start_byte() < offset
-                && offset < current.end_byte()
+            if current.kind() == "inline"
+                && let Some(inline) = self.config.and_then(|config| config.inline.as_deref())
             {
+                // Markdown math lives in the inline tree, parsed here for this block only.
+                let mut parser = Parser::new();
+                parser.set_language(&inline.language).expect("grammar ABI matches tree-sitter");
+                return parser.set_included_ranges(&[current.range()]).is_ok()
+                    && parse_rope(&mut parser, rope, None).is_some_and(|tree| in_math_node(tree.root_node(), offset));
+            }
+            if in_math_node(current, offset) {
                 return true;
             }
             node = current.parent();
@@ -916,6 +922,21 @@ fn collect_spans(
             });
         }
     }
+}
+
+/// Whether `offset` lies inside a formula at or above the node there.
+fn in_math_node(root: Node, offset: usize) -> bool {
+    let mut node = root.descendant_for_byte_range(offset, offset);
+    while let Some(current) = node {
+        if matches!(current.kind(), "inline_formula" | "displayed_equation" | "math_environment" | "math" | "latex_block")
+            && current.start_byte() < offset
+            && offset < current.end_byte()
+        {
+            return true;
+        }
+        node = current.parent();
+    }
+    false
 }
 
 /// Parses the inline text that touches `range`, one block at a time. Text outside of
@@ -1138,8 +1159,9 @@ mod tests {
     fn markdown_highlights_blocks_and_inlines() {
         let spans = kinds_for(
             Language::Markdown,
-            "# Title\n\nSome *em* and **strong** text\n\n```\ncode\n```\n",
+            "# Title\n\nSome *em* and **strong** text with $x^2$\n\n```\ncode\n```\n",
         );
+        assert!(spans.contains(&("$x^2$".into(), HighlightKind::Math)));
         assert!(spans.iter().any(|(_, kind)| *kind == HighlightKind::Heading));
         assert!(spans.iter().any(|(_, kind)| *kind == HighlightKind::Emphasis));
         assert!(spans.iter().any(|(_, kind)| *kind == HighlightKind::Strong));

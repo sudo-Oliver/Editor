@@ -5,20 +5,28 @@ The editor, the compilers and the PDF preview all run on your machine.
 
 ## Install
 
-Download `Editor-<version>.dmg` from the [releases](https://github.com/sudo-Oliver/Editor/releases), open it and drag Editor into Applications.
+**Mac:** download `Editor-<version>.dmg` from the [releases](https://github.com/sudo-Oliver/Editor/releases), open it and drag Editor into Applications.
 It runs on Apple silicon and Intel Macs with macOS 11 or later.
 With Homebrew, `brew install --cask sudo-oliver/tap/editor` does the same and adds the `editor` command.
 
-Files open from Finder (Open With, or drag them onto the Dock icon), and from the terminal like VS Code's `code`:
+**Windows:** download `Editor-<version>-windows-x64-setup.exe` from the same page and open it. It installs for you alone, without an administrator, adds Editor to the Start menu and the `editor` command to the PATH, and lets `.tex`, `.typ`, `.bib` and `.md` files open in it. It runs on 64-bit Windows 10 and 11.
+
+Neither build is signed with a paid certificate, so macOS and Windows warn the first time. [First open](#first-open) shows the two clicks past the warning.
+
+Files open from Finder or Explorer (Open With, a double click, or drag them onto the app), and from the terminal like VS Code's `code`:
 
 ```sh
 editor .            # this folder as a project
 editor main.tex     # the file, in the project it belongs to
 ```
 
-Without Homebrew's cask, Help, "Add editor command for Terminal…" adds the command.
+On the Mac without Homebrew's cask, Help, "Add editor command for Terminal…" adds the command.
 
-On the first start, a short setup asks whether you write LaTeX, Typst or both, and installs exactly that. Nothing has to be on the Mac beforehand.
+On the first start, a short setup asks whether you write LaTeX, Typst or both, and installs exactly that. Nothing has to be on the computer beforehand.
+
+On Windows the setup installs with winget, which comes with Windows, or into the app's folder (`%LOCALAPPDATA%\Editor\Tools`), without an administrator. The compact LaTeX is Tectonic, the complete one MiKTeX, which fetches missing packages on its own.
+
+On the Mac:
 For LaTeX it offers the complete MacTeX (about 7 GB, every package offline) or the compact Tectonic (about 20 MB, fetches packages as documents need them).
 It shows the download and disk size of every part and checks the free space before anything starts. Then it installs in one of three ways:
 
@@ -37,6 +45,8 @@ Git and GitHub are not part of the setup. The git panel sets them up when you wa
 Then a welcome document opens and a tour shows each part of the editor. Help, Editor tour plays it again.
 
 ## First open
+
+### On the Mac
 
 Editor is free and not registered with Apple, so macOS warns the first time you open it. That is expected, and it asks only once.
 The dmg has the same steps in "First open.txt".
@@ -57,15 +67,26 @@ xattr -dr com.apple.quarantine /Applications/Editor.app
 
 If Editor starts from the dmg or from Downloads, a bar offers to move it to Applications. It copies itself there, starts again and ejects the dmg; from Applications it can update itself.
 
+### On Windows
+
+Editor is not signed with a paid certificate yet, so Windows SmartScreen warns the first time you open the installer. That is expected.
+
+1. Open `Editor-<version>-windows-x64-setup.exe` from your Downloads.
+2. Windows says "Windows protected your PC". Click **More info**.
+3. Click **Run anyway**. The installer starts; it needs no administrator password.
+
+The first time you start a live session, Windows asks whether Editor may use the network. Allow it, so that others can reach you.
+
 ## Updates
 
 The app asks GitHub for the newest release a few seconds after it starts and then every six hours. When there is a newer one, a bar offers "Update and restart". The app downloads the dmg, checks it against the checksum GitHub lists for it, its bundle identifier, its version and its signature (intact, and from the same Apple team as the running app when that one has a team; a release signed ad hoc has none), puts it in place of the old app and starts again. Open files are saved first. If anything fails, the old app stays as it was.
+On Windows the app downloads the new installer, checks it against the checksum GitHub lists for it, and runs it once the app has closed; the installer starts the new version.
 An app installed with the Homebrew cask updates through `brew upgrade --cask` instead, so that Homebrew stays in step.
 Only an app bundle updates itself, never a build run with cargo. The only request is one to `api.github.com`, with nothing about you in it.
 
 ### LaTeX updates
 
-MacTeX keeps itself current from inside the app, without Homebrew or the Terminal.
+MiKTeX on Windows updates through its own console. MacTeX keeps itself current from inside the app, without Homebrew or the Terminal.
 
 - Once a week the app asks TeX Live's package manager, `tlmgr`, which packages have newer versions. Asking needs no password, and without internet it simply tries again later.
 - Settings, Writing tools shows the installed TeX Live year, when it last checked and how many updates there are. "Update LaTeX packages" first says why the password is needed, then macOS asks for it once, since MacTeX belongs to the system. `tlmgr` then updates itself and every package. Closing the password dialog changes nothing.
@@ -75,10 +96,11 @@ MacTeX keeps itself current from inside the app, without Homebrew or the Termina
 
 ## Building a release
 
-`scripts/bundle-macos.sh` builds `target/bundle/Editor.app` for both architectures and packs it into a dmg.
-Without signing details it signs ad hoc, which is enough for your own Mac.
-A release needs an Apple Developer ID; the script header lists the environment variables, and `.github/workflows/release.yml` reads them from repository secrets when a `v*` tag is pushed.
-The workflow creates a draft release. Publishing the draft is what the update bar of installed apps sees; the version comes from `Cargo.toml` and must be higher than the last release.
+Pushing a tag such as `v0.1.0` runs `.github/workflows/release.yml`. It builds the universal dmg on macOS and the Windows installer with Inno Setup, and attaches both, with the Windows checksum and the Homebrew cask, to a draft release.
+The version comes from `Cargo.toml` and must be higher than the last release. Test the downloads of the draft, with [docs/windows-test.md](docs/windows-test.md) on a PC, then publish it: installed apps only see published releases.
+
+Without signing details the Mac app is signed ad hoc. With an Apple Developer ID, the workflow reads the certificate and notarization details from repository secrets; the header of `scripts/bundle-macos.sh` lists them.
+Locally, `scripts/bundle-macos.sh` builds `target/bundle/Editor.app` for both architectures and the dmg. For a Windows installer of a branch, run the Windows preview workflow by hand, or label a pull request `windows-preview`.
 
 ## Setup for development
 
@@ -94,6 +116,9 @@ Then download the pinned PDFium build once and start the app with a project fold
 ./scripts/fetch-pdfium.sh
 cargo run --release -p app -- examples/overleaf-sample
 ```
+
+On Windows, install [rustup](https://rustup.rs), the Visual Studio Build Tools with "Desktop development with C++", and Git for Windows, then run the same two lines in Git Bash. `rust-toolchain.toml` pins the Rust version.
+Working notes, the rules of the project and the plans behind it are in [docs/notes](docs/notes/README.md).
 
 Building on Linux also needs the system libraries that GPUI requires (X11, Wayland, Vulkan, fontconfig).
 The Linux build has not been run yet.
@@ -127,12 +152,12 @@ The Recompile menu also offers "Recompile from scratch".
 Navigation uses SyncTeX, so it works for LaTeX only. Typst and Pandoc do not produce SyncTeX data.
 
 - Click a line in the editor to jump to it in the PDF. The Recompile menu can turn this off.
-- Cmd+click (macOS) or Ctrl+click (Linux) in the PDF to jump to the source line.
+- Cmd+click (macOS) or Ctrl+click (Windows, Linux) in the PDF to jump to the source line.
 - The position button in the PDF toolbar makes the PDF follow the editor cursor. It stays off until you turn it on, and Settings, Editor has the same switch.
 
 These work for every engine:
 
-- Drag over text in the PDF to select it, Cmd+C (macOS) or Ctrl+C (Linux) copies it.
+- Drag over text in the PDF to select it, Cmd+C (macOS) or Ctrl+C (Windows, Linux) copies it.
 - Click a link, such as a citation or `\ref`, to jump to its target. Cmd+[ or Alt+Left goes back, Cmd+] or Alt+Right forward again. Links to websites open in the browser, other kinds of external links stay closed.
 
 ## Images
@@ -194,30 +219,38 @@ The branch button in the left rail shows the Git panel in place of the file tree
 - A folder without a repository offers to create one, with `.build/` in `.gitignore`.
 - Click `+` and `-` to stage and unstage. Click a file to open it. `⌘↩` in the message field commits, and open documents are saved first.
 - The branch name opens a list of branches. Type a new name to create one. Git refuses a switch that would overwrite changes.
-- Pull only fast-forwards. Push publishes a new branch to `origin`, and never forces. Merges and conflicts belong in a terminal for now: the panel lists conflicts but does not resolve them.
+- Pull merges what others pushed. A merge that stops at conflicts lists the files; solve them in the editor, then finish the merge in the panel. Push publishes a new branch to `origin`, and never forces.
 - History shows all branches as a graph and loads more while you scroll.
 
 Git runs only while the panel is open, never when a folder opens. Hooks and filters in a repository run as they would in a terminal, so open this panel only for repositories you trust. Build output in `.build` stays out of the lists. Changes appear on their own, but the panel does not fetch: pull or push to talk to a remote.
 
+## Markdown
+
+`.md` files get a live preview next to the text instead of a PDF: tables, images, the title from the front matter, and display formulas typeset with the installed LaTeX. The preview follows the cursor, and a double click jumps to the source. The toolbar inserts tables, code, images, symbols and `[@key]` citations; a `bibliography:` in the front matter feeds the citation picker. Word, HTML and PDF exports go through Pandoc.
+
+## Citations and references
+
+The editor reads every `.bib` and Hayagriva file of the project, also across files that `\input` or `#include` each other.
+
+- `\cite{`, `@` in Typst and `[@` in Markdown open the citation picker; Insert citation (Cmd+Shift+C) opens it anywhere. It searches author, title and year, and cites several keys at once.
+- Unknown keys and labels, and the same work under two keys, are underlined while you type. Problems from BibTeX or Biber's `.blg` appear at their entry.
+- Hovering a key or label shows its entry or the text around it. F12 or Cmd+click goes to its definition.
+
+## Live sessions and reviews
+
+Start live session (the people button in the left rail) shares the open project with others, without a server or an account: they join with the invite code, and everyone edits the same files at once. Each person joins as Editor, Reviewer or Reader. A reviewer's changes stay suggestions with struck-through deletions until you accept them; readers can only comment. The review is saved in the project under `.editor`, so it outlasts the session.
+
+## Reporting a problem
+
+Help, Report a problem opens a prefilled GitHub issue with the app version, the system and the last build log. You only describe what happened. It needs a free GitHub account.
+
 ## Add-ons
 
-An add-on is a program in its own folder, with an `addon.toml` that names it and the permissions it wants. The Add-ons button in the left rail lists what is installed. There you install an add-on from a folder, turn it on or off and remove it. An add-on that is on gets its own button in the rail, and its program starts when you first open that panel. Without an add-on turned on, nothing runs.
-
-Add-ons have no sandbox. They run with your user rights, so install only those you trust. The permissions limit what they can ask the editor for, not what the program can do by itself. Through the editor, they reach only files inside the project and never `.git`.
-
-The Add-ons panel also lists what the catalog offers, with each add-on's description and permissions before you install it. The catalog is the public repository [editor-addons](https://github.com/sudo-Oliver/editor-addons). The editor contacts it only when you first open the panel in a session or press Refresh, through `curl` over https. A failed request leaves a line in the panel and installed add-ons keep working. Downloads must match their sha256 and start turned off. An update stays on only if it asks for no new permissions.
-
-There are no signatures. The checksum protects the download but does not say who wrote it, so installing means trusting that repository.
-
-An add-on can supply entries for the citation picker. In LaTeX, typing `\cite{` or a relative such as `\autocite[p. 3]{` opens the picker when entries exist. Insert citation and Cmd+Shift+C open it in LaTeX and Typst.
-
-An add-on with the `lookup_doi` permission can cite from a DOI: Cmd+Shift+D, Insert > Citation from a DOI, or `Space r` in Vim mode. The editor passes on a DOI from the selection or clipboard and draws the dialog of the add-on. With the cursor in a file that takes no citation, the key goes to the clipboard.
-
-The crate `addon_api` describes the protocol: one JSON message per line over stdin and stdout, with the panel sent as a tree of nodes that the editor draws.
+Add-ons are in development and not part of the releases. A build with `cargo run -p app --features addons` shows the Add-ons panel; the protocol is in the crate `addon_api`, and add-ons live in their own repositories.
 
 ## Settings
 
-The gear at the bottom left opens the settings, the question mark above it lists the keyboard shortcuts. Cmd+, (macOS) or Ctrl+, (Linux) also opens the settings. They are stored in `~/Library/Application Support/io.github.sudo-oliver.editor/settings.toml` on macOS, next to everything else the app keeps, and in `~/.config/editor/settings.toml` on Linux, or under `XDG_CONFIG_HOME` if it is set. Caches and downloads go to `~/Library/Caches/io.github.sudo-oliver.editor`. Project settings stay in `.editor.toml`.
+The gear at the bottom left opens the settings, the question mark above it lists the keyboard shortcuts. Cmd+, (macOS) or Ctrl+, (Windows, Linux) also opens the settings. They are stored in `~/Library/Application Support/io.github.sudo-oliver.editor/settings.toml` on macOS, next to everything else the app keeps, in `%APPDATA%\Editor\settings.toml` on Windows, with caches under `%LOCALAPPDATA%\Editor\Cache`, and in `~/.config/editor/settings.toml` on Linux, or under `XDG_CONFIG_HOME` if it is set. Caches and downloads go to `~/Library/Caches/io.github.sudo-oliver.editor`. Project settings stay in `.editor.toml`.
 
 ## Vim mode
 
@@ -239,6 +272,8 @@ Not included: LSP keys, git hunks, macros, named registers, marks and custom key
 | `app` | Window, panels, editor view, PDF view |
 | `editor_core` | Rope buffer, multicursor, undo, Tree-sitter highlighting |
 | `build` | Compiler runner, log parsers, project settings |
+| `citations` | Citation and label index for LaTeX, Typst and Markdown, built off the main thread |
+| `collab` | Live sessions and reviews: CRDT, roles and peer-to-peer transport |
 | `addon_api` | The messages between the editor and an add-on |
 | `git` | Status, staging, commits, branches and history through the `git` program |
 | `pdf` | PDFium worker thread |

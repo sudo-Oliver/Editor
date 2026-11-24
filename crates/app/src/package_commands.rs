@@ -5,7 +5,6 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    process::Command,
     time::UNIX_EPOCH,
 };
 
@@ -148,7 +147,7 @@ fn find_installed(files: &[&str]) -> Vec<PathBuf> {
     let Some(kpsewhich) = build::find_tool("kpsewhich") else {
         return Vec::new();
     };
-    let Ok(output) = Command::new(kpsewhich).args(files).output() else {
+    let Ok(output) = crate::platform::command(kpsewhich).args(files).output() else {
         return Vec::new();
     };
     String::from_utf8_lossy(&output.stdout).lines().map(str::trim).filter(|line| !line.is_empty()).map(PathBuf::from).collect()

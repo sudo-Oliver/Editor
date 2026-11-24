@@ -25,6 +25,12 @@ jobs:
           CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE_P12 }}
           CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
         run: |
+          # Without a certificate the app is signed ad hoc, and the dmg's
+          # "First open.txt" explains the warning macOS shows then.
+          if [ -z "$CERTIFICATE" ]; then
+            echo "No signing certificate in the secrets: the app gets an ad hoc signature."
+            exit 0
+          fi
           keychain="$RUNNER_TEMP/signing.keychain-db"
           password="$(uuidgen)"
           echo "$CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
@@ -55,3 +61,34 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" target/bundle/*.dmg target/bundle/editor.rb --draft --title "$GITHUB_REF_NAME" --generate-notes
+
+  # The Windows installer, attached to the draft release the dmg job made.
+  windows:
+    needs: dmg
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch PDFium
+        shell: bash
+        run: scripts/fetch-pdfium.sh
+      - name: Build
+        run: cargo build --release -p app
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+      - name: Build the installer
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p target/windows
+          cp target/release/editor.exe target/windows/
+          cp vendor/pdfium/bin/pdfium.dll target/windows/
+          "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" "-DVersion=$version" "-DSource=$(cygpath -w "$PWD/target/windows")" packaging/windows/editor.iss
+          cd target
+          sha256sum "Editor-$version-windows-x64-setup.exe" | cut -d' ' -f1 > "Editor-$version-windows-x64-setup.exe.sha256"
+      - name: Attach to the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: gh release upload "$GITHUB_REF_NAME" target/Editor-*-windows-x64-setup.exe target/Editor-*-windows-x64-setup.exe.sha256

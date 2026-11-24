@@ -28,7 +28,7 @@ pub fn sections(vim_mode: bool, keymap: &Keymap) -> Vec<Section> {
             title: group,
             rows: COMMANDS
                 .iter()
-                .filter(|command| command.group == *group)
+                .filter(|command| command.group == *group && command.available())
                 .filter_map(|command| {
                     let keys = keymap.keys(command);
                     (!keys.is_empty()).then(|| (keys.iter().map(|keys| keymap::display(keys, os)).collect::<Vec<_>>().join(", "), command.label))

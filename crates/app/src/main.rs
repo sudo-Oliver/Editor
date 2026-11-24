@@ -1,3 +1,6 @@
+// A window app on Windows, without a console beside it.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod actions;
 mod addon_panel;
 mod addon_reports;
@@ -18,6 +21,10 @@ mod history;
 mod image_view;
 mod keymap;
 mod markdown;
+mod markdown_preview;
+mod markdown_view;
+mod math_render;
+mod math_text;
 mod marketplace;
 mod material_icons;
 mod nvim_themes;
@@ -28,7 +35,9 @@ mod package_commands;
 mod pdf_text;
 mod pdf_view;
 mod picker;
+mod platform;
 mod problems;
+mod problem_report;
 mod projects;
 mod secrets;
 mod recovery;
@@ -36,6 +45,7 @@ mod settings;
 mod setup;
 mod shell_command;
 mod shortcuts;
+mod single_instance;
 mod smear;
 mod snippets;
 mod status_bar;
@@ -46,9 +56,10 @@ mod theme;
 mod toolchain;
 mod tour;
 mod updater;
+mod window_controls;
 mod workspace;
 
-use std::{ffi::OsString, os::unix::ffi::OsStringExt, path::PathBuf};
+use std::path::PathBuf;
 
 use gpui::{
     App, Bounds, Menu, MenuItem, TitlebarOptions, WindowBounds, WindowOptions, point, prelude::*,
@@ -58,8 +69,13 @@ use gpui::{
 fn main() {
     // Git may start the editor only to ask for a login.
     git_login::answer_if_asked();
+    problem_report::record_crashes();
     // Old macOS versions add a process serial number when Finder starts the app.
     let root = std::env::args_os().skip(1).find(|argument| !argument.to_string_lossy().starts_with("-psn_")).map(PathBuf::from);
+    // A second start on Windows hands its file to the editor that runs.
+    if single_instance::forward(root.as_deref()) {
+        return;
+    }
     // Before anything reads its settings or tools from the old place.
     storage::migrate();
     std::thread::spawn(storage::sweep);
@@ -68,6 +84,7 @@ fn main() {
     // Files and folders from Finder, the Dock and the `editor` command arrive
     // here, at the start as well as while the app runs.
     let (open_sender, mut opened) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+    single_instance::serve(open_sender.clone());
     let application = gpui_platform::application().with_assets(assets::Assets);
     application.on_open_urls(move |urls| {
         for path in urls.iter().filter_map(|url| path_from_url(url)) {
@@ -105,7 +122,10 @@ fn main() {
             cx.spawn(async move |cx| {
                 while let Some(path) = opened.recv().await {
                     let shown = window.update(cx, |workspace, window, cx| {
-                        workspace.open_path(path, window, cx);
+                        // Without a path, a second start only brings the window forward.
+                        if !path.as_os_str().is_empty() {
+                            workspace.open_path(path, window, cx);
+                        }
                         window.activate_window();
                     });
                     if shown.is_err() {
@@ -139,7 +159,21 @@ fn path_from_url(url: &str) -> Option<PathBuf> {
             }
         }
     }
-    Some(PathBuf::from(OsString::from_vec(decoded)))
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Some(PathBuf::from(std::ffi::OsString::from_vec(decoded)))
+    }
+    // `file:///C:/x` holds `/C:/x`, a drive path with a slash in front.
+    #[cfg(not(unix))]
+    {
+        let text = String::from_utf8(decoded).ok()?;
+        let text = match text.as_bytes() {
+            [b'/', _, b':', ..] => &text[1..],
+            _ => &text,
+        };
+        Some(PathBuf::from(text.replace('/', "\\")))
+    }
 }
 
 #[cfg(test)]

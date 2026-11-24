@@ -149,7 +149,13 @@ pub const GROUPS: &[Group] = &[
 
 pub fn table(language: Language, rows: usize, columns: usize) -> String {
     let row = |cell: &str, separator: &str| vec![cell; columns].join(separator);
-    if language == Language::Typst {
+    if language == Language::Markdown {
+        // The first row is the header, which a pipe table needs.
+        let line = format!("| {} |", row("${}", " | "));
+        let rule = format!("|{}", "---|".repeat(columns));
+        let body = vec![line.clone(); rows.saturating_sub(1)];
+        [vec![line, rule], body].concat().join("\n") + "\n"
+    } else if language == Language::Typst {
         let lines = vec![format!("  {},", row("[${}]", ", ")); rows].join("\n");
         format!("#table(\n  columns: {columns},\n{lines}\n)\n")
     } else {
@@ -210,7 +216,7 @@ pub const CODE_LANGUAGES: &[CodeLanguage] = &[
 /// A code block with syntax highlighting. LaTeX takes `listings`, which needs
 /// no `-shell-escape`, unlike `minted`.
 pub fn code_block(language: Language, code: &CodeLanguage) -> String {
-    if language == Language::Typst {
+    if matches!(language, Language::Typst | Language::Markdown) {
         format!("```{}\n${{}}\n```\n", code.typst)
     } else {
         let options = if code.listings.is_empty() { String::new() } else { format!("[{}]", code.listings) };
@@ -220,7 +226,11 @@ pub fn code_block(language: Language, code: &CodeLanguage) -> String {
 
 /// `relative` is seen from where the compiler looks for the file.
 pub fn figure(language: Language, relative: &str) -> String {
-    if language == Language::Typst {
+    if language == Language::Markdown {
+        // Angle brackets let the path hold spaces and parentheses.
+        let path = literal(&relative.replace('<', "%3C").replace('>', "%3E"));
+        format!("![${{Caption}}](<{path}>)\n")
+    } else if language == Language::Typst {
         let path = literal(&relative.replace('\\', "\\\\").replace('"', "\\\""));
         format!("#figure(\n  image(\"{path}\"),\n  caption: [${{Caption}}],\n) <fig:${{label}}>\n")
     } else {
@@ -234,7 +244,11 @@ pub fn figure(language: Language, relative: &str) -> String {
 
 pub fn citation(language: Language, key: &str) -> String {
     let key = literal(key);
-    if language == Language::Typst { format!("@{key}") } else { format!("\\cite{{{key}}}") }
+    match language {
+        Language::Typst => format!("@{key}"),
+        Language::Markdown => format!("[@{key}]"),
+        _ => format!("\\cite{{{key}}}"),
+    }
 }
 
 /// Whether `before`, the text before the cursor, ends in the opening brace of a
@@ -346,6 +360,11 @@ pub fn opens_reference(before: &str) -> bool {
     before.strip_suffix('@').is_some_and(|rest| !rest.ends_with(char::is_alphanumeric) && !rest.contains("//")) || opens_typst_cite(before)
 }
 
+/// Whether `before` ends in the `@` of a Pandoc citation, `[@` or `; @`.
+pub fn opens_markdown_cite(before: &str) -> bool {
+    before.ends_with("[@") || before.ends_with("; @")
+}
+
 /// Whether `before` ends in the `<` of `cite(<`, where the key needs its `>`.
 pub fn opens_typst_cite(before: &str) -> bool {
     before.ends_with("cite(<") && !before.contains("//")
@@ -376,6 +395,9 @@ mod tests {
         let typst = Snippet::parse(&table(Language::Typst, 2, 3), "");
         assert_eq!(typst.slots.len(), 2 * 3);
         assert!(typst.text.starts_with("#table(\n  columns: 3,\n  [], [], [],\n"));
+        let markdown = Snippet::parse(&table(Language::Markdown, 2, 3), "");
+        assert_eq!(markdown.slots.len(), 2 * 3);
+        assert_eq!(markdown.text, "|  |  |  |\n|---|---|---|\n|  |  |  |\n");
     }
 
     #[test]
@@ -384,6 +406,8 @@ mod tests {
         assert!(typst.text.contains("image(\"a\\\"$b.png\")"));
         let latex = Snippet::parse(&figure(Language::Latex, "x.svg"), "");
         assert!(latex.text.contains("\\includesvg[width=\\linewidth]{x.svg}"));
+        let markdown = Snippet::parse(&figure(Language::Markdown, "my <a>.png"), "");
+        assert_eq!(markdown.text, "![Caption](<my %3Ca%3E.png>)\n");
     }
 
     #[test]
@@ -403,6 +427,9 @@ mod tests {
     fn citations_follow_the_language() {
         assert_eq!(citation(Language::Latex, "a"), "\\cite{a}");
         assert_eq!(citation(Language::Typst, "a"), "@a");
+        assert_eq!(citation(Language::Markdown, "a"), "[@a]");
+        assert!(opens_markdown_cite("see [@") && opens_markdown_cite("[@a; @"));
+        assert!(!opens_markdown_cite("mail @"));
     }
 
     #[test]

@@ -299,7 +299,7 @@ fn list_updates() -> Listed {
     let Some(tlmgr) = tlmgr() else {
         return Listed::Failed("MacTeX is not installed.".to_string());
     };
-    let mut command = Command::new(tlmgr);
+    let mut command = crate::platform::command(tlmgr);
     command.args(["update", "--list", "--machine-readable"]);
     match run_for(command, LIST_TIMEOUT) {
         Ok((said, success)) => parse_list(&said, success),
@@ -338,7 +338,7 @@ fn updating(year: u16) -> bool {
     let Ok(pid) = std::fs::read_to_string(update_path(year, ".pid")) else {
         return false;
     };
-    let Ok(output) = Command::new("/bin/ps").args(["-p", pid.trim(), "-o", "command="]).stderr(Stdio::null()).output() else {
+    let Ok(output) = crate::platform::command("/bin/ps").args(["-p", pid.trim(), "-o", "command="]).stderr(Stdio::null()).output() else {
         return false;
     };
     output.status.success() && String::from_utf8_lossy(&output.stdout).contains(UPDATE_NAME)
@@ -415,7 +415,7 @@ fn package_of(file: &str) -> String {
     let Some(tlmgr) = tlmgr() else {
         return fallback;
     };
-    let mut command = Command::new(tlmgr);
+    let mut command = crate::platform::command(tlmgr);
     command.args(["search", "--global", "--file", &format!("/{file}")]);
     match run_for(command, LIST_TIMEOUT) {
         Ok((said, true)) => said

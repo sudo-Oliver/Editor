@@ -5,7 +5,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     time::{Duration, Instant},
 };
 
@@ -69,7 +69,7 @@ pub fn scan() -> Result<Themes, String> {
     let script = directory.path().join("themes.lua");
     let output = directory.path().join("themes.json");
     std::fs::write(&script, SCRIPT).map_err(|error| error.to_string())?;
-    let mut child = Command::new("nvim")
+    let mut child = crate::platform::command("nvim")
         .args(["--headless", "-n", "-i", "NONE", "-c"])
         .arg(format!("luafile {}", script.display()))
         .args(["-c", "qa!"])

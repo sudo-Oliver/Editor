@@ -20,7 +20,13 @@ pub const BUNDLE_ID: &str = "io.github.sudo-oliver.editor";
 const STALE_DOWNLOAD: Duration = Duration::from_secs(14 * 86_400);
 
 fn home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    crate::platform::home()
+}
+
+/// A folder that Windows names in a variable, such as `APPDATA`.
+#[cfg(windows)]
+fn known(variable: &str) -> Option<PathBuf> {
+    std::env::var_os(variable).filter(|value| !value.is_empty()).map(PathBuf::from)
 }
 
 /// `EDITOR_HOME` puts everything in one folder, for tests and for trying things out.
@@ -36,8 +42,12 @@ pub fn data_dir() -> Option<PathBuf> {
     if cfg!(target_os = "macos") {
         return Some(home()?.join("Library/Application Support").join(BUNDLE_ID));
     }
-    let config = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| Some(home()?.join(".config")))?;
-    Some(config.join("editor"))
+    // Roaming, as settings and recovery copies are the user's own.
+    #[cfg(windows)]
+    let config = known("APPDATA").or_else(|| Some(home()?.join("AppData\\Roaming")))?.join("Editor");
+    #[cfg(not(windows))]
+    let config = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| Some(home()?.join(".config")))?.join("editor");
+    Some(config)
 }
 
 /// What can be made or fetched again.
@@ -48,8 +58,12 @@ pub fn cache_dir() -> Option<PathBuf> {
     if cfg!(target_os = "macos") {
         return Some(home()?.join("Library/Caches").join(BUNDLE_ID));
     }
-    let cache = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from).or_else(|| Some(home()?.join(".cache")))?;
-    Some(cache.join("editor"))
+    // Local, as caches stay on this PC.
+    #[cfg(windows)]
+    let cache = known("LOCALAPPDATA").or_else(|| Some(home()?.join("AppData\\Local")))?.join("Editor\\Cache");
+    #[cfg(not(windows))]
+    let cache = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from).or_else(|| Some(home()?.join(".cache")))?.join("editor");
+    Some(cache)
 }
 
 /// Package downloads, kept between tries so that a second try continues.

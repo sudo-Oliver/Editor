@@ -2,13 +2,17 @@
 # Downloads the pinned PDFium build and verifies its checksum.
 #
 #   scripts/fetch-pdfium.sh            the build for this machine, into vendor/pdfium
+#   scripts/fetch-pdfium.sh windows    the Windows x64 build, into vendor/pdfium-windows
 #   scripts/fetch-pdfium.sh x86_64     a macOS build for that architecture, into
 #                                      vendor/pdfium-x86_64 (used by bundle-macos.sh)
 set -eu
 
 release="chromium/8125"
 root="$(cd "$(dirname "$0")/.." && pwd)"
-if [ $# -gt 0 ]; then
+if [ "${1:-}" = "windows" ]; then
+  platform="Windows-x86_64"
+  target="$root/vendor/pdfium-windows"
+elif [ $# -gt 0 ]; then
   platform="Darwin-$1"
   target="$root/vendor/pdfium-$1"
 else
@@ -24,6 +28,11 @@ case "$platform" in
   Darwin-x86_64)
     asset="pdfium-mac-x64.tgz"
     checksum="8a5193535b80c7215d8932f6647ae5097465b6dba2811602c21e120c2af112b0"
+    ;;
+  # Git Bash on Windows, as the CI runner has it.
+  MINGW64_NT*-x86_64 | MSYS_NT*-x86_64 | Windows-x86_64)
+    asset="pdfium-win-x64.tgz"
+    checksum="9a964261760cff52570aabf038ab346d3a5034dd8b30d0d5fe8861235d356b8b"
     ;;
   Linux-x86_64)
     asset="pdfium-linux-x64.tgz"

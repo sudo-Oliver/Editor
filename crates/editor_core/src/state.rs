@@ -599,7 +599,7 @@ impl EditorState {
                 if !selection.is_empty() {
                     snippet.fill_first(&self.buffer.slice(selection.range()));
                 }
-                if math && !self.syntax.in_math(start) {
+                if math && !self.syntax.in_math(self.buffer.rope(), start) {
                     snippet.surround("$", "$");
                 } else {
                     let before = self.char_before(start);
@@ -668,7 +668,7 @@ impl EditorState {
     }
 
     pub fn in_math(&self, offset: usize) -> bool {
-        self.syntax.in_math(offset)
+        self.syntax.in_math(self.buffer.rope(), offset)
     }
 
     /// Pastes one line per selection when the line count matches the cursor count.
@@ -1341,16 +1341,28 @@ fn plan_newline(buffer: &Buffer, language: Language, selection: &Selection) -> P
             (Some('{'), Some('}')) | (Some('['), Some(']')) | (Some('('), Some(')'))
         );
 
+    let ending = line_ending(buffer, line);
     if closes_directly {
         let inner = format!("{current_indent}{INDENT}");
-        let text = format!("\n{inner}\n{current_indent}");
-        return PlannedEdit::cursor_at(selection.range(), text, 1 + inner.len());
+        let text = format!("{ending}{inner}{ending}{current_indent}");
+        return PlannedEdit::cursor_at(selection.range(), text, ending.len() + inner.len());
     }
     let extra = if opens_block { INDENT } else { "" };
     PlannedEdit::cursor_after(
         selection.range(),
-        format!("\n{current_indent}{extra}"),
+        format!("{ending}{current_indent}{extra}"),
     )
+}
+
+/// The line ending the file uses around `line`, so that a file written on
+/// Windows keeps `\r\n` throughout: the one of this line, or of the one before
+/// for the last line.
+fn line_ending(buffer: &Buffer, line: usize) -> &'static str {
+    let ends_crlf = |line: usize| {
+        let end = buffer.line_start(line + 1);
+        end >= 2 && line + 1 < buffer.line_count() && buffer.slice(end - 2..end) == "\r\n"
+    };
+    if ends_crlf(line) || (line > 0 && line + 1 == buffer.line_count() && ends_crlf(line - 1)) { "\r\n" } else { "\n" }
 }
 
 fn opens_latex_environment(line: &str) -> bool {
@@ -1811,6 +1823,19 @@ mod tests {
     }
 
     #[test]
+    fn enter_keeps_the_line_endings_of_the_file() {
+        let mut state = state_at("a\r\nb\r\nc", &[1]);
+        state.newline();
+        assert_eq!(state.buffer().to_string(), "a\r\n\r\nb\r\nc");
+        let mut state = state_at("a\r\nb", &[4]);
+        state.newline();
+        assert_eq!(state.buffer().to_string(), "a\r\nb\r\n");
+        let mut state = state_at("a\nb", &[1]);
+        state.newline();
+        assert_eq!(state.buffer().to_string(), "a\n\nb");
+    }
+
+    #[test]
     fn math_mode_comes_from_the_tree() {
         for (text, language, offset, expected) in [
             ("a $x$ b", Language::Latex, 3, true),
@@ -1821,6 +1846,9 @@ mod tests {
             ("a $x$ b", Language::Typst, 3, true),
             ("a $x$ b", Language::Typst, 1, false),
             ("a $x$ b", Language::Typst, 5, false),
+            ("a $x$ b", Language::Markdown, 3, true),
+            ("a $x$ b", Language::Markdown, 1, false),
+            ("# T\n\n$$\nx\n$$\n", Language::Markdown, 9, true),
         ] {
             assert_eq!(parsed(text, language).in_math(offset), expected, "{text} at {offset}");
         }
