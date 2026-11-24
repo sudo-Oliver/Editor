@@ -7,7 +7,6 @@
 use std::{
     fmt::Write as _,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 const NEW_ISSUE: &str = "https://github.com/sudo-Oliver/Editor/issues/new";
@@ -83,7 +82,7 @@ impl Report {
 
 fn details_section(details: &Details) -> String {
     let mut out = String::from("### Details\n\n");
-    let _ = writeln!(out, "- Editor {} on {}", env!("CARGO_PKG_VERSION"), system());
+    let _ = writeln!(out, "- Editor {} on {}", env!("CARGO_PKG_VERSION"), crate::platform::system());
     if let Some(document) = &details.document {
         let _ = writeln!(out, "- Open file: {document}");
     }
@@ -118,24 +117,9 @@ fn details_section(details: &Details) -> String {
     out
 }
 
-/// The macOS version and the processor, such as `macOS 15.1 (arm64)`.
-fn system() -> String {
-    static SYSTEM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    SYSTEM.get_or_init(read_system).clone()
-}
-
-fn read_system() -> String {
-    let version = Command::new("sw_vers").arg("-productVersion").output().ok().map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string()).filter(|version| !version.is_empty());
-    let name = if cfg!(target_os = "macos") { "macOS" } else { std::env::consts::OS };
-    match version {
-        Some(version) => format!("{name} {version} ({})", std::env::consts::ARCH),
-        None => format!("{name} ({})", std::env::consts::ARCH),
-    }
-}
-
 /// The user's name stays private: `/Users/ada/Thesis` becomes `~/Thesis`.
 fn redact_home(text: &str) -> String {
-    match std::env::var("HOME").ok().filter(|home| home.len() > 1) {
+    match crate::platform::home().and_then(|home| home.to_str().map(str::to_string)).filter(|home| home.len() > 1) {
         Some(home) => text.replace(&home, "~"),
         None => text.to_string(),
     }
@@ -209,7 +193,7 @@ mod tests {
 
     #[test]
     fn reports_carry_the_details_and_hide_the_home_folder() {
-        let home = std::env::var("HOME").unwrap();
+        let home = crate::platform::home().unwrap().to_string_lossy().into_owned();
         let details = Details {
             tools: vec![("LaTeX".into(), format!("found at {home}/tex/pdflatex"))],
             build: Some("failed".into()),

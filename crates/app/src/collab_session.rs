@@ -1949,7 +1949,7 @@ fn decorations_for(state: &CollabState, path: &str) -> Vec<Decoration> {
 }
 
 fn dirs_home() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
+    crate::platform::home().unwrap_or_else(|| PathBuf::from("."))
 }
 
 #[cfg(test)]

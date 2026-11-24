@@ -503,17 +503,20 @@ async fn prepare_format(
     }
 }
 
+/// What separates folders in TeX's search paths: kpathsea takes `;` on Windows.
+const SEARCH_SEPARATOR: char = if cfg!(windows) { ';' } else { ':' };
+
 fn latex_invocation(engine: Engine, input: &str, format: Option<&str>, latexmk: bool, font_map: bool) -> Invocation {
     // A long line limit keeps file names and messages in the log on one line.
     // The limit is set per program, because BibTeX aborts on a value this high.
     let mut env = vec![("max_print_line_pdflatex", "100000".to_string()), ("max_print_line_lualatex", "100000".to_string())];
     if format.is_some() {
-        // The trailing colon keeps the normal search path.
-        env.push(("TEXFORMATS", format!("{OUTPUT_DIRECTORY}:")));
+        // The trailing separator keeps the normal search path.
+        env.push(("TEXFORMATS", format!("{OUTPUT_DIRECTORY}{SEARCH_SEPARATOR}")));
     }
     let font_map = font_map && engine == Engine::PdfLatex;
     if font_map {
-        env.push(("TEXFONTMAPS", format!("{OUTPUT_DIRECTORY}:")));
+        env.push(("TEXFONTMAPS", format!("{OUTPUT_DIRECTORY}{SEARCH_SEPARATOR}")));
     }
     let common = ["-interaction=nonstopmode", "-file-line-error", "-synctex=1", "-no-shell-escape"];
     if latexmk && find_tool("latexmk").is_some() {

@@ -86,7 +86,7 @@ pub fn parse_catalog(text: &str) -> Result<Vec<CatalogEntry>, String> {
 
 pub(crate) fn curl(seconds: &str) -> Command {
     let protocols = if cfg!(test) || std::env::var_os(CATALOG_OVERRIDE).is_some() { "=https,file" } else { "=https" };
-    let mut command = Command::new("curl");
+    let mut command = crate::platform::command("curl");
     command.args(["--fail", "--silent", "--show-error", "--location", "--max-time", seconds]);
     command.args(["--proto", protocols, "--proto-redir", protocols]);
     command
@@ -172,13 +172,13 @@ pub fn install(entry: &CatalogEntry, directory: &Path, previous: Option<&Install
     if sha256_hex(&bytes) != download.sha256.to_ascii_lowercase() {
         return Err(format!("The download of {} does not match its checksum, so it was not installed.", entry.name));
     }
-    let listing = run_tar(Command::new("tar").arg("-tzf").arg(&archive))?;
+    let listing = run_tar(crate::platform::command("tar").arg("-tzf").arg(&archive))?;
     if !archive_paths_stay_inside(&String::from_utf8_lossy(&listing.stdout)) {
         return Err(format!("The download of {} leads outside its folder, so it was not installed.", entry.name));
     }
     let unpacked = workspace.path().join("unpacked");
     std::fs::create_dir(&unpacked).map_err(|error| format!("Cannot unpack the download: {error}"))?;
-    run_tar(Command::new("tar").arg("-xzf").arg(&archive).arg("--no-same-owner").arg("-C").arg(&unpacked))?;
+    run_tar(crate::platform::command("tar").arg("-xzf").arg(&archive).arg("--no-same-owner").arg("-C").arg(&unpacked))?;
     let manifest = addons::read_manifest(&unpacked)?;
     check_against_catalog(&manifest, entry)?;
     if !unpacked.join(&manifest.program).is_file() {
@@ -222,7 +222,7 @@ mod tests {
         fs::write(source.join("addon.toml"), manifest).unwrap();
         fs::write(source.join("run"), "#!/bin/sh\n").unwrap();
         let archive = directory.join("a.tar.gz");
-        let status = Command::new("tar").arg("-czf").arg(&archive).arg("-C").arg(&source).args(["addon.toml", "run"]).status().unwrap();
+        let status = std::process::Command::new("tar").arg("-czf").arg(&archive).arg("-C").arg(&source).args(["addon.toml", "run"]).status().unwrap();
         assert!(status.success());
         (format!("file://{}", archive.display()), sha256_hex(&fs::read(&archive).unwrap()))
     }

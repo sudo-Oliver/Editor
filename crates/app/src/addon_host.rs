@@ -688,7 +688,7 @@ impl Workspace {
         let synctex = self.synctex.as_ref().ok_or("PDF navigation needs a finished LaTeX build.")?;
         let location = synctex
             .forward(&path, line.max(1))
-            .or_else(|| synctex.forward(&path.canonicalize().ok()?, line.max(1)))
+            .or_else(|| synctex.forward(&path.canonicalize().map(crate::platform::plain_path).ok()?, line.max(1)))
             .ok_or("This line has no position in the PDF.")?;
         Ok(Reply::PdfPlace {
             page: location.page + 1,
@@ -769,16 +769,16 @@ impl Workspace {
                     Ok(Reply::Commits { commits })
                 }
                 Request::GitDiff { path, .. } => {
-                    let top = repository.root().canonicalize().unwrap_or_else(|_| repository.root().to_path_buf());
+                    let top = repository.root().canonicalize().map(crate::platform::plain_path).unwrap_or_else(|_| repository.root().to_path_buf());
                     let files: Vec<String> = match path {
                         Some(path) => {
                             let file = addons::resolve_path(&root, &path)?;
-                            let real = file.canonicalize().unwrap_or(file);
+                            let real = file.canonicalize().map(crate::platform::plain_path).unwrap_or(file);
                             vec![real.strip_prefix(&top).map_err(|_| format!("{path} is not in the repository."))?.to_string_lossy().into_owned()]
                         }
                         None => repository.status()?.files.into_iter().map(|file| file.path).collect(),
                     };
-                    let open: Vec<(PathBuf, String)> = open.into_iter().map(|(path, text)| (path.canonicalize().unwrap_or(path), text)).collect();
+                    let open: Vec<(PathBuf, String)> = open.into_iter().map(|(path, text)| (path.canonicalize().map(crate::platform::plain_path).unwrap_or(path), text)).collect();
                     let diff = files
                         .iter()
                         .map(|file| {
@@ -895,8 +895,8 @@ impl Workspace {
             let main = main?.ok_or("This file type has no word count.")?;
             // LaTeX runs in the main file's folder, and Typst resolves `/` from the project.
             let base = if Language::from_path(&main) == Language::Typst { root.clone() } else { main.parent().unwrap_or(&root).to_path_buf() };
-            let open: HashMap<PathBuf, String> = open.into_iter().filter_map(|(path, text)| Some((path.canonicalize().ok()?, text))).collect();
-            let mut read = |path: &Path| path.canonicalize().ok().and_then(|path| open.get(&path).cloned().or_else(|| std::fs::read_to_string(&path).ok()));
+            let open: HashMap<PathBuf, String> = open.into_iter().filter_map(|(path, text)| Some((path.canonicalize().map(crate::platform::plain_path).ok()?, text))).collect();
+            let mut read = |path: &Path| path.canonicalize().map(crate::platform::plain_path).ok().and_then(|path| open.get(&path).cloned().or_else(|| std::fs::read_to_string(&path).ok()));
             let text = read(&main).ok_or_else(|| format!("Cannot read {}", main.display()))?;
             let count = editor_core::word_count::count_words(&main, &text, &base, &mut read);
             let relative = main.strip_prefix(&root).unwrap_or(&main).to_string_lossy().into_owned();

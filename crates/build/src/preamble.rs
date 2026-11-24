@@ -106,12 +106,12 @@ impl Preamble {
             self.mark_unsuitable();
             return false;
         }
-        let main = main.canonicalize().ok();
+        let main = main.canonicalize().map(crate::tools::plain_path).ok();
         let mut lines = String::new();
         let compiler = std::iter::once(compiler.to_path_buf());
         for input in compiler.chain(inputs.iter().map(|input| cwd.join(input))) {
             // The main file changes all the time, and the key covers its preamble.
-            if input.canonicalize().ok() == main {
+            if input.canonicalize().map(crate::tools::plain_path).ok() == main {
                 continue;
             }
             if let Some(line) = input_line(&input) {

@@ -6,7 +6,7 @@ use std::{
     fs::{self, File},
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -537,7 +537,7 @@ pub fn run_pandoc(pandoc: &Path, main: &Path, format: DraftFormat, target: &Path
     let reader = pandoc_reader(main).ok_or_else(|| format!("Pandoc cannot read {}", main.display()))?;
     let temp = start_temp(target)?;
     let name = main.file_name().ok_or_else(|| format!("{} has no file name", main.display()))?;
-    let mut command = Command::new(pandoc);
+    let mut command = crate::platform::command(pandoc);
     command
         .args(pandoc_args(reader, format, &Path::new(".").join(name), temp.path()))
         .envs(build::child_env())

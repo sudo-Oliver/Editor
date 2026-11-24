@@ -120,7 +120,7 @@ impl SyncTex {
         let file = normalize(file);
         self.inputs
             .iter()
-            .find(|(_, path)| **path == file)
+            .find(|(_, path)| same_path(path, &file))
             .map(|(tag, _)| *tag)
     }
 
@@ -231,6 +231,15 @@ fn parse_node(kind: char, record: &str, page: usize) -> Option<Node> {
         depth: size.next().unwrap_or(0.0),
         is_box: matches!(kind, '[' | '(' | 'h' | 'v'),
     })
+}
+
+/// Windows names files without regard to case, and TeX may write `c:` for `C:`.
+fn same_path(left: &Path, right: &Path) -> bool {
+    if cfg!(windows) {
+        left.to_string_lossy().to_lowercase() == right.to_string_lossy().to_lowercase()
+    } else {
+        left == right
+    }
 }
 
 fn normalize(path: &Path) -> PathBuf {

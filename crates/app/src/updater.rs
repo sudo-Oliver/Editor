@@ -10,7 +10,7 @@
 
 use std::{
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -120,7 +120,7 @@ pub fn check() -> Result<Option<Release>, String> {
 
 /// The Editor.app this program runs from, if it runs from one.
 pub fn running_bundle() -> Option<PathBuf> {
-    let program = std::env::current_exe().ok()?.canonicalize().ok()?;
+    let program = std::env::current_exe().ok()?.canonicalize().map(crate::platform::plain_path).ok()?;
     program.ancestors().find(|path| path.extension().is_some_and(|extension| extension == "app")).map(Path::to_path_buf)
 }
 
@@ -132,13 +132,13 @@ fn cask_homebrew() -> Option<PathBuf> {
 }
 
 fn plist_value(bundle: &Path, key: &str) -> Option<String> {
-    let output = Command::new("/usr/libexec/PlistBuddy").args(["-c", &format!("Print :{key}")]).arg(bundle.join("Contents/Info.plist")).output().ok()?;
+    let output = crate::platform::command("/usr/libexec/PlistBuddy").args(["-c", &format!("Print :{key}")]).arg(bundle.join("Contents/Info.plist")).output().ok()?;
     output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 /// The Apple team that signed a bundle, or `None` when it is signed ad hoc.
 fn team(bundle: &Path) -> Option<String> {
-    let output = Command::new("codesign").args(["-dv", "--verbose=2"]).arg(bundle).output().ok()?;
+    let output = crate::platform::command("codesign").args(["-dv", "--verbose=2"]).arg(bundle).output().ok()?;
     let report = String::from_utf8_lossy(&output.stderr);
     report.lines().find_map(|line| line.strip_prefix("TeamIdentifier=")).map(str::trim).filter(|team| *team != "not set").map(str::to_string)
 }
@@ -152,7 +152,7 @@ fn check_bundle(new: &Path, running: &Path, version: &str) -> Result<(), String>
     if plist_value(new, "CFBundleShortVersionString").as_deref() != Some(version) {
         return Err(format!("The download is not version {version}, so it was not installed."));
     }
-    let verify = Command::new("codesign").args(["--verify", "--deep", "--strict"]).arg(new).output().map_err(|error| format!("Cannot check the download: {error}"))?;
+    let verify = crate::platform::command("codesign").args(["--verify", "--deep", "--strict"]).arg(new).output().map_err(|error| format!("Cannot check the download: {error}"))?;
     if !verify.status.success() {
         return Err("The download is damaged, so it was not installed.".to_string());
     }
@@ -168,7 +168,7 @@ struct Mounted(PathBuf);
 
 impl Drop for Mounted {
     fn drop(&mut self) {
-        Command::new("hdiutil").args(["detach", "-force", "-quiet"]).arg(&self.0).status().ok();
+        crate::platform::command("hdiutil").args(["detach", "-force", "-quiet"]).arg(&self.0).status().ok();
     }
 }
 
@@ -200,13 +200,13 @@ pub(crate) fn put_in_place(source: &Path, bundle: &Path, staged: &Path, old: &Pa
             std::fs::remove_dir_all(leftover).map_err(|error| format!("Cannot clean up an earlier try: {error}"))?;
         }
     }
-    let copy = Command::new("ditto").arg(source).arg(staged).output().map_err(|error| format!("Cannot copy the app: {error}"))?;
+    let copy = crate::platform::command("ditto").arg(source).arg(staged).output().map_err(|error| format!("Cannot copy the app: {error}"))?;
     if !copy.status.success() {
         std::fs::remove_dir_all(staged).ok();
         return Err(format!("Cannot copy the app: {}", marketplace::failure(&copy)));
     }
     // Fails when there is no mark, which is fine.
-    Command::new("xattr").args(["-dr", "com.apple.quarantine"]).arg(staged).output().ok();
+    crate::platform::command("xattr").args(["-dr", "com.apple.quarantine"]).arg(staged).output().ok();
     if bundle.exists() {
         std::fs::rename(bundle, old).map_err(|error| format!("Cannot replace the app: {error}"))?;
     }
@@ -222,7 +222,7 @@ pub(crate) fn put_in_place(source: &Path, bundle: &Path, staged: &Path, old: &Pa
 /// until the new one is in place, so a failure leaves the old one working. Blocks.
 pub fn install_from_dmg(dmg: &Path, bundle: &Path, version: &str) -> Result<(), String> {
     let mount = tempfile::Builder::new().prefix("editor-update-").tempdir().map_err(|error| format!("Cannot open the download: {error}"))?;
-    let attach = Command::new("hdiutil")
+    let attach = crate::platform::command("hdiutil")
         .args(["attach", "-nobrowse", "-readonly", "-noautoopen", "-quiet", "-mountpoint"])
         .arg(mount.path())
         .arg(dmg)
@@ -246,7 +246,7 @@ pub fn install_from_dmg(dmg: &Path, bundle: &Path, version: &str) -> Result<(), 
     }
     // An app folder that belongs to another user: macOS asks for the password.
     let script = "/bin/rm -rf \"$3\" \"$4\" && /usr/bin/ditto \"$1\" \"$3\" && { /usr/bin/xattr -dr com.apple.quarantine \"$3\" || true; } && /bin/mv \"$2\" \"$4\" && { /bin/mv \"$3\" \"$2\" || { /bin/mv \"$4\" \"$2\"; exit 1; }; } && /bin/rm -rf \"$4\"";
-    let output = Command::new("osascript")
+    let output = crate::platform::command("osascript")
         .args([
             "-e",
             "on run argv",
@@ -271,7 +271,7 @@ pub fn install_from_dmg(dmg: &Path, bundle: &Path, version: &str) -> Result<(), 
 
 /// Runs `brew upgrade` for the cask. Blocks.
 fn upgrade_with_homebrew(brew: &Path, bundle: &Path, version: &str, cancel: &AtomicBool) -> Result<(), String> {
-    let mut command = Command::new(brew);
+    let mut command = crate::platform::command(brew);
     command
         .args(["upgrade", "--cask", CASK])
         .env("NONINTERACTIVE", "1")
@@ -308,7 +308,7 @@ fn upgrade_with_homebrew(brew: &Path, bundle: &Path, version: &str, cancel: &Ato
 
 /// Starts the app at `bundle` once this process has ended.
 pub(crate) fn relaunch(bundle: &Path) {
-    let mut command = Command::new("/bin/sh");
+    let mut command = crate::platform::command("/bin/sh");
     command
         .args(["-c", "while kill -0 \"$1\" 2>/dev/null; do sleep 0.2; done; exec /usr/bin/open \"$2\"", "sh"])
         .arg(std::process::id().to_string())
@@ -576,7 +576,7 @@ mod tests {
         let dmg = root.join(format!("Editor-{version}.dmg"));
         let folder = tempfile::tempdir().unwrap();
         let bundle = folder.path().join("Editor.app");
-        assert!(Command::new("ditto").arg(root.join("Editor.app")).arg(&bundle).status().unwrap().success());
+        assert!(std::process::Command::new("ditto").arg(root.join("Editor.app")).arg(&bundle).status().unwrap().success());
         std::fs::write(bundle.join("Contents/marker"), "old").unwrap();
         install_from_dmg(&dmg, &bundle, version).unwrap();
         assert!(!bundle.join("Contents/marker").exists());

@@ -986,7 +986,7 @@ impl Workspace {
     /// Opens a folder as the project, or a file in its project. Finder, the
     /// `editor` command and the command line all come here.
     pub fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        let path = match path.canonicalize() {
+        let path = match path.canonicalize().map(crate::platform::plain_path) {
             Ok(path) => path,
             Err(_) => return self.set_status(format!("Cannot find {}.", path.display()), cx),
         };
@@ -997,7 +997,7 @@ impl Workspace {
         let (root, file) = if path.is_dir() {
             (path, None)
         } else {
-            let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from);
+            let home = crate::platform::home().unwrap_or_else(|| PathBuf::from("/"));
             (projects::project_root_for(&path, self.root.as_deref(), &home), Some(path))
         };
         if self.root.as_deref() != Some(root.as_path()) {
@@ -2023,16 +2023,16 @@ impl Workspace {
     }
 
     fn document_at(&self, path: &Path, cx: &App) -> Option<usize> {
-        let wanted = path.canonicalize().ok();
+        let wanted = path.canonicalize().map(crate::platform::plain_path).ok();
         self.documents.iter().position(|document| {
             let open = document.view.read(cx).path.as_deref();
-            open == Some(path) || (wanted.is_some() && open.and_then(|open| open.canonicalize().ok()) == wanted)
+            open == Some(path) || (wanted.is_some() && open.and_then(|open| open.canonicalize().map(crate::platform::plain_path).ok()) == wanted)
         })
     }
 
     fn relative_to_project(&self, path: &Path) -> String {
-        let root = self.root.as_deref().and_then(|root| root.canonicalize().ok());
-        let real = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let root = self.root.as_deref().and_then(|root| root.canonicalize().map(crate::platform::plain_path).ok());
+        let real = path.canonicalize().map(crate::platform::plain_path).unwrap_or_else(|_| path.to_path_buf());
         root.and_then(|root| real.strip_prefix(root).ok().map(|inner| inner.display().to_string()))
             .unwrap_or_else(|| path.display().to_string())
     }
@@ -3492,9 +3492,9 @@ impl Workspace {
             let counted = cx
                 .background_spawn(async move {
                     let open: HashMap<PathBuf, String> =
-                        open.into_iter().filter_map(|(path, text)| Some((path.canonicalize().ok()?, text))).collect();
+                        open.into_iter().filter_map(|(path, text)| Some((path.canonicalize().map(crate::platform::plain_path).ok()?, text))).collect();
                     let mut read = |path: &Path| {
-                        path.canonicalize()
+                        path.canonicalize().map(crate::platform::plain_path)
                             .ok()
                             .and_then(|path| open.get(&path).cloned().or_else(|| text_file::read(&path).ok().map(|loaded| loaded.text)))
                     };
@@ -8090,7 +8090,7 @@ impl Workspace {
             )
         };
         let size = |part: fn(&storage::Usage) -> u64| usage.map(part);
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let home = crate::platform::home();
         let shown = |path: &Path| match home.as_deref().and_then(|home| path.strip_prefix(home).ok()) {
             Some(rest) => format!("~/{}", rest.display()),
             None => path.display().to_string(),

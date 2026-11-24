@@ -5,7 +5,7 @@ use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
     path::{Component, Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     sync::mpsc as std_mpsc,
     thread,
     time::{Duration, Instant},
@@ -140,7 +140,7 @@ pub fn read_manifest(folder: &Path) -> Result<Manifest, String> {
 pub fn install_from(source: &Path, directory: &Path) -> Result<Manifest, String> {
     let manifest = read_manifest(source)?;
     let target = directory.join(&manifest.id);
-    if source.canonicalize().ok() == target.canonicalize().ok() {
+    if source.canonicalize().map(crate::platform::plain_path).ok() == target.canonicalize().map(crate::platform::plain_path).ok() {
         return Err(format!("{} is already installed from this folder.", manifest.name));
     }
     let describe = |error: std::io::Error| format!("Cannot install {}: {error}", manifest.name);
@@ -217,11 +217,11 @@ pub fn resolve_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
     if path.components().any(|part| part.as_os_str() == ".git") {
         return Err(format!("{relative} belongs to Git."));
     }
-    let root = root.canonicalize().map_err(|error| format!("Cannot read the project: {error}"))?;
+    let root = root.canonicalize().map(crate::platform::plain_path).map_err(|error| format!("Cannot read the project: {error}"))?;
     let full = root.join(path);
     // The deepest part that exists shows where a link really leads.
     let existing = full.ancestors().find(|ancestor| ancestor.symlink_metadata().is_ok()).ok_or_else(refused)?;
-    let real = existing.canonicalize().map_err(|_| refused())?;
+    let real = existing.canonicalize().map(crate::platform::plain_path).map_err(|_| refused())?;
     if real.starts_with(&root) { Ok(full) } else { Err(refused()) }
 }
 
@@ -266,7 +266,7 @@ pub struct AddonProcess {
 impl AddonProcess {
     pub fn start(add_on: &Installed) -> Result<(Self, mpsc::Receiver<ProcessEvent>), String> {
         let program = add_on.program();
-        let mut command = Command::new(&program);
+        let mut command = crate::platform::command(&program);
         command.current_dir(&add_on.directory).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         // The add-on can start programs of its own, which should end with it.
         build::prepare_group(&mut command);
