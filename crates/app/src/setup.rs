@@ -60,6 +60,8 @@ pub enum SetupEvent {
     Finished { example: Option<TemplateLanguage>, guided: bool },
     /// Add the `editor` command for the terminal.
     InstallCommand,
+    /// Something did not work: tell the developer.
+    ReportProblem,
 }
 
 pub struct SetupView {
@@ -710,6 +712,9 @@ impl SetupView {
             if !left.is_empty() {
                 elements.push(quiet("setup-later", "Not now, I will install it later", cx, |this, cx| this.go(Step::Done, cx)).into_any_element());
             }
+            if failed {
+                elements.push(quiet("setup-report-install", "Still not working? Report the problem", cx, |_, cx| cx.emit(SetupEvent::ReportProblem)).into_any_element());
+            }
         }
         elements
     }
@@ -793,6 +798,7 @@ impl SetupView {
             })
             .collect();
         let ready = missing.is_empty() && failed.is_empty() && !testing;
+        let probe_failed = !failed.is_empty();
         let background = chosen.contains(&Tool::MacTex) && self.toolchain.read(cx).installing(Tool::MacTex);
         let mut elements = vec![
             title(if ready {
@@ -852,6 +858,9 @@ impl SetupView {
                     )
                     .into_any_element(),
             );
+        }
+        if probe_failed {
+            elements.push(quiet("setup-report-test", "Still not working? Report the problem", cx, |_, cx| cx.emit(SetupEvent::ReportProblem)).into_any_element());
         }
         if !testing {
             elements.push(

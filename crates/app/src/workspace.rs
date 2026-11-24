@@ -1,6 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
@@ -52,6 +52,7 @@ use crate::{
     nvim_themes, package_commands,
     picker::{self, FontSlot, Picker, PickerItem, PickerKind},
     package_check::{self, PackageHint},
+    problem_report,
     problems::{self, Problem},
     recovery,
     settings::{self, Settings},
@@ -74,6 +75,8 @@ use crate::{
 #[cfg(feature = "collab")]
 #[path = "collab_session.rs"]
 mod collab_session;
+#[path = "problem_dialog.rs"]
+mod problem_dialog;
 #[path = "git_sync.rs"]
 mod git_sync;
 #[path = "addon_host.rs"]
@@ -226,6 +229,7 @@ enum Dialog {
     JoinSession,
     GitSignIn,
     CommitDiff,
+    ReportProblem,
 }
 
 /// How the PDF on screen relates to the last build.
@@ -528,6 +532,14 @@ pub struct Workspace {
     /// Held by the backdrop of an open menu, so that keys do not reach the editor.
     menu_focus: FocusHandle,
     status: Option<SharedString>,
+    /// The last status messages, for a problem report.
+    recent_messages: VecDeque<String>,
+    report_field: Entity<EditorView>,
+    report_with_details: bool,
+    report_preview: bool,
+    report_error: Option<SharedString>,
+    /// What the app wrote when it quit unexpectedly last time, until reported.
+    crash_report: Option<String>,
     pdf: Entity<PdfView>,
     /// The preview of a Markdown file, which needs no build.
     markdown: Entity<MarkdownPreview>,
@@ -636,6 +648,12 @@ impl Workspace {
     pub fn new(root: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let pdf = cx.new(PdfView::new);
         let markdown = cx.new(MarkdownPreview::new);
+        // A crash of the last run is offered for a report once the window shows.
+        cx.defer_in(window, |this, window, cx| {
+            if this.crash_report.is_some() {
+                this.open_report(window, cx);
+            }
+        });
         let markdown_subscription = cx.subscribe_in(&markdown, window, |this, _, event, window, cx| match event {
             MarkdownPreviewEvent::Clicked(offset) => {
                 if let Some(view) = this.active_view() {
@@ -712,6 +730,7 @@ impl Workspace {
             HomeEvent::InstallCommand => this.install_shell_command(cx),
             HomeEvent::RunSetup => this.run_setup(window, cx),
             HomeEvent::ShowShortcuts => this.open_dialog(Dialog::Shortcuts, window, cx),
+            HomeEvent::ReportProblem => this.open_report(window, cx),
         });
         let workspace_handle = cx.entity().downgrade();
         let git_panel = cx.new(|cx| GitPanel::new(workspace_handle, cx));
@@ -831,6 +850,16 @@ impl Workspace {
             table_hover: (1, 1),
             menu_focus: cx.focus_handle(),
             status: None,
+            recent_messages: VecDeque::new(),
+            report_field: cx.new(|cx| {
+                let mut view = EditorView::new("", None, cx);
+                view.set_plain();
+                view
+            }),
+            report_with_details: true,
+            report_preview: false,
+            report_error: None,
+            crash_report: problem_report::take_crash(),
             pdf,
             markdown,
             markdown_task: None,
@@ -1785,7 +1814,12 @@ impl Workspace {
     }
 
     fn set_status(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
-        self.status = Some(message.into());
+        let message = message.into();
+        if self.recent_messages.len() == problem_dialog::KEPT_MESSAGES {
+            self.recent_messages.pop_front();
+        }
+        self.recent_messages.push_back(message.to_string());
+        self.status = Some(message);
         cx.notify();
     }
 
@@ -5262,6 +5296,7 @@ impl Workspace {
                 }),
                 entry("Writing tools…", "", |this, window, cx| this.open_dialog(Dialog::Settings(SettingsPage::Tools), window, cx)),
                 entry("Add editor command for Terminal…", "", |this, _, cx| this.install_shell_command(cx)),
+                entry("Report a problem…", "", |this, window, cx| this.open_report(window, cx)),
             ],
             Menu::Compile => {
                 let trigger = self.config.trigger;
@@ -7110,6 +7145,17 @@ impl Workspace {
                     errors - 1
                 )))
             })
+            .child(
+                div()
+                    .id("report-build-problem")
+                    .flex_none()
+                    .cursor_pointer()
+                    .text_size(px(12.))
+                    .text_color(theme::color(theme::palette().ui_muted))
+                    .hover(|style| style.text_color(theme::color(theme::palette().ui_text)))
+                    .on_click(cx.listener(|this, _, window, cx| this.open_report(window, cx)))
+                    .child("Looks like a fault of the editor? Report it"),
+            )
     }
 
     /// A one-line reminder after the user hides the card.
@@ -8148,6 +8194,7 @@ impl Workspace {
         let subscription = cx.subscribe_in(&setup, window, |this, _, event, window, cx| match event {
             SetupEvent::Finished { example, guided } => this.finish_setup(*example, *guided, window, cx),
             SetupEvent::InstallCommand => this.install_shell_command(cx),
+            SetupEvent::ReportProblem => this.open_report(window, cx),
         });
         let focus = setup.read(cx).focus_handle(cx);
         window.focus(&focus, cx);
@@ -8497,6 +8544,7 @@ impl Workspace {
             Dialog::JoinSession => "Join a live session".into(),
             Dialog::GitSignIn => "Sign in".into(),
             Dialog::CommitDiff => self.commit_title(),
+            Dialog::ReportProblem => "Report a problem".into(),
         };
         let content = match dialog {
             Dialog::Settings(SettingsPage::Editor) => self.render_editor_settings(cx),
@@ -8510,6 +8558,7 @@ impl Workspace {
             Dialog::JoinSession => self.render_join_dialog(cx),
             Dialog::GitSignIn => self.render_sign_in(cx),
             Dialog::CommitDiff => self.render_commit_view(),
+            Dialog::ReportProblem => self.render_report_dialog(cx),
         };
         div()
             .id("dialog-backdrop")

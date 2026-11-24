@@ -33,6 +33,7 @@ mod pdf_text;
 mod pdf_view;
 mod picker;
 mod problems;
+mod problem_report;
 mod projects;
 mod secrets;
 mod recovery;
@@ -62,6 +63,7 @@ use gpui::{
 fn main() {
     // Git may start the editor only to ask for a login.
     git_login::answer_if_asked();
+    problem_report::record_crashes();
     // Old macOS versions add a process serial number when Finder starts the app.
     let root = std::env::args_os().skip(1).find(|argument| !argument.to_string_lossy().starts_with("-psn_")).map(PathBuf::from);
     // Before anything reads its settings or tools from the old place.

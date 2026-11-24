@@ -72,6 +72,7 @@ pub enum HomeEvent {
     InstallCommand,
     RunSetup,
     ShowShortcuts,
+    ReportProblem,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2030,6 +2031,9 @@ impl HomeView {
                 }))
                 .child(self.action_card("hub-help-command", "folder", "Terminal command", "Type editor . in Terminal to open a folder here.", cx, |_, _, cx| {
                     cx.emit(HomeEvent::InstallCommand)
+                }))
+                .child(self.action_card("hub-help-report", "log", "Report a problem", "Tell what went wrong. The editor adds the details.", cx, |_, _, cx| {
+                    cx.emit(HomeEvent::ReportProblem)
                 }))
                 .into_any_element(),
         ]
