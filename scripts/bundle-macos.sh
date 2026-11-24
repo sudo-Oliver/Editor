@@ -44,16 +44,16 @@ lipo -create \
   vendor/pdfium-x86_64/lib/libpdfium.dylib \
   -output "$app/Contents/Frameworks/libpdfium.dylib"
 
-# The icon: the SVG drawn once at full size, then every size macOS asks for.
+# The icon: AppIcon.png, made by scripts/make-icon.swift from the artwork,
+# in every size macOS asks for.
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
-qlmanage -t -s 1024 -o "$work" packaging/macos/AppIcon.svg >/dev/null 2>&1
 iconset="$work/AppIcon.iconset"
 mkdir -p "$iconset"
 for size in 16 32 128 256 512; do
-  sips -z "$size" "$size" "$work/AppIcon.svg.png" --out "$iconset/icon_${size}x${size}.png" >/dev/null
+  sips -z "$size" "$size" packaging/macos/AppIcon.png --out "$iconset/icon_${size}x${size}.png" >/dev/null
   double=$((size * 2))
-  sips -z "$double" "$double" "$work/AppIcon.svg.png" --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+  sips -z "$double" "$double" packaging/macos/AppIcon.png --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
 done
 iconutil -c icns "$iconset" -o "$app/Contents/Resources/AppIcon.icns"
 
