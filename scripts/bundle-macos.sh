@@ -115,7 +115,7 @@ on run argv
       set background picture of options to file ".background:background.tiff"
       set position of item "Editor.app" of container window to {300, 200}
       set position of item "Applications" of container window to {660, 200}
-      set position of item "First open.txt" of container window to {480, 345}
+      set position of item "First open.txt" of container window to {480, 310}
       update without registering applications
       delay 1
       close
