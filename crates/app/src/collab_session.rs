@@ -28,6 +28,10 @@ use crate::{editor_view::EditorView, theme};
 const MAX_BLOB_BYTES: usize = 8 * 1024 * 1024;
 /// All files that are not text together, which must fit in one message.
 const MAX_BLOBS_BYTES: usize = 48 * 1024 * 1024;
+/// Text files beyond this, such as large data tables, stay out, so that the
+/// whole project fits one message to a newcomer, with blobs and history.
+const MAX_TEXT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TEXTS_BYTES: usize = 12 * 1024 * 1024;
 
 const TEXT_EXTENSIONS: &[&str] = &["tex", "bib", "sty", "cls", "bst", "bbx", "cbx", "typ", "md", "txt", "toml", "csv", "tikz", "ltx", "dtx", "ins"];
 const BLOB_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "pdf", "eps", "svg"];
@@ -190,6 +194,7 @@ fn collect_project(root: &Path, open: &HashMap<PathBuf, String>) -> (Project, Ha
     let mut shared = HashSet::new();
     let mut skipped = Vec::new();
     let mut blob_bytes = 0;
+    let mut text_bytes = 0;
     for entry in ignore::WalkBuilder::new(root).build().flatten() {
         let path = entry.path();
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
@@ -201,11 +206,12 @@ fn collect_project(root: &Path, open: &HashMap<PathBuf, String>) -> (Project, Ha
         let extension = path.extension().and_then(|extension| extension.to_str()).unwrap_or_default().to_ascii_lowercase();
         if is_text(&relative) {
             match open.get(path).cloned().or_else(|| std::fs::read_to_string(path).ok()) {
-                Some(text) => {
+                Some(text) if text.len() <= MAX_TEXT_BYTES && text_bytes + text.len() <= MAX_TEXTS_BYTES => {
+                    text_bytes += text.len();
                     project.add_file(&relative, &text);
                     shared.insert(relative);
                 }
-                None => skipped.push(relative),
+                _ => skipped.push(relative),
             }
         } else if BLOB_EXTENSIONS.contains(&extension.as_str()) {
             match std::fs::read(path) {
