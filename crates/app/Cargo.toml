@@ -44,6 +44,9 @@ default = ["collab"]
 # Live editing with others, without a server. Nothing of it runs until a
 # session opens.
 collab = ["dep:collab"]
+# Add-ons: the panel, the catalog and the add-ons the user installed. Off
+# until add-ons are ready for users.
+addons = []
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "sync", "time"] }
