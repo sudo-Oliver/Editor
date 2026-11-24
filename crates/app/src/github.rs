@@ -82,11 +82,10 @@ fn request(method: &str, url: &str, header: Option<&str>, form: &[(&str, &str)],
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("Cannot run curl: {error}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        if let Some(header) = header {
+    if let Some(mut stdin) = child.stdin.take()
+        && let Some(header) = header {
             stdin.write_all(header.as_bytes()).map_err(|error| format!("Cannot reach GitHub: {error}"))?;
         }
-    }
     let output = child.wait_with_output().map_err(|error| format!("Cannot reach GitHub: {error}"))?;
     if !output.status.success() {
         return Err(format!("Cannot reach GitHub. Check the internet connection. ({})", String::from_utf8_lossy(&output.stderr).trim()));

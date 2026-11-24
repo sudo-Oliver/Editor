@@ -41,11 +41,10 @@ pub fn pretend_fresh() -> bool {
 
 /// Searches `directory` too, after everything else.
 pub fn add_directory(directory: PathBuf) {
-    if let Ok(mut added) = ADDED_DIRECTORIES.write() {
-        if !added.contains(&directory) {
+    if let Ok(mut added) = ADDED_DIRECTORIES.write()
+        && !added.contains(&directory) {
             added.push(directory);
         }
-    }
 }
 
 /// Stops searching `directory`, for example after its tool was removed.
