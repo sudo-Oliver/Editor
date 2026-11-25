@@ -201,7 +201,7 @@ mod tests {
         let mut text = main.to_string();
         text.replace_range(range, &lines);
         std::fs::write(directory.path().join("main.tex"), text).unwrap();
-        let output = std::process::Command::new("pdflatex")
+        let output = std::process::Command::new(build::find_tool("pdflatex").expect("LaTeX is installed"))
             .args(["-interaction=nonstopmode", "-halt-on-error", "main.tex"])
             .current_dir(directory.path())
             .output()
