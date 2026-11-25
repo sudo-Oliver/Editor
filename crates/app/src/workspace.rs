@@ -8966,6 +8966,20 @@ fn is_unknown_ctrl(key: Key) -> bool {
 /// respects the keyboard layout: on a German layout, `/` is Shift+7 and `{` is Alt+8.
 fn translate_key(keystroke: &Keystroke, map_navigation: bool) -> Option<Key> {
     let name = keystroke.key.as_str();
+    // AltGr is Ctrl+Alt on Windows: with it, `\`, `{` or `@` on a German
+    // layout come as Ctrl keys, but with the character they type.
+    if cfg!(windows)
+        && keystroke.modifiers.control
+        && keystroke.modifiers.alt
+        && let Some(text) = keystroke.key_char.as_deref()
+    {
+        let mut chars = text.chars();
+        if let (Some(ch), None) = (chars.next(), chars.next())
+            && !ch.is_control()
+        {
+            return Some(Key::Char(ch));
+        }
+    }
     if keystroke.modifiers.control {
         let mut chars = name.chars();
         return match (chars.next(), chars.next()) {
@@ -9349,6 +9363,21 @@ fn save_failed(error: &std::io::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn altgr_types_its_character_in_vim() {
+        fn keystroke(source: &'static str, typed: Option<&str>) -> Keystroke {
+            let mut keystroke = Keystroke::parse(source).unwrap();
+            keystroke.key_char = typed.map(ToString::to_string);
+            keystroke
+        }
+        // AltGr+ß and AltGr+7 on a German layout.
+        assert!(matches!(translate_key(&keystroke("ctrl-alt-ß", Some("\\")), true), Some(Key::Char('\\'))));
+        assert!(matches!(translate_key(&keystroke("ctrl-alt-7", Some("{")), true), Some(Key::Char('{'))));
+        // A real Ctrl key stays one.
+        assert!(matches!(translate_key(&keystroke("ctrl-d", None), true), Some(Key::Ctrl('d'))));
+    }
 
     #[test]
     fn the_slanted_edge_decides_which_tab_a_click_hits() {
