@@ -7,7 +7,6 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc,
     },
     time::{Duration, Instant},
 };
@@ -109,6 +108,8 @@ const SYMBOL_COLUMNS: f32 = 11.0;
 const TABLE_GRID: usize = 8;
 const PREVIEW_TOOLBAR_HEIGHT: f32 = 32.0;
 const MIN_PANE_WIDTH: f32 = 160.0;
+/// Changes on disk come in bursts; one refresh takes them all.
+const WATCH_SETTLE: Duration = Duration::from_millis(250);
 /// The rows of the file tree: room to breathe, and one step of indent per level.
 const TREE_ROW: f32 = 34.0;
 const TREE_INSET: f32 = 12.0;
@@ -1163,7 +1164,7 @@ impl Workspace {
     }
 
     fn start_watching(&mut self, root: &Path, cx: &mut Context<Self>) {
-        let (sender, receiver) = mpsc::channel::<()>();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<()>();
         let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
             // Build output would otherwise wake the tree on every compile.
             let relevant = event.is_ok_and(|event| event.paths.iter().any(|path| git_panel::is_watched_path(path)));
@@ -1181,21 +1182,12 @@ impl Workspace {
         }
         self._watcher = Some(watcher);
         self._watch_task = Some(cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(Duration::from_millis(250)).await;
-                let mut changed = false;
-                loop {
-                    match receiver.try_recv() {
-                        Ok(()) => changed = true,
-                        Err(mpsc::TryRecvError::Empty) => break,
-                        Err(mpsc::TryRecvError::Disconnected) => return,
-                    }
-                }
-                if changed
-                    && this
-                        .update(cx, |this, cx| this.refresh_in_background(cx))
-                        .is_err()
-                {
+            // Sleeps until something changes, then takes what follows in the
+            // same burst, such as a checkout, in one refresh.
+            while receiver.recv().await.is_some() {
+                cx.background_executor().timer(WATCH_SETTLE).await;
+                while receiver.try_recv().is_ok() {}
+                if this.update(cx, |this, cx| this.refresh_in_background(cx)).is_err() {
                     return;
                 }
             }
@@ -3281,6 +3273,12 @@ impl Workspace {
             }
             return;
         };
+        // On Windows the app's shortcuts are Ctrl keys, which on the Mac are
+        // Cmd keys and never reach vim: a Ctrl key vim has no use for, such as
+        // Ctrl+1 for the first tab or Ctrl+S, goes to the shortcuts.
+        if cfg!(windows) && takes_keys && is_unknown_ctrl(key) {
+            return;
+        }
         // The input method composes without the user's mappings.
         let step = if view.read(cx).is_composing() {
             Step::Type
@@ -4059,13 +4057,13 @@ impl Workspace {
             view.state.is_dirty() && view.path.as_deref().is_some_and(|open| open.starts_with(&path))
         });
         cx.spawn_in(window, async move |this, cx| {
-            let message = format!("Move “{name}” to the Trash?");
+            let message = format!("Move “{name}” to the {}?", crate::platform::TRASH);
             let detail = if unsaved {
                 if cfg!(windows) { "Windows can put it back from the Recycle Bin. Unsaved changes stay in Earlier versions." } else { "Finder can put it back from the Trash. Unsaved changes stay in Earlier versions." }
             } else {
                 if cfg!(windows) { "Windows can put it back from the Recycle Bin." } else { "Finder can put it back from the Trash." }
             };
-            if ask(&this, cx, PromptLevel::Warning, &message, detail, &["Move to Trash", "Cancel"]).await != Some(0) {
+            if ask(&this, cx, PromptLevel::Warning, &message, detail, &[crate::platform::MOVE_TO_TRASH, "Cancel"]).await != Some(0) {
                 return;
             }
             let target = path.clone();
@@ -4083,7 +4081,7 @@ impl Workspace {
                 .await;
             this.update_in(cx, |this, window, cx| {
                 if let Err(error) = trashed {
-                    this.set_status(format!("Cannot move {name} to the Trash: {error}"), cx);
+                    this.set_status(format!("Cannot move {name} to the {}: {error}", crate::platform::TRASH), cx);
                     return;
                 }
                 for document in &this.documents {
@@ -4103,7 +4101,7 @@ impl Workspace {
                 this.collapsed.retain(|folder| !folder.starts_with(&path));
                 this.refresh_from_disk(cx);
                 this.tree_cursor = this.tree_cursor.min(this.entries.len().saturating_sub(1));
-                this.set_status(format!("Moved {name} to the Trash"), cx);
+                this.set_status(format!("Moved {name} to the {}", crate::platform::TRASH), cx);
             })
             .ok();
         })
@@ -4172,7 +4170,7 @@ impl Workspace {
             let target = path.clone();
             entries.push(MenuEntry {
                 danger: true,
-                ..entry("Move to Trash", if vim { "D" } else { "" }, move |this, window, cx| this.trash_tree_entry(target.clone(), window, cx))
+                ..entry(crate::platform::MOVE_TO_TRASH, if vim { "D" } else { "" }, move |this, window, cx| this.trash_tree_entry(target.clone(), window, cx))
             });
         }
         entries.push(menu_separator());
@@ -5300,15 +5298,21 @@ impl Workspace {
             Menu::Tree => self.tree_menu_entries(),
             Menu::EditorContext => self.editor_menu_entries(cx),
             Menu::Symbols | Menu::Table | Menu::Code => Vec::new(),
-            Menu::Help => vec![
-                entry("Editor tour", "", |this, window, cx| this.start_tour(window, cx)),
-                entry("Keyboard shortcuts", "", |this, window, cx| {
-                    this.open_dialog(Dialog::Shortcuts, window, cx);
-                }),
-                entry("Writing tools…", "", |this, window, cx| this.open_dialog(Dialog::Settings(SettingsPage::Tools), window, cx)),
-                entry("Add editor command for Terminal…", "", |this, _, cx| this.install_shell_command(cx)),
-                entry("Report a problem…", "", |this, window, cx| this.open_report(window, cx)),
-            ],
+            Menu::Help => {
+                let mut entries = vec![
+                    entry("Editor tour", "", |this, window, cx| this.start_tour(window, cx)),
+                    entry("Keyboard shortcuts", "", |this, window, cx| {
+                        this.open_dialog(Dialog::Shortcuts, window, cx);
+                    }),
+                    entry("Writing tools…", "", |this, window, cx| this.open_dialog(Dialog::Settings(SettingsPage::Tools), window, cx)),
+                ];
+                // The Windows installer puts the command on the PATH itself.
+                if !cfg!(windows) {
+                    entries.push(entry("Add editor command for Terminal…", "", |this, _, cx| this.install_shell_command(cx)));
+                }
+                entries.push(entry("Report a problem…", "", |this, window, cx| this.open_report(window, cx)));
+                entries
+            }
             Menu::Compile => {
                 let trigger = self.config.trigger;
                 let engine = self.config.engine;
@@ -5398,8 +5402,7 @@ impl Workspace {
 
     fn menu_button(&self, menu: Menu, label: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
         let open = self.open_menu == Some(menu);
-        div()
-            .id(label)
+        window_controls::clickable(div().id(label))
             .px(px(9.))
             .h(px(28.))
             .flex()
@@ -5515,8 +5518,7 @@ impl Workspace {
                     .items_center()
                     .gap(px(2.))
                     .child(
-                        div()
-                            .id("hub-logo")
+                        window_controls::clickable(div().id("hub-logo"))
                             .relative()
                             .children(self.tour_anchor(TourAnchor::Home))
                             .flex()
@@ -5558,8 +5560,7 @@ impl Workspace {
                     .justify_center()
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(
-                        div()
-                            .id("project-title")
+                        window_controls::clickable(div().id("project-title"))
                             .px(px(8.))
                             .py(px(2.))
                             .rounded(px(4.))
