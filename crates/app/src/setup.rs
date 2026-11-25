@@ -113,7 +113,9 @@ impl SetupView {
         let way = {
             let state = toolchain.read(cx);
             let found = state.found(Tool::Homebrew) != Found::Missing;
-            if found && (state.use_homebrew || cfg!(windows)) { Way::Homebrew } else { Way::AppFolder }
+            // On Windows the app installs everything itself: winget put programs
+            // where the running app does not see them.
+            if found && state.use_homebrew && !cfg!(windows) { Way::Homebrew } else { Way::AppFolder }
         };
         Self {
             step: if again { Step::Choose } else { Step::Welcome },
@@ -538,7 +540,7 @@ impl SetupView {
             .flex_col()
             .gap(px(8.))
             // On Windows winget is there or not: nothing to install first.
-            .when(!cfg!(windows) || has_homebrew, |ways| ways.child(self.option("setup-way-brew", homebrew_label, homebrew_text, self.way == Way::Homebrew, cx, |this, cx| this.choose_way(Way::Homebrew, cx))))
+            .when(!cfg!(windows), |ways| ways.child(self.option("setup-way-brew", homebrew_label, homebrew_text, self.way == Way::Homebrew, cx, |this, cx| this.choose_way(Way::Homebrew, cx))))
             .child(self.option(
                 "setup-way-app",
                 app_label,

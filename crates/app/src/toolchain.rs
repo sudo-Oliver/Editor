@@ -570,8 +570,12 @@ fn found_program(program: &str, tools: Option<&Path>) -> Found {
 
 pub fn find(tool: Tool) -> Found {
     match tool {
-        // TeX Live or MiKTeX, wherever its installer put it.
-        Tool::MacTex if cfg!(windows) => found_program("pdflatex", tools_directory().as_deref()),
+        // TeX Live, wherever its installer put it: `tlmgr` next to `pdflatex`
+        // tells it from MiKTeX, which latexmk and the log reading do not suit.
+        Tool::MacTex if cfg!(windows) => match found_program("pdflatex", tools_directory().as_deref()) {
+            Found::Own(path) if !path.with_file_name("tlmgr.bat").is_file() => Found::Missing,
+            found => found,
+        },
         Tool::MacTex => {
             let pdflatex = Path::new(MACTEX_TEXBIN).join("pdflatex");
             if pdflatex.is_file() && !build::pretend_fresh() { Found::Own(pdflatex) } else { Found::Missing }
@@ -596,6 +600,9 @@ pub fn latex() -> Found {
 /// Whether a complete TeX distribution is there, such as MacTeX or TeX Live
 /// from Homebrew, rather than only Tectonic.
 pub fn complete_latex() -> bool {
+    if cfg!(windows) {
+        return find(Tool::MacTex) != Found::Missing;
+    }
     let tools = tools_directory();
     find(Tool::MacTex) != Found::Missing || ["latexmk", "pdflatex"].iter().any(|program| matches!(found_program(program, tools.as_deref()), Found::Own(_)))
 }
@@ -820,8 +827,6 @@ fn texlive_profile(root: &str) -> String {
         format!("TEXMFSYSVAR {root}/texmf-var"),
         "instopt_adjustpath 1".to_string(),
         "instopt_adjustrepo 1".to_string(),
-        "instopt_desktop_integration 0".to_string(),
-        "instopt_file_assocs 0".to_string(),
         "instopt_letter 0".to_string(),
         "instopt_portable 0".to_string(),
         "instopt_write18_restricted 1".to_string(),
@@ -836,9 +841,9 @@ fn texlive_profile(root: &str) -> String {
         + "\n"
 }
 
-/// "[1234/4512, 10:31/38:02] install: pgf [4.6M]" as 1234 of 4512.
+/// "Installing [1234/5281, time/total: 10:31/38:02]: pgf [4.6M]" as 1234 of 5281.
 fn texlive_progress(line: &str) -> Option<(u64, u64)> {
-    let (done, rest) = line.strip_prefix('[')?.split_once('/')?;
+    let (done, rest) = line.strip_prefix("Installing [")?.split_once('/')?;
     let total = rest.split(|ch: char| !ch.is_ascii_digit()).next()?;
     Some((done.parse().ok()?, total.parse().ok()?))
 }
@@ -913,7 +918,8 @@ fn install_texlive(package: &Package, received: &Arc<AtomicU64>, line: &Arc<Mute
     received.store(0, Ordering::Relaxed);
     say("");
     let total = package.bytes;
-    let last = Arc::new(Mutex::new(String::new()));
+    // The last lines that are not progress: install-tl says why before it stops.
+    let last = Arc::new(Mutex::new(Vec::<String>::new()));
     let (mut child, group) = build::spawn_group(&mut command).map_err(|error| format!("Cannot start TeX Live's installer: {error}"))?;
     let readers: Vec<_> = [child.stdout.take().map(|out| Box::new(out) as Box<dyn std::io::Read + Send>), child.stderr.take().map(|err| Box::new(err) as Box<dyn std::io::Read + Send>)]
         .into_iter()
@@ -928,7 +934,9 @@ fn install_texlive(package: &Package, received: &Arc<AtomicU64>, line: &Arc<Mute
                     } else if !text.is_empty()
                         && let Ok(mut last) = last.lock()
                     {
-                        *last = text;
+                        last.push(text);
+                        let extra = last.len().saturating_sub(3);
+                        last.drain(..extra);
                     }
                 }
             })
@@ -954,8 +962,8 @@ fn install_texlive(package: &Package, received: &Arc<AtomicU64>, line: &Arc<Mute
     }
     let bin = root.join("bin\\windows");
     if !status.success() || !bin.join("pdflatex.exe").is_file() {
-        let last = last.lock().map(|last| last.clone()).unwrap_or_default();
-        return Err(format!("TeX Live could not be installed: {last}"));
+        let said = last.lock().map(|last| last.iter().filter(|line| *line != "Stopping here.").cloned().collect::<Vec<_>>().join(" ")).unwrap_or_default();
+        return Err(format!("TeX Live could not be installed. {said}"));
     }
     build::add_directory(bin);
     std::fs::remove_dir_all(&work).ok();
@@ -1927,8 +1935,8 @@ mod tests {
 
     #[test]
     fn texlive_says_how_far_it_is() {
-        assert_eq!(texlive_progress("[1234/4512, 10:31/38:02] install: pgf [4.6M]"), Some((1234, 4512)));
-        assert_eq!(texlive_progress("[1/4512, ??:??/??:??] install: a2ping [27k]"), Some((1, 4512)));
+        assert_eq!(texlive_progress("Installing [1234/5281, time/total: 10:31/38:02]: pgf [4.6M]"), Some((1234, 5281)));
+        assert_eq!(texlive_progress("Installing [0001/5281, time/total: ??:??/??:??]: 12many [3k]"), Some((1, 5281)));
         assert_eq!(texlive_progress("Installing to: C:/Users/x/TeXLive"), None);
         let profile = texlive_profile("C:/Users/Ada Lovelace/AppData/Local/Programs/TeXLive");
         assert!(profile.contains("TEXDIR C:/Users/Ada Lovelace/AppData/Local/Programs/TeXLive\n"));
