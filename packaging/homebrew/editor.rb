@@ -2,6 +2,7 @@
 # checksum and attaches the result to the release; copy it into the tap
 # repository (sudo-Oliver/homebrew-tap, Casks/editor.rb) to publish it. Then:
 #
+#   brew trust sudo-oliver/tap
 #   brew install --cask sudo-oliver/tap/editor
 cask "editor" do
   version "@VERSION@"
@@ -12,7 +13,7 @@ cask "editor" do
   desc "Local LaTeX and Typst editor with a live PDF preview"
   homepage "https://github.com/sudo-Oliver/Editor"
 
-  depends_on macos: ">= :big_sur"
+  depends_on macos: :big_sur
 
   app "Editor.app"
   binary "#{appdir}/Editor.app/Contents/Resources/bin/editor"

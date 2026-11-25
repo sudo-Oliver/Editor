@@ -27,7 +27,7 @@
 
 | | Download | Guide |
 | --- | --- | --- |
-| **macOS** 11 or later, Apple silicon and Intel | `Editor-<version>.dmg` from the [latest release](https://github.com/sudo-Oliver/Editor/releases/latest), or `brew install --cask sudo-oliver/tap/editor` | [Editor on macOS](docs/macos.md) |
+| **macOS** 11 or later, Apple silicon and Intel | `Editor-<version>.dmg` from the [latest release](https://github.com/sudo-Oliver/Editor/releases/latest), or with Homebrew (see the guide) | [Editor on macOS](docs/macos.md) |
 | **Windows** 10 and 11, 64-bit | `Editor-<version>-windows-x64-setup.exe` from the [latest release](https://github.com/sudo-Oliver/Editor/releases/latest) | [Editor on Windows](docs/windows.md) |
 
 Neither build is signed with a paid certificate yet, so macOS and Windows warn the first time you open it. The guide for your system shows the few clicks past the warning.

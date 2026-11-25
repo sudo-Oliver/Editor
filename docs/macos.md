@@ -8,9 +8,10 @@ Editor runs on Apple silicon and Intel Macs with macOS 11 or later.
 
 Download `Editor-<version>.dmg` from the [latest release](https://github.com/sudo-Oliver/Editor/releases/latest), open it and drag Editor into Applications.
 
-With Homebrew, this does the same and adds the `editor` command:
+With Homebrew, this does the same and adds the `editor` command. Homebrew asks you to trust a tap other than its own once:
 
 ```sh
+brew trust sudo-oliver/tap
 brew install --cask sudo-oliver/tap/editor
 ```
 
