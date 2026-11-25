@@ -69,6 +69,37 @@ fn extra_directories() -> Vec<PathBuf> {
     if let Some(profile) = variable("USERPROFILE") {
         directories.push(profile.join(".cargo\\bin"));
     }
+    // What installers added to the PATH since the app started, such as winget,
+    // which puts a program's own folder there when it cannot make a link.
+    directories.extend(registry_path());
+    directories
+}
+
+/// The `PATH` of this user and of the system as the registry has it now, not
+/// as it was when the app started.
+#[cfg(windows)]
+fn registry_path() -> Vec<PathBuf> {
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegGetValueW};
+    let wide = |text: &str| text.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    let value = wide("Path");
+    let mut directories = Vec::new();
+    for (key, subkey) in [(HKEY_CURRENT_USER, "Environment"), (HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment")] {
+        let subkey = wide(subkey);
+        let mut buffer = vec![0u16; 16_384];
+        let mut bytes = (buffer.len() * 2) as u32;
+        // SAFETY: both names end in a zero, and `bytes` is the size of `buffer`.
+        // A REG_EXPAND_SZ value comes back with its %VARIABLES% expanded.
+        let status = unsafe {
+            RegGetValueW(key, subkey.as_ptr(), value.as_ptr(), RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ, std::ptr::null_mut(), buffer.as_mut_ptr().cast(), &mut bytes)
+        };
+        if status != 0 {
+            continue;
+        }
+        // An expanded value can be shorter than the size Windows reports.
+        let filled = &buffer[..(bytes as usize / 2).min(buffer.len())];
+        let text = String::from_utf16_lossy(&filled[..filled.iter().position(|&unit| unit == 0).unwrap_or(filled.len())]);
+        directories.extend(text.split(';').map(str::trim).filter(|part| !part.is_empty()).map(PathBuf::from));
+    }
     directories
 }
 

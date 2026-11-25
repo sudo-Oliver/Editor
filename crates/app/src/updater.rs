@@ -320,10 +320,11 @@ fn upgrade_with_homebrew(brew: &Path, bundle: &Path, version: &str, cancel: &Ato
 fn run_installer_after_exit(setup: &Path, folder: &Path) {
     let quote = |path: &Path| path.display().to_string().replace('\'', "''");
     let script = format!(
-        "Wait-Process -Id {} -ErrorAction SilentlyContinue; Start-Process -Wait -FilePath '{}' -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART'; Remove-Item -Force '{}'; Start-Process -FilePath '{}'",
+        "Wait-Process -Id {} -ErrorAction SilentlyContinue; Start-Process -Wait -FilePath '{}' -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART'; Remove-Item -Recurse -Force '{}'; Start-Process -FilePath '{}'",
         std::process::id(),
         quote(setup),
-        quote(setup),
+        // The download's own folder, which holds nothing else; never any other.
+        quote(setup.parent().filter(|folder| folder.file_name().is_some_and(|name| name.to_string_lossy().starts_with("editor-update-"))).unwrap_or(setup)),
         quote(&folder.join("editor.exe")),
     );
     let mut command = crate::platform::command("powershell");
@@ -592,12 +593,15 @@ mod tests {
 
     #[test]
     fn a_release_needs_a_dmg_with_a_checksum() {
+        let asset = format!("Editor-0.2.0{ASSET_SUFFIX}");
         let json = r#"{"tag_name":"v0.2.0","html_url":"https://github.com/x/releases/v0.2.0","draft":false,"prerelease":false,"assets":[
             {"name":"editor.rb","browser_download_url":"https://x/editor.rb","size":10,"digest":"sha256:aa"},
-            {"name":"Editor-0.2.0.dmg","browser_download_url":"https://x/Editor-0.2.0.dmg","size":34000000,"digest":"sha256:ABCD"}]}"#;
+            {"name":"ASSET","browser_download_url":"https://x/ASSET","size":34000000,"digest":"sha256:ABCD"}]}"#
+            .replace("ASSET", &asset);
+        let json = json.as_str();
         let release = parse_release(json).unwrap().unwrap();
         assert_eq!(release.version, "0.2.0");
-        assert_eq!(release.asset_url, "https://x/Editor-0.2.0.dmg");
+        assert_eq!(release.asset_url, format!("https://x/{asset}"));
         assert_eq!(release.sha256, "abcd");
         let unchecked = json.replace(",\"digest\":\"sha256:ABCD\"", "");
         assert_eq!(parse_release(&unchecked).unwrap(), None);

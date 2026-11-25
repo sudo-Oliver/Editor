@@ -27,7 +27,7 @@ const ALWAYS: &[&str] = &["pdftex_dl14.map", "ps2pk35.map", "cm.map"];
 fn system_map() -> Option<&'static Path> {
     static MAP: OnceLock<Option<PathBuf>> = OnceLock::new();
     MAP.get_or_init(|| {
-        let output = Command::new(find_tool("kpsewhich")?).arg("pdftex.map").output().ok()?;
+        let output = crate::process::no_window(Command::new(find_tool("kpsewhich")?).arg("pdftex.map")).output().ok()?;
         let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
         (output.status.success() && path.is_file()).then_some(path)
     })

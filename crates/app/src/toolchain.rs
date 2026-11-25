@@ -115,7 +115,7 @@ impl Tool {
 
     pub fn purpose(self) -> &'static str {
         match self {
-            Self::MacTex if cfg!(windows) => "LaTeX as most people on Windows use it. Fetches each package once, the first time a document needs it.",
+            Self::MacTex if cfg!(windows) => "Everything LaTeX has, on your PC. Every package works at once, also without internet.",
             Self::MacTex => "Everything LaTeX has, on your Mac. Every package works at once, also without internet.",
             Self::Tectonic => "Turns LaTeX into a PDF. Small, and fetches each package the first time a document uses it.",
             Self::Typst => "Turns Typst into a PDF. Typst is a newer, simpler language for documents.",
@@ -151,7 +151,7 @@ impl Tool {
     pub fn note(self) -> Option<&'static str> {
         match self {
             Self::Tectonic => Some("The first PDF downloads the LaTeX packages it uses, so it needs the internet and takes a minute."),
-            Self::MacTex if cfg!(windows) => Some("Installs for you alone, without a password. The first PDF of a document fetches the packages it uses."),
+            Self::MacTex if cfg!(windows) => Some("Installs for you alone, without a password, then fetches every LaTeX package once, as MacTeX has them. That takes about an hour, only this once."),
             Self::MacTex => Some("macOS asks for your password once the download is done, to install into /Library/TeX."),
             _ => None,
         }
@@ -321,6 +321,12 @@ fn executable(name: &str) -> String {
 }
 
 pub fn tools_directory() -> Option<PathBuf> {
+    // Programs stay on this PC on Windows: the roaming profile, which school
+    // and office PCs copy at every sign-in, keeps only the user's own files.
+    #[cfg(windows)]
+    if std::env::var_os("EDITOR_HOME").is_none() {
+        return Some(PathBuf::from(std::env::var_os("LOCALAPPDATA").filter(|local| !local.is_empty())?).join("Editor\\Tools"));
+    }
     Some(settings::config_dir()?.join("tools"))
 }
 
@@ -360,6 +366,10 @@ pub fn register_installed() {
                     build::add_directory(folder);
                 }
             }
+        }
+        #[cfg(windows)]
+        if mingit_commands(&tools).join("git.exe").is_file() {
+            build::add_directory(mingit_commands(&tools));
         }
     }
     if let Some(manual) = manual_directory().filter(|manual| manual.is_dir()) {
@@ -471,7 +481,11 @@ pub fn probe(language: Tool) -> Result<(), String> {
         }
         Tool::MacTex | Tool::Tectonic => {
             if let Some(pdflatex) = build::find_tool("pdflatex") {
-                let mut command = crate::platform::command(pdflatex);
+                let mut command = crate::platform::command(&pdflatex);
+                // MiKTeX fetches what the test needs without a dialog per package.
+                if cfg!(windows) && pdflatex.with_file_name("initexmf.exe").is_file() {
+                    command.arg("--enable-installer");
+                }
                 command.args(["-interaction=nonstopmode", "-halt-on-error", "probe.tex"]);
                 ("probe.tex", command)
             } else {
@@ -529,9 +543,12 @@ fn probe_failure(said: &str) -> String {
         return "The compiler needs the internet the first time, to fetch packages. Connect and try again.".to_string();
     }
     if lower.contains("cannot be opened") || lower.contains("operation not permitted") || lower.contains("killed") {
-        return "macOS did not let the compiler run. Install it again with the button.".to_string();
+        return if cfg!(windows) { "Windows did not let the compiler run. Install it again with the button." } else { "macOS did not let the compiler run. Install it again with the button." }.to_string();
     }
-    let last = said.lines().map(str::trim).rfind(|line| !line.is_empty()).unwrap_or("It ended without a PDF.");
+    // TeX's own error first. MiKTeX adds notes such as "major issue: … not
+    // checked for updates", which say nothing about the document.
+    let lines = || said.lines().map(str::trim).filter(|line| !line.is_empty() && !line.contains(" issue: "));
+    let last = lines().find(|line| line.starts_with('!')).or_else(|| lines().last()).unwrap_or("It ended without a PDF.");
     format!("The test document did not compile: {last}")
 }
 
@@ -761,7 +778,7 @@ fn install_package(tool: Tool, package: &Package, tools: &Path, received: &Atomi
         return Err("Stopped.".to_string());
     }
     if cfg!(windows) {
-        return install_miktex(&file, &set_stage);
+        return install_miktex(&file, &set_stage, cancel);
     }
     // Said before the dialog comes up, so that it does not come out of nowhere.
     let place = if tool == Tool::MacTex { "/Library/TeX" } else { "a folder for the whole Mac" };
@@ -792,15 +809,39 @@ fn install_package(tool: Tool, package: &Package, tools: &Path, received: &Atomi
 
 /// Runs MiKTeX's own installer for this user, without questions and without
 /// an administrator, and lets it fetch missing packages without asking. Blocks.
-fn install_miktex(installer: &Path, set_stage: &dyn Fn(&str)) -> Result<(), String> {
+fn install_miktex(installer: &Path, set_stage: &dyn Fn(&str), cancel: &AtomicBool) -> Result<(), String> {
     set_stage("Installing MiKTeX. This takes a few minutes.");
-    let output = crate::platform::command(installer)
-        .args(["--unattended", "--private", "--auto-install=yes"])
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| format!("Cannot start the MiKTeX installer: {error}"))?;
-    if !output.status.success() {
-        return Err(format!("Cannot install MiKTeX: {}", marketplace::failure(&output)));
+    let mut command = crate::platform::command(installer);
+    command.args(["--unattended", "--private", "--auto-install=yes"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+    // Its own group, so that Stop also ends what the installer started.
+    let (mut child, group) = build::spawn_group(&mut command).map_err(|error| format!("Cannot start the MiKTeX installer: {error}"))?;
+    // Read while it runs, so that a full pipe never stops it.
+    let stderr = child.stderr.take().map(|mut stderr| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut stderr, &mut text).ok();
+            text
+        })
+    });
+    let status = loop {
+        if cancel.load(Ordering::Relaxed) {
+            match &group {
+                Some(group) => group.terminate(),
+                None => drop(child.kill()),
+            }
+            let _ = child.wait();
+            return Err("Stopped.".to_string());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(POLL),
+            Err(error) => return Err(format!("The MiKTeX installer stopped: {error}")),
+        }
+    };
+    let error = stderr.and_then(|reader| reader.join().ok()).unwrap_or_default();
+    if !status.success() {
+        let error = error.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("it ended with an error").trim().to_string();
+        return Err(format!("Cannot install MiKTeX: {error}"));
     }
     std::fs::remove_file(installer).ok();
     Ok(())
@@ -929,6 +970,10 @@ fn remove_versions_except(tools: &Path, pinned: &[(&str, &str)]) {
 /// of output, to show what it is doing, and `cancel` stops it.
 pub fn install_with_homebrew(brew: &Path, tool: Tool, line: &Arc<Mutex<String>>, cancel: &AtomicBool) -> Result<(), String> {
     let formula = tool.formula().ok_or_else(|| format!("{} does not install {} here.", Tool::Homebrew.name(), tool.name()))?;
+    install_formula(brew, formula, line, cancel)
+}
+
+fn install_formula(brew: &Path, formula: &str, line: &Arc<Mutex<String>>, cancel: &AtomicBool) -> Result<(), String> {
     let mut command = crate::platform::command(brew);
     if cfg!(windows) {
         // For this user, so without an administrator, and without questions.
@@ -942,8 +987,22 @@ pub fn install_with_homebrew(brew: &Path, tool: Tool, line: &Arc<Mutex<String>>,
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    let status = run_showing_progress(&mut command, Tool::Homebrew.name(), line, cancel, |_| true)?;
+    // winget ends with 0x8A15002B when the package is there already.
+    if status.success() || (cfg!(windows) && status.code().is_some_and(|code| code as u32 == 0x8A15_002B)) {
+        Ok(())
+    } else {
+        let last = line.lock().map(|line| line.clone()).unwrap_or_default();
+        Err(format!("{} could not install {formula}: {last}", Tool::Homebrew.name()))
+    }
+}
+
+/// Runs `command` until it ends, with its last line of output in `line`.
+/// `cancel` stops it and what it started. Blocks.
+/// Only lines that `shown` lets through count.
+fn run_showing_progress(command: &mut std::process::Command, name: &str, line: &Arc<Mutex<String>>, cancel: &AtomicBool, shown: fn(&str) -> bool) -> Result<std::process::ExitStatus, String> {
     // Its own group, so that stopping also stops the downloads it started.
-    let (mut child, group) = build::spawn_group(&mut command).map_err(|error| format!("Cannot start {}: {error}", Tool::Homebrew.name()))?;
+    let (mut child, group) = build::spawn_group(command).map_err(|error| format!("Cannot start {name}: {error}"))?;
     let readers: Vec<_> = [child.stdout.take().map(|out| Box::new(out) as Box<dyn std::io::Read + Send>), child.stderr.take().map(|err| Box::new(err) as Box<dyn std::io::Read + Send>)]
         .into_iter()
         .flatten()
@@ -951,8 +1010,9 @@ pub fn install_with_homebrew(brew: &Path, tool: Tool, line: &Arc<Mutex<String>>,
             let line = line.clone();
             std::thread::spawn(move || {
                 for text in BufReader::new(stream).lines().map_while(Result::ok) {
-                    let text = text.trim().to_string();
-                    if !text.is_empty()
+                    // winget redraws its progress bar with `\r`: the last drawing counts.
+                    let text = text.rsplit('\r').find(|part| !part.trim().is_empty()).unwrap_or_default().trim().to_string();
+                    if !text.is_empty() && shown(&text)
                         && let Ok(mut last) = line.lock() {
                             *last = text;
                         }
@@ -973,17 +1033,32 @@ pub fn install_with_homebrew(brew: &Path, tool: Tool, line: &Arc<Mutex<String>>,
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => std::thread::sleep(POLL),
-            Err(error) => return Err(format!("Homebrew stopped: {error}")),
+            Err(error) => return Err(format!("{name} stopped: {error}")),
         }
     };
     for reader in readers {
         let _ = reader.join();
     }
+    Ok(status)
+}
+
+/// Turns MiKTeX Basic into the complete MiKTeX, with every package, as
+/// MacTeX has them: no document waits for a download later. Blocks.
+fn complete_miktex(line: &Arc<Mutex<String>>, cancel: &AtomicBool) -> Result<(), String> {
+    let miktex = build::find_tool("miktex").ok_or("MiKTeX is not installed.")?;
+    // Missing packages come without a question also outside the app.
+    if let Some(initexmf) = build::find_tool("initexmf") {
+        crate::platform::command(initexmf).arg("--set-config-value=[MPM]AutoInstall=1").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().ok();
+    }
+    let mut command = crate::platform::command(miktex);
+    command.args(["--verbose", "packages", "upgrade", "complete"]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // One line per package, instead of each download's address and speed.
+    let status = run_showing_progress(&mut command, "MiKTeX", line, cancel, |text| text.starts_with("Installing package") || text.starts_with("Sorry"))?;
     if status.success() {
         Ok(())
     } else {
         let last = line.lock().map(|line| line.clone()).unwrap_or_default();
-        Err(format!("Homebrew could not install {formula}: {last}"))
+        Err(format!("MiKTeX could not fetch all its packages: {last}"))
     }
 }
 
@@ -1131,6 +1206,10 @@ impl Toolchain {
             // winget installs MiKTeX for this user, as the app's own way does.
             Tool::MacTex if cfg!(windows) && self.use_homebrew && homebrew().is_some() => Method::Homebrew,
             Tool::MacTex | Tool::Homebrew => Method::Package,
+            // On Windows the app's own download is quicker and works at once:
+            // winget puts single programs such as Typst on a PATH the running
+            // app does not see. winget stays for MiKTeX only.
+            _ if cfg!(windows) => Method::Release,
             _ if self.use_homebrew && tool.formula().is_some() => Method::Homebrew,
             _ => Method::Release,
         }
@@ -1224,7 +1303,7 @@ impl Toolchain {
             if !self.jobs.contains_key(&Tool::Homebrew) && !self.waiting.is_empty() {
                 // Homebrew failed or was stopped, so its formulas cannot follow.
                 for tool in std::mem::take(&mut self.waiting) {
-                    self.errors.insert(tool, "Needs Homebrew, which is not installed.".to_string());
+                    self.errors.insert(tool, format!("Needs {}, which is not installed.", Tool::Homebrew.name()));
                 }
             }
             return cx.notify();
@@ -1242,7 +1321,20 @@ impl Toolchain {
         let handle = JobHandle { received: job.received.clone(), line: job.line.clone(), cancel: job.cancel.clone() };
         self.jobs.insert(tool, job);
         let install = cx.background_spawn(async move {
-            install(&handle)?;
+            if cfg!(windows) && tool == Tool::MacTex {
+                // LaTeX builds wait while MiKTeX writes its package database.
+                build::set_tex_busy(true);
+                let installed = install(&handle).and_then(|()| {
+                    if let Ok(mut line) = handle.line.lock() {
+                        *line = "Fetching all LaTeX packages, as MacTeX has them…".to_string();
+                    }
+                    complete_miktex(&handle.line, &handle.cancel)
+                });
+                build::set_tex_busy(false);
+                installed?;
+            } else {
+                install(&handle)?;
+            }
             if tool == Tool::Tectonic {
                 // Its first run builds its formats and fetches the common
                 // packages, which takes a minute or two. Done here, the user's
@@ -1350,6 +1442,61 @@ pub fn install_developer_tools(cancel: &AtomicBool) -> Result<(), String> {
     Ok(())
 }
 
+/// MinGit, the smallest official Git for Windows, for PCs without winget.
+#[cfg(windows)]
+const MINGIT: Release = Release {
+    version: "2.56.1",
+    url: "https://github.com/git-for-windows/git/releases/download/v2.56.1.windows.1/MinGit-2.56.1-64-bit.zip",
+    sha256: "4a92850b6e917da4fd010669b614b55dccf5b0ec333a534cc4be4700dfefdafd",
+    bytes: 39_849_768,
+    program: "cmd\\git.exe",
+};
+
+/// Where MinGit's `git.exe` is once the app installed it.
+#[cfg(windows)]
+fn mingit_commands(tools: &Path) -> PathBuf {
+    tools.join(format!("git-{}", MINGIT.version)).join("cmd")
+}
+
+/// Installs git for this user, without an administrator: through winget when
+/// it is there, otherwise MinGit into the app's folder. Blocks.
+#[cfg(windows)]
+pub fn install_git(line: &Arc<Mutex<String>>, cancel: &AtomicBool) -> Result<(), String> {
+    if let Some(winget) = homebrew() {
+        match install_formula(&winget, "Git.Git", line, cancel) {
+            Err(error) if error == "Stopped." => return Err(error),
+            Err(_) => {}
+            Ok(()) => return Ok(()),
+        }
+    }
+    if let Ok(mut line) = line.lock() {
+        *line = format!("Downloading git ({} MB)…", MINGIT.bytes.div_ceil(1_000_000));
+    }
+    let tools = tools_directory().ok_or("Cannot find the folder for programs.")?;
+    std::fs::create_dir_all(&tools).map_err(|error| format!("Cannot make the folder for git: {error}"))?;
+    let workspace = tempfile::Builder::new().prefix(".download-").tempdir_in(&tools).map_err(|error| format!("Cannot prepare the download: {error}"))?;
+    let archive = workspace.path().join("download");
+    download(MINGIT.url, &archive, false, DOWNLOAD_SECONDS, &AtomicU64::new(0), cancel).map_err(|error| if error == "Stopped." { error } else { format!("Cannot download git. {error}") })?;
+    if file_digest::<sha2::Sha256>(&archive)? != MINGIT.sha256 {
+        return Err("The download of git is not the expected file, so it was not installed.".to_string());
+    }
+    // MinGit is a whole folder, unlike the single programs of the others.
+    let unpacked = workspace.path().join("unpacked");
+    std::fs::create_dir(&unpacked).map_err(|error| format!("Cannot unpack git: {error}"))?;
+    marketplace::run_tar(crate::platform::command(crate::platform::system_program("tar")).arg("-xf").arg(&archive).arg("-C").arg(&unpacked))?;
+    if !unpacked.join(MINGIT.program).is_file() {
+        return Err("The download of git has no program.".to_string());
+    }
+    let commands = mingit_commands(&tools);
+    let destination = commands.parent().ok_or("Cannot install git.")?;
+    if destination.exists() {
+        std::fs::remove_dir_all(destination).map_err(|error| format!("Cannot replace the old git: {error}"))?;
+    }
+    std::fs::rename(&unpacked, destination).map_err(|error| format!("Cannot install git: {error}"))?;
+    build::add_directory(commands);
+    Ok(())
+}
+
 /// Apple's tools first, then Homebrew's own installer. Blocks.
 fn install_homebrew(tools: &Path, job: &JobHandle) -> Result<(), String> {
     if let Ok(mut line) = job.line.lock() {
@@ -1395,7 +1542,7 @@ pub fn tool_rows(toolchain: &Entity<Toolchain>, tools: &[Tool], manage: bool, cx
             let error = state.errors.get(&tool).cloned();
             let method = state.method(tool);
             let status: SharedString = match job {
-                _ if waiting => "Waiting for Homebrew…".into(),
+                _ if waiting => format!("Waiting for {}…", Tool::Homebrew.name()).into(),
                 Some(job) if job.downloading() => {
                     let total = tool.megabytes().unwrap_or(0);
                     let done = (job.progress() * total as f32).round() as u64;
@@ -1404,7 +1551,7 @@ pub fn tool_rows(toolchain: &Entity<Toolchain>, tools: &[Tool], manage: bool, cx
                         None => format!("Downloading… {done} of {total} MB").into(),
                     }
                 }
-                Some(_) if method == Method::Homebrew => "Installing with Homebrew…".into(),
+                Some(_) if method == Method::Homebrew => format!("Installing with {}…", Tool::Homebrew.name()).into(),
                 Some(job) => job.line().into(),
                 None => describe(&found).into(),
             };
@@ -1425,6 +1572,7 @@ pub fn tool_rows(toolchain: &Entity<Toolchain>, tools: &[Tool], manage: bool, cx
                 div().into_any_element()
             };
             let details = (found == Found::Missing && !busy).then(|| match (method, tool.formula(), tool.megabytes()) {
+                (Method::Homebrew, Some(formula), _) if cfg!(windows) => format!("Runs winget install {formula} for you."),
                 (Method::Homebrew, Some(formula), _) if state.found(Tool::Homebrew) != Found::Missing => format!("Runs brew install {formula} for you."),
                 (Method::Homebrew, Some(formula), _) => format!("Installs Homebrew first, then runs brew install {formula}."),
                 (Method::Package, _, Some(megabytes)) => {
@@ -1500,7 +1648,13 @@ pub fn size(megabytes: u64) -> String {
 
 /// Said once under the rows, so that nobody wonders what the app does to the computer.
 pub fn promise(toolchain: &Entity<Toolchain>, cx: &App) -> &'static str {
-    if toolchain.read(cx).use_homebrew {
+    if cfg!(windows) {
+        if toolchain.read(cx).use_homebrew && homebrew().is_some() {
+            "winget installs these for you alone, without an administrator. Settings > Apps removes them, like any other program."
+        } else {
+            "The compilers stay in the app's own folder, and you can remove them any time. MiKTeX installs for you alone, without an administrator."
+        }
+    } else if toolchain.read(cx).use_homebrew {
         "Homebrew installs these like any other formula. brew uninstall removes them. MacTeX goes to /Library/TeX, as with its own installer."
     } else {
         "The compilers stay in the app's own folder, and you can remove them any time. Only MacTeX goes to /Library/TeX and asks for your password."
@@ -1635,7 +1789,7 @@ mod tests {
 
         let good = release(url, sha256, bytes);
         let program = install_release(Tool::Typst, &good, &tools, &received, &cancel).unwrap();
-        assert_eq!(program, tools.join("typst-9/typst"));
+        assert_eq!(program, tools.join("typst-9").join(executable("typst")));
         assert_eq!(received.load(Ordering::Relaxed), bytes);
         let leftovers: Vec<_> = fs::read_dir(&tools).unwrap().map(|entry| entry.unwrap().file_name()).collect();
         assert_eq!(leftovers, ["typst-9"]);
@@ -1691,12 +1845,12 @@ mod tests {
         assert_eq!(program_in(directory.path(), "typst"), None);
         let nested = directory.path().join("typst-aarch64-apple-darwin");
         fs::create_dir_all(&nested).unwrap();
-        fs::write(nested.join("typst"), "").unwrap();
-        assert_eq!(program_in(directory.path(), "typst"), Some(nested.join("typst")));
+        fs::write(nested.join(executable("typst")), "").unwrap();
+        assert_eq!(program_in(directory.path(), "typst"), Some(nested.join(executable("typst"))));
         let pandoc = directory.path().join("pandoc-3.14-arm64/bin");
         fs::create_dir_all(&pandoc).unwrap();
-        fs::write(pandoc.join("pandoc"), "").unwrap();
-        assert_eq!(program_in(directory.path(), "pandoc"), Some(pandoc.join("pandoc")));
+        fs::write(pandoc.join(executable("pandoc")), "").unwrap();
+        assert_eq!(program_in(directory.path(), "pandoc"), Some(pandoc.join(executable("pandoc"))));
     }
 
     #[test]
@@ -1704,6 +1858,9 @@ mod tests {
         assert!(probe_failure("error: failed to connect to relay.fullyjustified.net").contains("internet"));
         assert!(probe_failure("zsh: killed     tectonic").contains("Install it again"));
         assert_eq!(probe_failure("! LaTeX Error: File `x.sty' not found.\n"), "The test document did not compile: ! LaTeX Error: File `x.sty' not found.");
+        // MiKTeX's notes about itself are not the error.
+        let miktex = "! Emergency stop.\nl.3 \\foo\npdflatex: major issue: So far, you have not checked for MiKTeX updates.\n";
+        assert_eq!(probe_failure(miktex), "The test document did not compile: ! Emergency stop.");
     }
 
     #[test]
@@ -1712,9 +1869,16 @@ mod tests {
         assert_eq!(Tool::for_language("Typst"), Some(Tool::Typst));
         assert_eq!(Tool::for_language("Pandoc"), Some(Tool::Pandoc));
         assert_eq!(Tool::MacTex.language(), Tool::Tectonic.language());
-        assert_eq!(Tool::MacTex.formula(), None);
-        assert!(Tool::MacTex.package().is_some_and(|package| package.signer.is_some() && package.sha512_url.is_some()));
-        assert!(Tool::Homebrew.package().is_some_and(|package| package.sha256.is_some_and(|sha256| sha256.len() == 64)));
+        if cfg!(windows) {
+            // MiKTeX, from CTAN with a pinned checksum or through winget.
+            assert_eq!(Tool::MacTex.formula(), Some("MiKTeX.MiKTeX"));
+            assert!(Tool::MacTex.package().is_some_and(|package| package.sha256.is_some_and(|sha256| sha256.len() == 64)));
+            assert!(Tool::Homebrew.package().is_none());
+        } else {
+            assert_eq!(Tool::MacTex.formula(), None);
+            assert!(Tool::MacTex.package().is_some_and(|package| package.signer.is_some() && package.sha512_url.is_some()));
+            assert!(Tool::Homebrew.package().is_some_and(|package| package.sha256.is_some_and(|sha256| sha256.len() == 64)));
+        }
     }
 
     #[test]

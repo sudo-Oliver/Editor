@@ -50,7 +50,7 @@ Name: "desktopicon"; Description: "A shortcut on the desktop"; Flags: unchecked
 
 [Registry]
 ; The file types the editor opens, for this user.
-Root: HKCU; Subkey: "Software\Classes\Editor.Document"; ValueType: string; ValueData: "Document"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\Editor.Document"; ValueType: string; ValueData: "Editor document"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\Editor.Document\DefaultIcon"; ValueType: string; ValueData: "{app}\editor.exe,0"
 Root: HKCU; Subkey: "Software\Classes\Editor.Document\shell\open\command"; ValueType: string; ValueData: """{app}\editor.exe"" ""%1"""
 Root: HKCU; Subkey: "Software\Classes\.tex\OpenWithProgids"; ValueType: string; ValueName: "Editor.Document"; ValueData: ""; Flags: uninsdeletevalue
@@ -63,6 +63,10 @@ Root: HKCU; Subkey: "Software\Classes\.typ"; ValueType: string; ValueData: "Edit
 Root: HKCU; Subkey: "Software\Classes\Directory\shell\Editor"; ValueType: string; ValueData: "Open in Editor"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\Directory\shell\Editor"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\editor.exe,0"
 Root: HKCU; Subkey: "Software\Classes\Directory\shell\Editor\command"; ValueType: string; ValueData: """{app}\editor.exe"" ""%1"""
+; The same on the empty space inside an open folder.
+Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\Editor"; ValueType: string; ValueData: "Open in Editor"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\Editor"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\editor.exe,0"
+Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\Editor\command"; ValueType: string; ValueData: """{app}\editor.exe"" ""%V"""
 ; The `editor` command for the terminal, as on the Mac.
 Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}\bin"; Check: NeedsAddPath(ExpandConstant('{app}\bin'))
 
