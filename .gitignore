@@ -3,3 +3,6 @@
 /vendor/pdfium/
 /vendor/pdfium-*/
 .DS_Store
+
+# Private to-do notes
+/tasks.txt

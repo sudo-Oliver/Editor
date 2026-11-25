@@ -1,0 +1,148 @@
+# User guide
+
+[Back to the README](../README.md) · [Editor on macOS](macos.md) · [Editor on Windows](windows.md)
+
+Shortcuts name the Mac key first. On Windows, Ctrl takes the place of Cmd.
+
+## Compiling
+
+Opening a project compiles it. Output goes to `.build/` inside the project.
+Compile on save is the default. The Recompile menu also offers compile on type, which saves your files automatically after the delay.
+
+Optional settings live in `.editor.toml`:
+
+```toml
+main = "paper.tex"      # file to compile, otherwise found automatically
+engine = "lualatex"     # typst, tectonic, pdflatex, lualatex or pandoc
+trigger = "type"        # save or type
+debounce_ms = 300       # delay for compile on type
+```
+
+When a build fails, a card above the PDF names the file and line, shows the source and explains the error in plain language.
+The last good PDF stays visible below it. If the compiler still produced a PDF, the card says that it may be incomplete.
+
+LaTeX keeps state in files such as `.aux`, and a failed run can leave them broken.
+The build after a failed or stopped run therefore starts without them, and the PDF is kept.
+A build that fails where LaTeX reads those files runs once more without them.
+The Recompile menu also offers "Recompile from scratch".
+
+`-shell-escape` stays off and `latexmk` ignores `latexmkrc` files, because both can run commands from a document.
+
+## PDF navigation
+
+Navigation uses SyncTeX, so it works for LaTeX only. Typst and Pandoc do not produce SyncTeX data.
+
+- Click a line in the editor to jump to it in the PDF. The Recompile menu can turn this off.
+- Cmd+click (macOS) or Ctrl+click (Windows, Linux) in the PDF to jump to the source line.
+- The position button in the PDF toolbar makes the PDF follow the editor cursor. It stays off until you turn it on, and Settings, Editor has the same switch.
+
+These work for every engine:
+
+- Drag over text in the PDF to select it, Cmd+C (macOS) or Ctrl+C (Windows, Linux) copies it.
+- Click a link, such as a citation or `\ref`, to jump to its target. Cmd+[ or Alt+Left goes back, Cmd+] or Alt+Right forward again. Links to websites open in the browser, other kinds of external links stay closed.
+
+## Images
+
+Clicking a PNG, JPEG, WebP or SVG in the file tree opens it in a tab, with its resolution and file size. Copy include puts the matching code for the engine on the clipboard, for example `\includegraphics{images/photo.png}` or `#image("images/photo.png")`. Export saves a copy elsewhere. Cmd+W closes the tab.
+
+## Toolbar
+
+The buttons insert code in the language of the open file, LaTeX or Typst.
+
+- The symbol palette holds templates, Greek letters, operators, relations and arrows. Outside a formula, a symbol gets `$` around it. The palette stays open until you press `Esc` or click elsewhere.
+- The table button inserts a table of the size you pick in the grid.
+- The figure button lists the project's images, and the citation button lists the entries of its `.bib` files.
+
+After an insert, `Tab` moves to the next empty field. `Esc` or moving the cursor away ends this. In Vim mode, a button click switches to Insert mode.
+
+### Files
+
+The buttons in the file tree's header make a new file or folder, add files from elsewhere and close the panel. New entries go to the last clicked folder, or the folder of the last clicked file. Nothing gets replaced: a name that exists shows an error, and added files with such a name are left out. Clicking the header folds the tree, so that the outline gets its space.
+
+### File menu
+
+The File menu creates files and folders (New file with Cmd+N), adds files from elsewhere, and copies the open file as `a-copy.tex`, with its unsaved changes. Version history opens the Git panel with the history showing.
+
+Word count works from the main file through `\input`, `\include`, `\subfile` and `#include`, and open documents count with their unsaved text. Comments, math, code, labels, citations and the preamble do not count, and neither does text that only macros or Typst functions generate. Files it cannot find are named.
+
+Downloads never change the project, and a failed one leaves an existing file as it was:
+
+- **PDF** copies the preview byte for byte, so its layout is the same. If the PDF has errors, is out of date or has undefined references, a dialog says so first and offers to recompile.
+- **Source (.zip)** holds everything except `.git`, `.build` and `.DS_Store`, also what `.gitignore` lists, because a build can need it. Files that may hold secrets, such as `.env`, are asked about. Every entry is compared with its original before the archive is saved. A file that cannot be read stops the export. Typst `@preview` and Tectonic packages download at compile time and are not in the archive.
+- **Word, HTML and Markdown drafts** come from Pandoc, which has to be installed. They do not keep the layout: page margins, the document class and fonts are lost. A dialog lists what Pandoc reports as left out, before the draft is saved. Pandoc does not report everything for Typst, such as shapes and show rules, so compare with the PDF. A Typst project with `@preview` packages only converts once they are in the local cache.
+
+### Packages
+
+LaTeX errors about a missing package get a button that adds `\\usepackage` to the preamble of the main file. After each build, the editor also looks through the whole project:
+
+- A command or environment from a known package, with that package not loaded, gets a quiet underline.
+- A package that nothing in the project uses gets one too. This covers only packages whose commands are all known and that change nothing by being loaded, such as `booktabs`.
+
+The editor stays silent when it cannot be sure: with an unknown document class or package, with `.sty` or `.cls` files in the project, or when the project defines the name itself. The compiler's error still has the button then.
+
+`Cmd+.` applies the fix on the line of the cursor, in Vim's Normal mode also `Space .`. A strip below the editor explains the underline on the cursor's line. All details lists every hint with its button. Undo reverts a fix. Turn the underlines off with Settings, Editor, Package hints, or `package_hints = false` in `settings.toml`.
+
+### Suggestions
+
+A popup at the cursor offers commands and names while you type, without AI or network access:
+
+- LaTeX: after `\\` commands and your own `\\newcommand` macros, in `\\begin{` environments, and in `\\ref{` and its relatives the labels of the open documents.
+- Typst: after `#` keywords, functions and your own `#let` names, after `@` the labels of the open documents.
+
+While the popup shows, `Tab` accepts, `Up` and `Down` or `Ctrl+N` and `Ctrl+P` choose, and `Esc` closes it. `Enter` always starts a new line. Prose gets no popup, and `\\cite{` keeps its citation picker. In Vim mode, the popup works in Insert mode and `.` repeats an accepted suggestion. Turn it off with Settings, Editor, Auto suggestions, or `auto_suggestions = false` in `settings.toml`.
+
+Some LaTeX output needs a package in the preamble, which the editor does not add: `graphicx` for figures, `svg` for SVG figures and `amsmath` for matrices and cases.
+
+## Git
+
+The branch button in the left rail shows the Git panel in place of the file tree. It uses the `git` program, so Git LFS, hooks, SSH keys, credential helpers and commit signing work as they do in a terminal.
+
+- A folder without a repository offers to create one, with `.build/` in `.gitignore`.
+- Click `+` and `-` to stage and unstage. Click a file to open it. `⌘↩` in the message field commits, and open documents are saved first.
+- The branch name opens a list of branches. Type a new name to create one. Git refuses a switch that would overwrite changes.
+- Pull merges what others pushed. A merge that stops at conflicts lists the files; solve them in the editor, then finish the merge in the panel. Push publishes a new branch to `origin`, and never forces.
+- History shows all branches as a graph and loads more while you scroll.
+
+Git runs only while the panel is open, never when a folder opens. Hooks and filters in a repository run as they would in a terminal, so open this panel only for repositories you trust. Build output in `.build` stays out of the lists. Changes appear on their own, but the panel does not fetch: pull or push to talk to a remote.
+
+## Markdown
+
+`.md` files get a live preview next to the text instead of a PDF: tables, images, the title from the front matter, and display formulas typeset with the installed LaTeX. The preview follows the cursor, and a double click jumps to the source. The toolbar inserts tables, code, images, symbols and `[@key]` citations; a `bibliography:` in the front matter feeds the citation picker. Word, HTML and PDF exports go through Pandoc.
+
+## Citations and references
+
+The editor reads every `.bib` and Hayagriva file of the project, also across files that `\input` or `#include` each other.
+
+- `\cite{`, `@` in Typst and `[@` in Markdown open the citation picker; Insert citation (Cmd+Shift+C) opens it anywhere. It searches author, title and year, and cites several keys at once.
+- Unknown keys and labels, and the same work under two keys, are underlined while you type. Problems from BibTeX or Biber's `.blg` appear at their entry.
+- Hovering a key or label shows its entry or the text around it. F12 or Cmd+click goes to its definition.
+
+## Live sessions and reviews
+
+Start live session (the people button in the left rail) shares the open project with others, without a server or an account: they join with the invite code, and everyone edits the same files at once. Each person joins as Editor, Reviewer or Reader. A reviewer's changes stay suggestions with struck-through deletions until you accept them; readers can only comment. The review is saved in the project under `.editor`, so it outlasts the session.
+
+## Reporting a problem
+
+Help, Report a problem opens a prefilled GitHub issue with the app version, the system and the last build log. You only describe what happened. It needs a free GitHub account.
+
+## Add-ons
+
+Add-ons are in development and not part of the releases. A build with `cargo run -p app --features addons` shows the Add-ons panel; the protocol is in the crate `addon_api`, and add-ons live in their own repositories.
+
+## Settings
+
+The gear at the bottom left opens the settings, the question mark above it lists the keyboard shortcuts. Cmd+, (macOS) or Ctrl+, (Windows, Linux) also opens the settings. They are stored in `~/Library/Application Support/io.github.sudo-oliver.editor/settings.toml` on macOS, next to everything else the app keeps, in `%APPDATA%\Editor\settings.toml` on Windows, with caches under `%LOCALAPPDATA%\Editor\Cache`, and in `~/.config/editor/settings.toml` on Linux, or under `XDG_CONFIG_HOME` if it is set. Caches and downloads go to `~/Library/Caches/io.github.sudo-oliver.editor`. Project settings stay in `.editor.toml`.
+
+## Vim mode
+
+Vim mode is off by default. Turn it on with Settings, Editor, Keybindings. It applies at once.
+
+- Modes: Normal, Insert, Visual, Visual Line and Command, shown in a status bar.
+- `Space w` saves, `Space x` closes the tab, `Space f` finds a file and `Space g` finds text in the project.
+- `Tab` moves between editor and file tree. In the tree, `j` and `k` move, `l` or `Enter` opens and `h` closes a folder. `a` makes a new file, `A` a new folder and `u` adds files from elsewhere.
+- `]d` and `[d` jump between errors. `H` and `L` switch tabs.
+
+The question mark lists all keys while the mode is on. `/` searches literal text and ignores case unless the query has an uppercase letter. `Space g` reads files from disk, so unsaved edits do not count.
+
+Not included: LSP keys, git hunks, macros, named registers, marks and custom key bindings.
+

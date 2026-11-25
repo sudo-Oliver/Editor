@@ -1,1 +1,0 @@
-- Warum auch immer sieht das Froschbild in unserem Beispiel Latex Dokument farblich total anders aus als das File an sich. Also das File an sich in unserem File Tree preview sieht akkurat grünlich aus. Aber in dem PDFviewer rechts sieht das so leicht bläulich aus. Ich dachte schon erst dass das ein anders Bild ist aber scheinbar passt da dann was noch nicht ganz.
