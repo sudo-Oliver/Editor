@@ -841,7 +841,7 @@ impl SetupView {
                 if cfg!(windows) { "A test document just became a PDF on your PC. The complete LaTeX keeps downloading in the background and takes over on its own once it is there. Open the welcome document to see how it works." } else { "A test document just became a PDF on your Mac. The complete LaTeX keeps downloading in the background and takes over on its own once it is there. Open the welcome document to see how it works." }
             } else if ready {
                 if cfg!(windows) { "A test document just became a PDF on your PC. Open the welcome document to see how it works; a short tour shows each part of the editor." } else { "A test document just became a PDF on your Mac. Open the welcome document to see how it works; a short tour shows each part of the editor." }
-            } else if testing && ((chosen.contains(&Tool::Tectonic) && !toolchain::complete_latex())) {
+            } else if testing && chosen.contains(&Tool::Tectonic) && !toolchain::complete_latex() {
                 "A small test document compiles with what was installed, so that your first PDF works. LaTeX fetches the packages it needs this first time, which takes two or three minutes."
             } else if testing {
                 "A small test document compiles with what was installed, so that your first PDF works. The first time takes a moment."
