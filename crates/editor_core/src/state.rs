@@ -672,8 +672,19 @@ impl EditorState {
     }
 
     /// Pastes one line per selection when the line count matches the cursor count.
+    /// The pasted text takes the line endings of the file, since the Windows
+    /// clipboard has `\r\n` and a file mixing both shows up in every diff.
     pub fn paste(&mut self, text: &str) {
-        let lines: Vec<&str> = text.split('\n').collect();
+        let unix = text.replace("\r\n", "\n");
+        let line = self.selections.iter().next().map_or(0, |selection| self.buffer.offset_to_line(selection.start()));
+        if line_ending(&self.buffer, line) == "\r\n" && unix.contains('\n') {
+            return self.paste_lines(&unix.replace('\n', "\r\n"), "\r\n");
+        }
+        self.paste_lines(&unix, "\n");
+    }
+
+    fn paste_lines(&mut self, text: &str, ending: &str) {
+        let lines: Vec<&str> = text.split(ending).collect();
         if self.selections.len() > 1 && lines.len() == self.selections.len() {
             let planned = self
                 .selections
@@ -1833,6 +1844,20 @@ mod tests {
         let mut state = state_at("a\nb", &[1]);
         state.newline();
         assert_eq!(state.buffer().to_string(), "a\n\nb");
+    }
+
+    #[test]
+    fn paste_takes_the_line_endings_of_the_file() {
+        let mut state = state_at("a\nb", &[1]);
+        state.paste("x\r\ny");
+        assert_eq!(state.buffer().to_string(), "ax\ny\nb");
+        let mut state = state_at("a\r\nb", &[1]);
+        state.paste("x\ny");
+        assert_eq!(state.buffer().to_string(), "ax\r\ny\r\nb");
+        // One line per cursor, also from the Windows clipboard.
+        let mut state = state_at("a\nb", &[1, 3]);
+        state.paste("x\r\ny");
+        assert_eq!(state.buffer().to_string(), "ax\nby");
     }
 
     #[test]

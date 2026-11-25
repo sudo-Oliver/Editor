@@ -465,7 +465,8 @@ mod tests {
     fn typst_follows_includes_from_the_current_file() {
         let counted = count("ch/m.typ", "a #include \"b.typ\"\n#include \"/c.typ\"\n#include \"no.typ\"", &[("ch/b.typ", "bb"), ("c.typ", "cc")]);
         assert_eq!(counted.body, 3);
-        assert_eq!(counted.missing, ["ch/no.typ"]);
+        // In the system's own spelling, as the user reads it.
+        assert_eq!(counted.missing, [std::path::Path::new("ch").join("no.typ").display().to_string()]);
     }
 
     #[test]
