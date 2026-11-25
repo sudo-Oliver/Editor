@@ -4,8 +4,11 @@ use std::process::Command;
 
 use synctex::SyncTex;
 
-fn pdflatex() -> Option<&'static str> {
-    ["pdflatex", "/Library/TeX/texbin/pdflatex"]
+fn pdflatex() -> Option<String> {
+    // TeX Live as the editor installs it on Windows, also when the shell's
+    // PATH is older than the install.
+    let windows = std::env::var("LOCALAPPDATA").map(|local| format!(r"{local}\Programs\TeXLive\bin\windows\pdflatex.exe")).unwrap_or_default();
+    ["pdflatex".to_string(), "/Library/TeX/texbin/pdflatex".to_string(), windows]
         .into_iter()
         .find(|program| Command::new(program).arg("--version").output().is_ok())
 }
@@ -16,7 +19,9 @@ fn navigates_multi_page_document_with_input_file() {
         return;
     };
     let dir = tempfile::tempdir().unwrap();
+    // Without the `\\?\` of `canonicalize` on Windows, as the editor opens folders.
     let root = dir.path().canonicalize().unwrap();
+    let root = std::path::PathBuf::from(root.to_string_lossy().trim_start_matches(r"\\?\").to_string());
     std::fs::create_dir(root.join("sub")).unwrap();
     std::fs::write(
         root.join("main.tex"),
@@ -25,7 +30,7 @@ fn navigates_multi_page_document_with_input_file() {
     .unwrap();
     std::fs::write(root.join("sub/part.tex"), "Included text.\n\nMore included text.\n").unwrap();
 
-    let status = Command::new(pdflatex)
+    let status = Command::new(&pdflatex)
         .args(["-interaction=nonstopmode", "-synctex=1", "main.tex"])
         .current_dir(&root)
         .output()

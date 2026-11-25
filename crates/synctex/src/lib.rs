@@ -236,7 +236,12 @@ fn parse_node(kind: char, record: &str, page: usize) -> Option<Node> {
 /// Windows names files without regard to case, and TeX may write `c:` for `C:`.
 fn same_path(left: &Path, right: &Path) -> bool {
     if cfg!(windows) {
-        left.to_string_lossy().to_lowercase() == right.to_string_lossy().to_lowercase()
+        // `canonicalize` adds `\\?\`, which TeX never writes.
+        let plain = |path: &Path| {
+            let text = path.to_string_lossy().to_lowercase();
+            text.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(text)
+        };
+        plain(left) == plain(right)
     } else {
         left == right
     }
