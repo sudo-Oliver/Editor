@@ -34,7 +34,7 @@ impl Workspace {
             ("LaTeX".to_string(), shown(toolchain::latex())),
             ("Typst".to_string(), shown(toolchain::find(Tool::Typst))),
             ("Pandoc".to_string(), shown(toolchain::find(Tool::Pandoc))),
-            ("Homebrew".to_string(), shown(toolchain::find(Tool::Homebrew))),
+            (Tool::Homebrew.name().to_string(), shown(toolchain::find(Tool::Homebrew))),
         ];
         let install_errors = self.toolchain.read(cx).errors.iter().map(|(tool, error)| (tool.name().to_string(), error.clone())).collect();
         let document = self.active_view().map(|view| {
