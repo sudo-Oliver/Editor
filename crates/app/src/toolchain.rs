@@ -2009,7 +2009,9 @@ mod live {
             }
             println!("{name}: {:?} each", start.elapsed() / 100);
         };
-        time("developer_tools", &|| assert!(developer_tools()));
+        if cfg!(target_os = "macos") {
+            time("developer_tools", &|| assert!(developer_tools()));
+        }
         time("find(Typst)", &|| drop(find(Tool::Typst)));
         time("latex()", &|| drop(latex()));
         time("homebrew()", &|| drop(homebrew()));

@@ -470,7 +470,7 @@ mod tests {
         // The figure stays out, because it needs an image file.
         let body = format!("{}\n\n{}\n\n{}", all(Language::Typst), filled(&table(Language::Typst, 2, 2)), code_blocks(Language::Typst));
         std::fs::write(&typst, body).unwrap();
-        let output = Command::new("typst").arg("compile").arg(&typst).output().unwrap();
+        let output = Command::new(build::find_tool("typst").expect("Typst is installed")).arg("compile").arg(&typst).output().unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 
         let latex = directory.path().join("all.tex");
@@ -480,7 +480,7 @@ mod tests {
             format!("\\documentclass{{article}}\n\\usepackage{{amsmath,amssymb,listings}}\n\\begin{{document}}\n{body}\n\\end{{document}}\n"),
         )
         .unwrap();
-        let output = Command::new("pdflatex")
+        let output = Command::new(build::find_tool("pdflatex").expect("LaTeX is installed"))
             .args(["-interaction=nonstopmode", "-halt-on-error", "all.tex"])
             .current_dir(directory.path())
             .output()
