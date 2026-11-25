@@ -5541,7 +5541,7 @@ impl Workspace {
                             .child(if self.logo_hovered {
                                 Self::icon("home", 18., theme::palette().ui_text)
                             } else {
-                                Self::icon("notepad", 18., theme::palette().accent)
+                                Self::icon("pencil", 18., theme::palette().ui_text)
                             }),
                     )
                     .child(div().relative().child(self.menu_button(Menu::File, "File", cx)).children(self.tour_anchor(TourAnchor::FileMenu)))

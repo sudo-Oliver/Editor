@@ -16,8 +16,8 @@ icons!(
     "addon", "arrow-left", "arrow-right", "book", "chevron-down", "chevron-left", "chevron-right",
     "chevron-up", "close", "contrast", "dots", "download", "file", "file-bib", "file-default",
     "file-markdown", "file-md", "file-plus", "file-tex", "file-toml", "file-txt", "file-typ", "folder",
-    "folder-plus", "git-branch", "help", "home", "image", "layout", "link", "log", "logo", "math", "minus",
-    "notepad", "outline", "people", "plus", "position", "puzzle", "quote", "redo", "refresh", "settings", "sigma", "table", "undo", "upload", "vim",
+    "folder-plus", "git-branch", "help", "home", "image", "layout", "link", "log", "math", "minus",
+    "outline", "pencil", "people", "plus", "position", "puzzle", "quote", "redo", "refresh", "settings", "sigma", "table", "undo", "upload", "vim",
     "check-circle", "code", "grid", "list", "play", "wrench", "paperclip", "binder-clip",
 );
 
@@ -44,6 +44,10 @@ pub const FONTS: &[&[u8]] = &[
     include_bytes!("../assets/fonts/DejaVuSansMono-BoldOblique.ttf"),
 ];
 
+/// The app icon without its margin, for the setup and the hub.
+pub const LOGO: &str = "images/logo.png";
+const LOGO_BYTES: &[u8] = include_bytes!("../assets/logo.png");
+
 pub struct Assets;
 
 impl AssetSource for Assets {
@@ -51,6 +55,9 @@ impl AssetSource for Assets {
         // The icon of an add-on, which is the only absolute path asked for.
         if path.starts_with('/') {
             return Ok(std::fs::read(path).ok().map(Cow::Owned));
+        }
+        if path == LOGO {
+            return Ok(Some(Cow::Borrowed(LOGO_BYTES)));
         }
         if path.starts_with(material_icons::INK_PREFIX) {
             return Ok(material_icons::load_inked(path).map(Cow::Owned));

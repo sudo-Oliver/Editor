@@ -8,7 +8,7 @@ use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 use gpui::{
     AnyElement, App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, KeyDownEvent, SharedString, Subscription, Task, Window, div,
-    prelude::*, px, svg,
+    img, prelude::*, px, svg,
 };
 
 use crate::{
@@ -356,17 +356,8 @@ impl SetupView {
     // Rendering
 
     fn render_welcome(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let palette = theme::palette();
         vec![
-            div()
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(px(64.))
-                .rounded(px(16.))
-                .bg(theme::color(palette.accent))
-                .child(svg().path("icons/logo.svg").size(px(38.)).text_color(theme::color(palette.on_accent)))
-                .into_any_element(),
+            img(crate::assets::LOGO).size(px(64.)).flex_none().into_any_element(),
             title("Welcome to Editor"),
             paragraph(if cfg!(windows) { "Write LaTeX or Typst on the left and see the PDF on the right, like on Overleaf. Everything runs on your PC, also without internet." } else { "Write LaTeX or Typst on the left and see the PDF on the right, like on Overleaf. Everything runs on your Mac, also without internet." }),
             paragraph(if cfg!(windows) { "The setup asks what you write and installs exactly what that needs, nothing else. You need nothing on your PC beforehand." } else { "The setup asks what you write and installs exactly what that needs, nothing else. You need nothing on your Mac beforehand." }),

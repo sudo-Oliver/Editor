@@ -1106,16 +1106,7 @@ impl HomeView {
                     .px(px(10.))
                     .pt(px(8.))
                     .pb(px(20.))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .size(px(32.))
-                            .rounded(px(theme::RADIUS_MD))
-                            .bg(theme::color(palette.accent))
-                            .child(svg().path("icons/logo.svg").size(px(20.)).text_color(theme::color(palette.on_accent))),
-                    )
+                    .child(img(crate::assets::LOGO).size(px(32.)).flex_none())
                     .child(div().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child("Editor")),
             )
             .child(item("hub-nav-projects", "folder", "Projects", HubPage::Projects, cx))
