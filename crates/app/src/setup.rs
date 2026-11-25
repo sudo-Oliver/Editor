@@ -688,7 +688,7 @@ impl SetupView {
                 .into_any_element(),
         ];
         if failed && self.way == Way::Homebrew {
-            elements.push(quiet("setup-no-brew", "Install without Homebrew instead", cx, |this, cx| {
+            elements.push(quiet("setup-no-brew", if cfg!(windows) { "Install without winget instead" } else { "Install without Homebrew instead" }, cx, |this, cx| {
                 this.choose_way(Way::AppFolder, cx);
                 this.toolchain.update(cx, |toolchain, _| {
                     toolchain.errors.clear();
@@ -699,9 +699,11 @@ impl SetupView {
         }
         if busy && self.usable(cx) {
             // Only the complete LaTeX is left: the small one works already.
-            elements.push(paragraph(
-                "You can start now. The complete LaTeX keeps downloading in the background, and the status bar shows how far. macOS asks for your password once it is done.",
-            ));
+            elements.push(paragraph(if cfg!(windows) {
+                "You can start now. The complete LaTeX keeps downloading and installing in the background, and the status bar shows how far."
+            } else {
+                "You can start now. The complete LaTeX keeps downloading in the background, and the status bar shows how far. macOS asks for your password once it is done."
+            }));
             elements.push(
                 div()
                     .flex()
