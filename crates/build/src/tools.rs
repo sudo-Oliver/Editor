@@ -11,6 +11,11 @@ const EXTRA_DIRECTORIES: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin", "/Li
 /// TeX distribution or a Typst the user installed wins.
 static ADDED_DIRECTORIES: RwLock<Vec<PathBuf>> = RwLock::new(Vec::new());
 
+/// Programs found before, on Windows, where a search looks into dozens of
+/// folders once for every ending. A program that is gone is searched again,
+/// and a missing one is never kept, so that a new install shows at once.
+static FOUND: RwLock<Vec<(String, PathBuf)>> = RwLock::new(Vec::new());
+
 /// Where the compilers the app starts keep what they download, with the
 /// variables that tell them.
 static CACHE_DIRECTORIES: RwLock<Vec<(&'static str, PathBuf)>> = RwLock::new(Vec::new());
@@ -142,6 +147,7 @@ pub fn pretend_fresh() -> bool {
 
 /// Searches `directory` too, after everything else.
 pub fn add_directory(directory: PathBuf) {
+    forget_found();
     if let Ok(mut added) = ADDED_DIRECTORIES.write()
         && !added.contains(&directory) {
             added.push(directory);
@@ -150,16 +156,45 @@ pub fn add_directory(directory: PathBuf) {
 
 /// Stops searching `directory`, for example after its tool was removed.
 pub fn remove_directory(directory: &Path) {
+    forget_found();
     if let Ok(mut added) = ADDED_DIRECTORIES.write() {
         added.retain(|known| known != directory);
     }
 }
 
 /// Finds a program by its name. On Windows, `pdflatex` is `pdflatex.exe`, and
-/// some programs are batch files, as `PATHEXT` lists them.
+/// some programs are batch files, such as `tlmgr.bat`.
 pub fn find_tool(name: &str) -> Option<PathBuf> {
+    if cfg!(windows) {
+        let known = FOUND.read().ok().and_then(|found| found.iter().find(|(known, _)| known == name).map(|(_, path)| path.clone()));
+        if let Some(path) = known.filter(|path| path.is_file()) {
+            return Some(path);
+        }
+        let path = search_tool(name)?;
+        if let Ok(mut found) = FOUND.write() {
+            found.retain(|(known, _)| known != name);
+            found.push((name.to_string(), path.clone()));
+        }
+        return Some(path);
+    }
+    search_tool(name)
+}
+
+/// A new folder to search may hold a program that comes before a found one.
+fn forget_found() {
+    if let Ok(mut found) = FOUND.write() {
+        found.clear();
+    }
+}
+
+fn search_tool(name: &str) -> Option<PathBuf> {
     let names = program_names(name);
-    search_path().into_iter().find_map(|directory| names.iter().map(|name| directory.join(name)).find(|path| path.is_file()))
+    search_path()
+        .into_iter()
+        // On Windows each folder costs one look for every ending, and many
+        // usual places do not exist: one look settles those.
+        .filter(|directory| !cfg!(windows) || directory.is_dir())
+        .find_map(|directory| names.iter().map(|name| directory.join(name)).find(|path| path.is_file()))
 }
 
 #[cfg(not(windows))]
@@ -172,8 +207,10 @@ fn program_names(name: &str) -> Vec<String> {
     if Path::new(name).extension().is_some() {
         return vec![name.to_string()];
     }
-    let extensions = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
-    extensions.split(';').filter(|extension| !extension.is_empty()).map(|extension| format!("{name}{}", extension.to_ascii_lowercase())).collect()
+    // Only what a program can start directly. `PATHEXT` also lists script
+    // types, such as .vbs and .js, which cost a look in every folder and
+    // which no tool here comes as.
+    [".exe", ".bat", ".cmd", ".com"].iter().map(|extension| format!("{name}{extension}")).collect()
 }
 
 /// `PATH` for child processes, so that for example Pandoc finds Typst.
