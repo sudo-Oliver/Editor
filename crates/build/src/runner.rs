@@ -204,17 +204,6 @@ async fn build(
     if matches!(request.engine, Engine::PdfLatex | Engine::LuaLatex) {
         // `\include{dir/file}` writes its .aux below the output directory.
         mirror_directories(&cwd, &output_directory);
-        // A LaTeX run that fetches a package while the distribution installs
-        // packages itself can break its package database: it waits instead.
-        if tex_busy() {
-            events.send(BuildEvent::Output("Waiting until LaTeX has finished installing…".to_string())).await.ok();
-            while tex_busy() {
-                tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-                    _ = &mut *cancelled => return None,
-                }
-            }
-        }
     }
 
     let is_latex = matches!(request.engine, Engine::PdfLatex | Engine::LuaLatex);
@@ -265,14 +254,10 @@ async fn build(
             }
         };
         let mut by_latexmk = direct.tool == "latexmk";
-        if reruns_by_hand && needs_latexmk(&cwd, &output_directory, &stem) {
-            if latexmk_works() {
-                // The full font map, since latexmk's runs would make bitmaps for a missing font.
-                let full = invocation(request.engine, &input, &stem, name.as_deref(), true, false);
-                run = run_process(&full, &cwd, events, cancelled, group).await?;
-            } else {
-                run = latexmk_by_hand(&direct, run, &cwd, &output_directory, &stem, &log_path, events, cancelled, group).await?;
-            }
+        if reruns_by_hand && find_tool("latexmk").is_some() && needs_latexmk(&cwd, &output_directory, &stem) {
+            // The full font map, since latexmk's runs would make bitmaps for a missing font.
+            let full = invocation(request.engine, &input, &stem, name.as_deref(), true, false);
+            run = run_process(&full, &cwd, events, cancelled, group).await?;
             by_latexmk = true;
         }
         if run.success && request.engine == Engine::PdfLatex && !font_map {
@@ -405,64 +390,6 @@ fn needs_latexmk(cwd: &Path, output_directory: &Path, stem: &str) -> bool {
     blg::undefined_citations(&log).iter().any(|key| !not_found.contains(key) && !bbl.contains(&format!("{{{key}}}")))
 }
 
-/// latexmk is a Perl script. MiKTeX brings no Perl, and its `latexmk.exe`
-/// then only fails, so on Windows latexmk counts only together with Perl.
-fn latexmk_works() -> bool {
-    find_tool("latexmk").is_some() && (!cfg!(windows) || find_tool("perl").is_some())
-}
-
-/// What latexmk would do, without latexmk: the bibliography, the index and
-/// the nomenclature, then LaTeX again until its references settle. `run` is
-/// the LaTeX run so far, which stays the result if nothing more can run.
-#[allow(clippy::too_many_arguments)]
-async fn latexmk_by_hand(
-    latex: &Invocation,
-    mut run: RunResult,
-    cwd: &Path,
-    output_directory: &Path,
-    stem: &str,
-    log_path: &Path,
-    events: &mpsc::Sender<BuildEvent>,
-    cancelled: &mut oneshot::Receiver<()>,
-    group: &Running,
-) -> Option<RunResult> {
-    let strings = |args: &[&str]| args.iter().map(ToString::to_string).collect::<Vec<_>>();
-    let built = |extension: &str| output_directory.join(format!("{stem}.{extension}"));
-    // The project's folder for .bib and .bst files, as the helpers run inside the
-    // output folder. The trailing separator keeps the normal search path.
-    let project = format!("{}{SEARCH_SEPARATOR}", cwd.display());
-    let aux = std::fs::read(built("aux")).map(|aux| String::from_utf8_lossy(&aux).into_owned()).unwrap_or_default();
-    let mut helpers = Vec::new();
-    if built("bcf").is_file() {
-        helpers.push(Invocation { tool: "biber", args: strings(&["--input-directory", ".", "--output-directory", ".", stem]), env: vec![("BIBINPUTS", project.clone())] });
-    } else if aux.contains("\\bibdata") {
-        helpers.push(Invocation { tool: "bibtex", args: strings(&[stem]), env: vec![("BIBINPUTS", project.clone()), ("BSTINPUTS", project.clone())] });
-    }
-    if built("idx").is_file() {
-        helpers.push(Invocation { tool: "makeindex", args: strings(&["-q", &format!("{stem}.idx")]), env: Vec::new() });
-    }
-    if built("nlo").is_file() {
-        helpers.push(Invocation { tool: "makeindex", args: strings(&["-q", "-s", "nomencl.ist", "-o", &format!("{stem}.nls"), &format!("{stem}.nlo")]), env: Vec::new() });
-    }
-    let mut ran = false;
-    for helper in helpers.iter().filter(|helper| find_tool(helper.tool).is_some()) {
-        let _ = run_process(helper, output_directory, events, cancelled, group).await?;
-        ran = true;
-    }
-    if !ran {
-        return Some(run);
-    }
-    // Once to read what the helpers wrote, and once more for references that moved.
-    for _ in 0..2 {
-        run = run_process(latex, cwd, events, cancelled, group).await?;
-        let log = std::fs::read(log_path).map(|log| String::from_utf8_lossy(&log).into_owned()).unwrap_or_default();
-        if !log.contains("Rerun to get") && !log.contains("Please rerun LaTeX") {
-            break;
-        }
-    }
-    Some(run)
-}
-
 /// Picks the most useful line. latexmk prints a summary after its other output.
 fn failure_summary(stderr: &str) -> &str {
     let mut lines = stderr.lines();
@@ -559,10 +486,6 @@ async fn prepare_format(
                 PDF_COMPRESSION,
                 input,
             ];
-            let mut args = args.to_vec();
-            if miktex() {
-                args.insert(1, MIKTEX_INSTALLER);
-            }
             let build = Invocation {
                 tool: "pdflatex",
                 args: args.iter().map(ToString::to_string).collect(),
@@ -580,27 +503,6 @@ async fn prepare_format(
     }
 }
 
-static TEX_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Says that the TeX distribution installs or updates its packages, during
-/// which LaTeX builds wait.
-pub fn set_tex_busy(busy: bool) {
-    TEX_BUSY.store(busy, std::sync::atomic::Ordering::Relaxed);
-}
-
-fn tex_busy() -> bool {
-    TEX_BUSY.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// MiKTeX fetches a missing package without asking, instead of a dialog for
-/// each one, also when it was installed to ask first.
-const MIKTEX_INSTALLER: &str = "--enable-installer";
-
-/// Whether LaTeX is MiKTeX's, which keeps `initexmf` next to `pdflatex`.
-fn miktex() -> bool {
-    cfg!(windows) && find_tool("pdflatex").is_some_and(|pdflatex| pdflatex.with_file_name("initexmf.exe").is_file())
-}
-
 /// What separates folders in TeX's search paths: kpathsea takes `;` on Windows.
 const SEARCH_SEPARATOR: char = if cfg!(windows) { ';' } else { ':' };
 
@@ -616,11 +518,8 @@ fn latex_invocation(engine: Engine, input: &str, format: Option<&str>, latexmk: 
     if font_map {
         env.push(("TEXFONTMAPS", format!("{OUTPUT_DIRECTORY}{SEARCH_SEPARATOR}")));
     }
-    let mut common = vec!["-interaction=nonstopmode", "-file-line-error", "-synctex=1", "-no-shell-escape"];
-    if miktex() {
-        common.push(MIKTEX_INSTALLER);
-    }
-    if latexmk && latexmk_works() {
+    let common = ["-interaction=nonstopmode", "-file-line-error", "-synctex=1", "-no-shell-escape"];
+    if latexmk && find_tool("latexmk").is_some() {
         // -norc ignores latexmkrc files, which can run arbitrary commands from a project.
         let mode = if engine == Engine::LuaLatex { "-lualatex" } else { "-pdf" };
         // -f carries on past BibTeX's complaints, such as a missing field in

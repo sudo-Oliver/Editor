@@ -583,7 +583,7 @@ impl SetupView {
         let needed = self.megabytes_needed(cx);
         let free = self.free;
         let enough = free.is_none_or(|free| free >= needed);
-        // MiKTeX installs for one user on Windows, without a password.
+        // TeX Live installs for one user on Windows, without a password.
         let passwords = (self.way != Way::Manual && needs_homebrew) as usize + (to_install.contains(&Tool::MacTex) && cfg!(target_os = "macos")) as usize;
         elements.push(
             div()
@@ -623,7 +623,7 @@ impl SetupView {
         }
         if to_install.contains(&Tool::MacTex) {
             elements.push(paragraph(if cfg!(windows) {
-                "MiKTeX is a download of about 150 MB and installs in a few minutes. The first PDF of a document fetches the packages it uses, so that one takes a little longer."
+                "The complete LaTeX is one long download of about 2.6 GB: on a fast connection about an hour, on a slow one longer. The setup shows how long it still takes. After that, everything works offline."
             } else {
                 "The complete LaTeX is one long download: on a fast connection about 15 minutes, on a slow one longer. The setup shows how long it still takes. After that, everything works offline, and updates come from inside the app."
             }));
@@ -757,9 +757,9 @@ impl SetupView {
             let mut steps: Vec<AnyElement> = Vec::new();
             if tool == Tool::MacTex && cfg!(windows) {
                 let page = tool.download_page();
-                steps.push(numbered(1, format!("Download the MiKTeX installer ({}) from miktex.org.", toolchain::size(tool.megabytes().unwrap_or(0)))).into_any_element());
+                steps.push(numbered(1, "Download the TeX Live installer, install-tl-windows.exe, from tug.org.").into_any_element());
                 steps.push(link(("manual-page", index), "Open the download page", move |cx| cx.open_url(page)).into_any_element());
-                steps.push(numbered(2, "Open it from your Downloads folder, choose \"Only for me\" and keep the other answers as they are. No password is needed.").into_any_element());
+                steps.push(numbered(2, format!("Open it from your Downloads folder, choose to install for yourself only and keep the other answers as they are. It fetches about {} and needs no password.", toolchain::size(tool.megabytes().unwrap_or(0)))).into_any_element());
             } else if tool == Tool::MacTex {
                 let page = tool.download_page();
                 steps.push(numbered(1, format!("Download MacTeX.pkg ({}) from tug.org.", toolchain::size(tool.megabytes().unwrap_or(0)))).into_any_element());
@@ -839,7 +839,7 @@ impl SetupView {
                 if cfg!(windows) { "A test document just became a PDF on your PC. The complete LaTeX keeps downloading in the background and takes over on its own once it is there. Open the welcome document to see how it works." } else { "A test document just became a PDF on your Mac. The complete LaTeX keeps downloading in the background and takes over on its own once it is there. Open the welcome document to see how it works." }
             } else if ready {
                 if cfg!(windows) { "A test document just became a PDF on your PC. Open the welcome document to see how it works; a short tour shows each part of the editor." } else { "A test document just became a PDF on your Mac. Open the welcome document to see how it works; a short tour shows each part of the editor." }
-            } else if testing && ((chosen.contains(&Tool::Tectonic) && !toolchain::complete_latex()) || (cfg!(windows) && chosen.contains(&Tool::MacTex))) {
+            } else if testing && ((chosen.contains(&Tool::Tectonic) && !toolchain::complete_latex())) {
                 "A small test document compiles with what was installed, so that your first PDF works. LaTeX fetches the packages it needs this first time, which takes two or three minutes."
             } else if testing {
                 "A small test document compiles with what was installed, so that your first PDF works. The first time takes a moment."
