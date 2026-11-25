@@ -36,7 +36,7 @@ fn image_page() -> Vec<u8> {
 const NEGATIVE: Recolor = Recolor { paper: 0x000000, ink: 0xffffff };
 
 fn render(bytes: Vec<u8>, recolor: Option<Recolor>) -> Option<Vec<u8>> {
-    let library = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vendor/pdfium/lib");
+    let library = Path::new(env!("CARGO_MANIFEST_DIR")).join(if cfg!(windows) { "../../vendor/pdfium/bin" } else { "../../vendor/pdfium/lib" });
     if !library.is_dir() {
         return None;
     }

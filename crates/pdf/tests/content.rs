@@ -58,7 +58,7 @@ fn compile(document: &str) -> Option<Vec<u8>> {
 }
 
 fn library() -> Option<PathBuf> {
-    Some(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vendor/pdfium/lib")).filter(|library| library.is_dir())
+    Some(Path::new(env!("CARGO_MANIFEST_DIR")).join(if cfg!(windows) { "../../vendor/pdfium/bin" } else { "../../vendor/pdfium/lib" })).filter(|library| library.is_dir())
 }
 
 fn first_h(content: &PageContent) -> Rect {

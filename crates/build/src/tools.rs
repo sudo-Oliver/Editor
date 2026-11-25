@@ -23,11 +23,33 @@ fn search_path() -> Vec<PathBuf> {
         directories.extend(ADDED_DIRECTORIES.read().map(|added| added.clone()).unwrap_or_default());
         return directories;
     }
-    let mut directories: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).collect())
-        .unwrap_or_default();
+    let mut directories = preferred_directories();
+    directories.extend(std::env::var_os("PATH").map(|path| std::env::split_paths(&path).collect::<Vec<_>>()).unwrap_or_default());
     directories.extend(extra_directories());
     directories.extend(ADDED_DIRECTORIES.read().map(|added| added.clone()).unwrap_or_default());
+    directories
+}
+
+/// Searched before the `PATH`.
+#[cfg(not(windows))]
+fn preferred_directories() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+/// TeX Live before anything on the `PATH`: the editor is made for it, as for
+/// MacTeX on the Mac, and another LaTeX, such as a MiKTeX someone installed
+/// for another editor, stays where it is, unused. The app's own first, then
+/// the newest year of one installed for everyone.
+#[cfg(windows)]
+fn preferred_directories() -> Vec<PathBuf> {
+    let mut directories: Vec<PathBuf> = std::env::var_os("LOCALAPPDATA").map(|local| PathBuf::from(local).join("Programs\\TeXLive\\bin\\windows")).into_iter().collect();
+    // Read once, since every search for a program comes here.
+    static TEXLIVE: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
+    directories.extend(TEXLIVE.get_or_init(|| {
+        let mut years: Vec<PathBuf> = std::fs::read_dir("C:\\texlive").into_iter().flatten().flatten().map(|entry| entry.path()).filter(|path| path.join("bin\\windows").is_dir()).collect();
+        years.sort();
+        years.into_iter().rev().map(|year| year.join("bin\\windows")).collect()
+    }).iter().cloned());
     directories
 }
 
@@ -42,28 +64,18 @@ fn extra_directories() -> Vec<PathBuf> {
 }
 
 /// The usual install places on Windows, which installers do not always add
-/// to the `PATH` an app started from the Start menu sees: TeX Live, MiKTeX
-/// for everyone or for one user, and Git.
+/// to the `PATH` an app started from the Start menu sees: MiKTeX for
+/// everyone or for one user, and Git.
 #[cfg(windows)]
 fn extra_directories() -> Vec<PathBuf> {
     let variable = |name: &str| std::env::var_os(name).map(PathBuf::from);
     let mut directories = Vec::new();
-    // TeX Live puts each year in its own folder; the newest wins. Read once,
-    // since every search for a program comes here.
-    static TEXLIVE: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
-    directories.extend(TEXLIVE.get_or_init(|| {
-        let mut years: Vec<PathBuf> = std::fs::read_dir("C:\\texlive").into_iter().flatten().flatten().map(|entry| entry.path()).filter(|path| path.join("bin\\windows").is_dir()).collect();
-        years.sort();
-        years.into_iter().rev().map(|year| year.join("bin\\windows")).collect()
-    }).iter().cloned());
     for base in [variable("ProgramFiles"), variable("LOCALAPPDATA").map(|local| local.join("Programs"))].into_iter().flatten() {
         directories.push(base.join("MiKTeX\\miktex\\bin\\x64"));
         directories.push(base.join("Git\\cmd"));
         directories.push(base.join("Pandoc"));
     }
     if let Some(local) = variable("LOCALAPPDATA") {
-        // TeX Live as the app installs it, for this user.
-        directories.push(local.join("Programs\\TeXLive\\bin\\windows"));
         // Where winget links what it installs for one user, and Pandoc's own installer.
         directories.push(local.join("Microsoft\\WinGet\\Links"));
         directories.push(local.join("Pandoc"));
