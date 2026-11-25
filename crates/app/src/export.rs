@@ -1001,4 +1001,30 @@ mod tests {
         assert_eq!(fs::read_to_string(&target).unwrap(), "done\n");
         folder_is_only(folder.path(), &["o.md"]);
     }
+
+    /// Fetches Pandoc as the app does and turns the sample project, with its
+    /// figure and bibliography, and a Markdown file into Word documents.
+    #[test]
+    #[ignore = "downloads Pandoc"]
+    fn word_from_latex_and_markdown_with_real_pandoc() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        let tools = tempdir().unwrap();
+        let pandoc = crate::toolchain::install(crate::toolchain::Tool::Pandoc, tools.path(), &AtomicU64::new(0), &AtomicBool::new(false)).unwrap();
+        let sample = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/overleaf-sample");
+        let project = tempdir().unwrap();
+        for name in ["main.tex", "sample.bib", "frog.jpg"] {
+            fs::copy(sample.join(name), project.path().join(name)).unwrap();
+        }
+        fs::write(project.path().join("notes.md"), "# Notizen über Ü\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n$$x^2$$\n").unwrap();
+        for (main, expected) in [("main.tex", "Introduction"), ("notes.md", "Notizen über Ü")] {
+            let target = project.path().join(Path::new(main).with_extension("docx"));
+            let draft = run_pandoc(&pandoc, &project.path().join(main), DraftFormat::Word, &target).unwrap();
+            println!("{main}: {:?}", draft.report);
+            draft.keep(&target).unwrap();
+            let mut archive = ZipArchive::new(File::open(&target).unwrap()).unwrap();
+            let mut document = String::new();
+            archive.by_name("word/document.xml").unwrap().read_to_string(&mut document).unwrap();
+            assert!(document.contains(expected), "{main} lost its text");
+        }
+    }
 }
