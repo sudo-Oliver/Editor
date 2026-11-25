@@ -13,9 +13,9 @@ use std::{
 use serde::Deserialize;
 
 /// The OAuth app of the editor, with the device flow turned on. Public by
-/// design, not a secret. Empty until the app is registered, which hides the
-/// browser sign-in and leaves the token field.
-pub const CLIENT_ID: &str = "";
+/// design, not a secret: the device flow needs no client secret. Empty, it
+/// would hide the browser sign-in and leave the token field.
+pub const CLIENT_ID: &str = "Ov23limypGSogCL6UYJ4";
 pub const HOST: &str = "github.com";
 const SECONDS: &str = "30";
 
