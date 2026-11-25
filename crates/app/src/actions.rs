@@ -223,8 +223,8 @@ pub const COMMANDS: &[Command] = &[
     command!("select_word_right", "Selection", "Select word right", SelectWordRight, EDITOR, if MAC { &["alt-shift-right"] } else { &["alt-shift-right", "ctrl-shift-right"] }),
     command!("select_line_start", "Selection", "Select to line start", SelectLineStart, EDITOR, if MAC { &["shift-home", "cmd-shift-left"] } else { &["shift-home"] }),
     command!("select_line_end", "Selection", "Select to line end", SelectLineEnd, EDITOR, if MAC { &["shift-end", "cmd-shift-right"] } else { &["shift-end"] }),
-    command!("select_document_start", "Selection", "Select to document start", SelectDocumentStart, EDITOR, if MAC { &["cmd-shift-up"] } else { &[] }),
-    command!("select_document_end", "Selection", "Select to document end", SelectDocumentEnd, EDITOR, if MAC { &["cmd-shift-down"] } else { &[] }),
+    command!("select_document_start", "Selection", "Select to document start", SelectDocumentStart, EDITOR, if MAC { &["cmd-shift-up"] } else { &["ctrl-shift-home"] }),
+    command!("select_document_end", "Selection", "Select to document end", SelectDocumentEnd, EDITOR, if MAC { &["cmd-shift-down"] } else { &["ctrl-shift-end"] }),
     // Only while the popup shows, and later than the editor keys, so they win.
     command!("accept_completion", "Suggestions", "Accept suggestion", AcceptCompletion, COMPLETION, &["tab"]),
     command!("next_completion", "Suggestions", "Next suggestion", NextCompletion, COMPLETION, &["down", "ctrl-n"]),

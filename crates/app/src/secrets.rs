@@ -125,6 +125,20 @@ fn quote(word: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A login stays in the Credential Manager, as a git token does between starts.
+    #[cfg(windows)]
+    #[test]
+    fn the_credential_manager_keeps_a_secret() {
+        let service = format!("editor-test-{}", std::process::id());
+        assert_eq!(get(&service, "ada"), Ok(None));
+        set(&service, "", "ada", "token-ä1").unwrap();
+        assert_eq!(get(&service, "ada"), Ok(Some("token-ä1".to_string())));
+        set(&service, "", "ada", "token-2").unwrap();
+        assert_eq!(get(&service, "ada"), Ok(Some("token-2".to_string())));
+        std::process::Command::new("cmdkey").arg(format!("/delete:{service}/ada")).output().ok();
+        assert_eq!(get(&service, "ada"), Ok(None));
+    }
+
     #[test]
     fn keychain_words_are_quoted() {
         assert_eq!(quote(r#"a"b\c d"#), r#""a\"b\\c d""#);

@@ -161,6 +161,10 @@ pub fn project_root_for(file: &Path, current: Option<&Path>, home: &Path) -> Pat
 }
 
 pub fn tilde(path: &Path) -> String {
+    // Windows knows no `~`: there the whole path, as Explorer shows it.
+    if cfg!(windows) {
+        return path.display().to_string();
+    }
     match path.strip_prefix(home()) {
         Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
         Ok(rest) => format!("~/{}", rest.display()),

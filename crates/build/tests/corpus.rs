@@ -416,7 +416,18 @@ fn a_cancelled_build_leaves_nothing_behind() {
     let project = Project::new("cancel", &[(main.as_str(), slow.to_string())]);
     let manager = BuildManager::new();
     let request = project.request(&main, Engine::PdfLatex);
-    let leftovers = || Command::new("pgrep").args(["-f", &stem]).output().map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string()).unwrap_or_default();
+    let leftovers = || {
+        let mut command = if cfg!(windows) {
+            let mut command = Command::new("powershell");
+            command.args(["-NoProfile", "-Command", &format!("Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{stem}*' -and $_.Name -ne 'powershell.exe' }} | ForEach-Object {{ $_.ProcessId }}")]);
+            command
+        } else {
+            let mut command = Command::new("pgrep");
+            command.args(["-f", &stem]);
+            command
+        };
+        command.output().map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string()).unwrap_or_default()
+    };
 
     let mut events = manager.start(request.clone());
     loop {

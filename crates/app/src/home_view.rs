@@ -766,11 +766,11 @@ impl HomeView {
         cx.spawn_in(window, async move |this, cx| {
             let message = format!("Remove {title}?");
             let detail = if exists {
-                format!("Removing from the list keeps the folder {}. The trash keeps it until you empty the trash.", projects::tilde(&path))
+                if cfg!(windows) { format!("Removing from the list keeps the folder {}. The Recycle Bin keeps it until you empty it.", projects::tilde(&path)) } else { format!("Removing from the list keeps the folder {}. The trash keeps it until you empty the trash.", projects::tilde(&path)) }
             } else {
                 "The folder is gone already, so only the entry remains.".to_string()
             };
-            let answers: &[&str] = if exists { &["Remove from list", "Move to Trash", "Cancel"] } else { &["Remove from list", "Cancel"] };
+            let answers: &[&str] = if exists { &["Remove from list", crate::platform::MOVE_TO_TRASH, "Cancel"] } else { &["Remove from list", "Cancel"] };
             let Ok(answer) = this.update_in(cx, |_, window, cx| window.prompt(PromptLevel::Warning, &message, Some(&detail), answers, cx)) else {
                 return;
             };
@@ -784,7 +784,7 @@ impl HomeView {
                 let trashed = cx.background_spawn(async move { trash::delete(&target) }).await;
                 if let Err(error) = trashed {
                     this.update(cx, |this, cx| {
-                        this.message = Some(format!("Cannot move the folder to the trash: {error}"));
+                        this.message = Some(format!("Cannot move the folder to the {}: {error}", crate::platform::TRASH));
                         cx.notify();
                     })
                     .ok();
@@ -808,10 +808,10 @@ impl HomeView {
 
     fn delete_template(&mut self, dir: PathBuf, name: String, window: &mut Window, cx: &mut Context<Self>) {
         cx.spawn_in(window, async move |this, cx| {
-            let message = format!("Move the template {name} to the trash?");
+            let message = format!("Move the template {name} to the {}?", crate::platform::TRASH);
             let detail = "Projects made from it keep their files.";
             let Ok(answer) = this.update_in(cx, |_, window, cx| {
-                window.prompt(PromptLevel::Warning, &message, Some(detail), &["Move to Trash", "Cancel"], cx)
+                window.prompt(PromptLevel::Warning, &message, Some(detail), &[crate::platform::MOVE_TO_TRASH, "Cancel"], cx)
             }) else {
                 return;
             };
@@ -1045,7 +1045,7 @@ impl HomeView {
             .pr(px(if cfg!(windows) { 0. } else { 10. }))
             .bg(theme::color(theme::palette().panel))
             .when(self.has_project, |element| {
-                element.child(button("hub-back", "Back to project", false, cx, |_, _, cx| cx.emit(HomeEvent::Close)))
+                element.child(crate::window_controls::clickable(div().child(button("hub-back", "Back to project", false, cx, |_, _, cx| cx.emit(HomeEvent::Close)))))
             })
             .children(crate::window_controls::buttons(window, BAND_HEIGHT))
     }
@@ -2028,9 +2028,12 @@ impl HomeView {
                 .child(self.action_card("hub-help-tools", "wrench", "Set up again", "Choose LaTeX, Typst or both and install what is missing.", cx, |_, _, cx| {
                     cx.emit(HomeEvent::RunSetup)
                 }))
-                .child(self.action_card("hub-help-command", "folder", "Terminal command", "Type editor . in Terminal to open a folder here.", cx, |_, _, cx| {
-                    cx.emit(HomeEvent::InstallCommand)
-                }))
+                // The Windows installer puts the command on the PATH itself.
+                .when(!cfg!(windows), |row| {
+                    row.child(self.action_card("hub-help-command", "folder", "Terminal command", "Type editor . in Terminal to open a folder here.", cx, |_, _, cx| {
+                        cx.emit(HomeEvent::InstallCommand)
+                    }))
+                })
                 .child(self.action_card("hub-help-report", "log", "Report a problem", "Tell what went wrong. The editor adds the details.", cx, |_, _, cx| {
                     cx.emit(HomeEvent::ReportProblem)
                 }))

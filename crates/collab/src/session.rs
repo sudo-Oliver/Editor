@@ -35,6 +35,8 @@ const HOST: u64 = 0;
 /// How often a guest tries to get back to the host before giving up, about a
 /// minute and a half in all.
 const RECONNECT_ATTEMPTS: u32 = 10;
+/// How long a guest keeps looking for a host that cannot be found yet.
+const JOIN_PATIENCE: Duration = Duration::from_secs(60);
 /// An update this large would be refused at the other end, which would drop
 /// the link and try again forever. Room for the frame's own header.
 const MAX_UPDATE: usize = MAX_FRAME - 1024;
@@ -181,7 +183,17 @@ impl Session {
         runtime.spawn(async move {
             let joined = async {
                 let (endpoint, mdns) = bind(None).await?;
-                let (connection, send, recv, me, role) = handshake(&endpoint, host, secret.clone(), &identity).await?;
+                // A host that just started has not published where it is yet,
+                // and someone may paste the code at once: try again for a while.
+                let deadline = tokio::time::Instant::now() + JOIN_PATIENCE;
+                let (connection, send, recv, me, role) = loop {
+                    match handshake(&endpoint, host, secret.clone(), &identity).await {
+                        Err(error) if error.starts_with("Cannot reach the host") && tokio::time::Instant::now() < deadline => {
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                        }
+                        other => break other?,
+                    }
+                };
                 Ok::<_, String>((endpoint, mdns, connection, send, recv, me, role))
             };
             match joined.await {

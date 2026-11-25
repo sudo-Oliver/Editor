@@ -617,10 +617,10 @@ impl Workspace {
                 .await;
             let result = this
                 .update(cx, |this, cx| match trashed {
-                    Err(error) => Err(format!("Cannot move {name} to the Trash: {error}")),
+                    Err(error) => Err(format!("Cannot move {name} to the {}: {error}", crate::platform::TRASH)),
                     Ok(()) => {
                         this.close_everything_in(&path, cx);
-                        this.set_status(format!("Moved {name} to the Trash"), cx);
+                        this.set_status(format!("Moved {name} to the {}", crate::platform::TRASH), cx);
                         Ok(Reply::Done)
                     }
                 })
@@ -715,8 +715,8 @@ impl Workspace {
             Some(("add_package", package)) => Fix::AddPackage(package.to_string()),
             Some(("remove_package", package)) => Fix::RemovePackage(package.to_string()),
             Some(("install_tool", _)) => return Err("Installing a compiler needs the user. Ask them to use the fix in the editor.".to_string()),
-            Some(("install_latex_package", _)) => return Err("Installing a LaTeX package needs the Mac password. Ask the user to use the fix in the editor.".to_string()),
-            None if id == "update_latex" => return Err("Updating LaTeX needs the Mac password. Ask the user to use the fix in the editor.".to_string()),
+            Some(("install_latex_package", _)) => return Err(if cfg!(windows) { "Installing a LaTeX package needs the user. Ask the user to use the fix in the editor." } else { "Installing a LaTeX package needs the Mac password. Ask the user to use the fix in the editor." }.to_string()),
+            None if id == "update_latex" => return Err(if cfg!(windows) { "Updating LaTeX needs the user. Ask the user to use the fix in the editor." } else { "Updating LaTeX needs the Mac password. Ask the user to use the fix in the editor." }.to_string()),
             _ => return Err(format!("No fix is called {id}.")),
         };
         let path = self.package_hints.iter().find(|hint| hint.fix == fix).map(|hint| hint.path.clone());

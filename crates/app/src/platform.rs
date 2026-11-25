@@ -12,6 +12,10 @@ pub fn home() -> Option<PathBuf> {
     home.filter(|home| !home.is_empty()).map(PathBuf::from)
 }
 
+/// Where deleted files go, as the system calls it.
+pub const TRASH: &str = if cfg!(windows) { "Recycle Bin" } else { "Trash" };
+pub const MOVE_TO_TRASH: &str = if cfg!(windows) { "Move to Recycle Bin" } else { "Move to Trash" };
+
 /// A command for `program` that opens no console window on Windows, where
 /// every console program would otherwise flash one up.
 pub fn command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {

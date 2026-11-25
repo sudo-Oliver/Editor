@@ -332,7 +332,8 @@ mod tests {
 
         git(directory.path(), &["checkout", "--", "a.tex"]);
         repository.switch("main").unwrap();
-        assert_eq!(fs::read_to_string(directory.path().join("a.tex")).unwrap(), "base\n");
+        // Git for Windows checks out with \r\n, as its own settings say.
+        assert_eq!(fs::read_to_string(directory.path().join("a.tex")).unwrap().replace("\r\n", "\n"), "base\n");
         assert!(repository.create_branch("--force").is_err());
         assert!(repository.switch("").is_err());
 
@@ -370,7 +371,7 @@ mod tests {
         other.push().unwrap();
 
         repo.pull().unwrap();
-        assert_eq!(fs::read_to_string(first.join("a.tex")).unwrap(), "2\n");
+        assert_eq!(fs::read_to_string(first.join("a.tex")).unwrap().replace("\r\n", "\n"), "2\n");
 
         write(&first, "b.tex", "here\n");
         repo.stage_all().unwrap();

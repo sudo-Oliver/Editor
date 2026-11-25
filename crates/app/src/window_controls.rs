@@ -16,6 +16,13 @@ pub fn drag_area<E: InteractiveElement>(element: E) -> E {
     if cfg!(windows) { element.window_control_area(WindowControlArea::Drag) } else { element }
 }
 
+/// Keeps a button on the bar a button on Windows: without this, the drag
+/// area behind it answers Windows' hit test, and Windows takes the click to
+/// move the window.
+pub fn clickable<E: InteractiveElement>(element: E) -> E {
+    if cfg!(windows) { element.occlude() } else { element }
+}
+
 /// Minimize, maximize or restore, and close, `height` tall, on Windows only.
 pub fn buttons(window: &Window, height: f32) -> Option<AnyElement> {
     if !cfg!(windows) {

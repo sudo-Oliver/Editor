@@ -26,9 +26,9 @@ When it is done, download `Editor-windows-setup` from the run and unpack it.
 
 ## 3. Setup, without anything installed
 
-- [ ] The setup offers winget as the recommended way, when winget is there.
 - [ ] LaTeX compact (Tectonic) installs; the test document becomes a PDF (the first one takes 2 to 3 minutes).
-- [ ] LaTeX complete (MiKTeX) installs without a password; the test document becomes a PDF.
+- [ ] LaTeX complete (TeX Live) installs without a password, with progress and time left (about an hour, 5 GB); the test document becomes a PDF.
+- [ ] With a MiKTeX already installed, the setup still offers TeX Live, and the editor uses TeX Live once it is there.
 - [ ] Typst installs and its test document becomes a PDF.
 - [ ] Without internet, the test stops with a clear message instead of hanging.
 
@@ -47,10 +47,18 @@ When it is done, download `Editor-windows-setup` from the run and unpack it.
 - [ ] With Editor open behind another window, double click on a `.tex` (Open with > Editor) brings Editor to the front with the file.
 - [ ] Right click on a folder > Open in Editor works.
 
-## 6. Live session, Mac and Windows
+## 6. Live session, with anyone
 
 - [ ] Windows asks once about the network; after Allow, a session from the Mac can be joined with its code.
+- [ ] A guest on another network joins with the code at once after it was shared.
 - [ ] Typing on either side shows on the other within a moment; cursors and comments come through.
+
+## 6a. Editing
+
+- [ ] Vim mode: AltGr types `\ { } [ ] @`, Ctrl+1/2/3 switch tabs, also in the .bib.
+- [ ] `\usep` and `\sec` suggest `\usepackage{}` and `\section{}`; Tab takes them.
+- [ ] The logo and the project title open the hub; the bar still moves and maximizes the window.
+- [ ] Set up git in the git panel installs git without an administrator.
 
 ## 7. Git and the keychain
 

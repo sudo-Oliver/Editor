@@ -61,6 +61,10 @@ pub struct Package {
 }
 
 pub const MACTEX_TEXBIN: &str = "/Library/TeX/texbin";
+/// What TeX Live's installer fetches for everything without manuals and
+/// sources, roughly, and what that takes on the disk in megabytes.
+const TEXLIVE_BYTES: u64 = 2_600_000_000;
+const TEXLIVE_MEGABYTES: u64 = 5_000;
 
 impl Tool {
     /// The ones listed in the settings, in the order shown.
@@ -92,7 +96,7 @@ impl Tool {
 
     pub fn name(self) -> &'static str {
         match self {
-            Self::MacTex if cfg!(windows) => "LaTeX, complete (MiKTeX)",
+            Self::MacTex if cfg!(windows) => "LaTeX, complete (TeX Live)",
             Self::MacTex => "LaTeX, complete (MacTeX)",
             Self::Tectonic => "LaTeX, compact (Tectonic)",
             Self::Typst => "Typst",
@@ -115,7 +119,7 @@ impl Tool {
 
     pub fn purpose(self) -> &'static str {
         match self {
-            Self::MacTex if cfg!(windows) => "LaTeX as most people on Windows use it. Fetches each package once, the first time a document needs it.",
+            Self::MacTex if cfg!(windows) => "Everything LaTeX has, on your PC. Every package works at once, also without internet.",
             Self::MacTex => "Everything LaTeX has, on your Mac. Every package works at once, also without internet.",
             Self::Tectonic => "Turns LaTeX into a PDF. Small, and fetches each package the first time a document uses it.",
             Self::Typst => "Turns Typst into a PDF. Typst is a newer, simpler language for documents.",
@@ -126,7 +130,7 @@ impl Tool {
 
     pub fn source(self) -> &'static str {
         match self {
-            Self::MacTex if cfg!(windows) => "Official MiKTeX from miktex.org, through CTAN",
+            Self::MacTex if cfg!(windows) => "Official TeX Live from tug.org, checked with its fingerprint",
             Self::MacTex => "Official MacTeX from tug.org, signed by its author",
             Self::Tectonic => "Official release from github.com/tectonic-typesetting",
             Self::Typst => "Official release from github.com/typst",
@@ -138,7 +142,7 @@ impl Tool {
     /// The page to download it by hand.
     pub fn download_page(self) -> &'static str {
         match self {
-            Self::MacTex if cfg!(windows) => "https://miktex.org/download",
+            Self::MacTex if cfg!(windows) => "https://tug.org/texlive/windows.html",
             Self::MacTex => "https://tug.org/mactex/mactex-download.html",
             Self::Tectonic => "https://github.com/tectonic-typesetting/tectonic/releases",
             Self::Typst => "https://github.com/typst/typst/releases",
@@ -151,7 +155,7 @@ impl Tool {
     pub fn note(self) -> Option<&'static str> {
         match self {
             Self::Tectonic => Some("The first PDF downloads the LaTeX packages it uses, so it needs the internet and takes a minute."),
-            Self::MacTex if cfg!(windows) => Some("Installs for you alone, without a password. The first PDF of a document fetches the packages it uses."),
+            Self::MacTex if cfg!(windows) => Some("Installs for you alone, without a password, and fetches every LaTeX package once, as MacTeX has them. That takes about an hour, only this once."),
             Self::MacTex => Some("macOS asks for your password once the download is done, to install into /Library/TeX."),
             _ => None,
         }
@@ -160,13 +164,15 @@ impl Tool {
     /// Installed to the system with a password, never into the app's folder.
     pub fn package(self) -> Option<Package> {
         if cfg!(windows) {
-            // MiKTeX's own installer, for this user only, so no administrator.
+            // TeX Live's own installer, for this user only, so no administrator.
+            // It changes daily, so its fingerprint comes from the same server.
+            // `bytes` is what it fetches in all, about 4,500 packages.
             return (self == Self::MacTex).then_some(Package {
-                url: "https://mirror.ctan.org/systems/win32/miktex/setup/windows-x64/basic-miktex-25.12-x64.exe",
-                sha512_url: None,
-                sha256: Some("14b42dd9f4b4a7813a8bfd69c8f99316c2888cc4ee26f631f397e163d85d6c62"),
+                url: "https://mirror.ctan.org/systems/texlive/tlnet/install-tl.zip",
+                sha512_url: Some("https://mirror.ctan.org/systems/texlive/tlnet/install-tl.zip.sha512"),
+                sha256: None,
                 signer: None,
-                bytes: 148_882_184,
+                bytes: TEXLIVE_BYTES,
             });
         }
         match self {
@@ -256,8 +262,7 @@ impl Tool {
             return match self {
                 Self::Typst => Some("Typst.Typst"),
                 Self::Pandoc => Some("JohnMacFarlane.Pandoc"),
-                Self::MacTex => Some("MiKTeX.MiKTeX"),
-                Self::Tectonic | Self::Homebrew => None,
+                Self::MacTex | Self::Tectonic | Self::Homebrew => None,
             };
         }
         match self {
@@ -277,7 +282,7 @@ impl Tool {
     /// What it takes on the disk once installed, in megabytes, roughly.
     pub fn installed_megabytes(self) -> u64 {
         match self {
-            Self::MacTex if cfg!(windows) => 900,
+            Self::MacTex if cfg!(windows) => TEXLIVE_MEGABYTES,
             Self::MacTex => 9_000,
             Self::Tectonic => 60,
             Self::Typst => 45,
@@ -321,6 +326,12 @@ fn executable(name: &str) -> String {
 }
 
 pub fn tools_directory() -> Option<PathBuf> {
+    // Programs stay on this PC on Windows: the roaming profile, which school
+    // and office PCs copy at every sign-in, keeps only the user's own files.
+    #[cfg(windows)]
+    if std::env::var_os("EDITOR_HOME").is_none() {
+        return Some(PathBuf::from(std::env::var_os("LOCALAPPDATA").filter(|local| !local.is_empty())?).join("Editor\\Tools"));
+    }
     Some(settings::config_dir()?.join("tools"))
 }
 
@@ -360,6 +371,10 @@ pub fn register_installed() {
                     build::add_directory(folder);
                 }
             }
+        }
+        #[cfg(windows)]
+        if mingit_commands(&tools).join("git.exe").is_file() {
+            build::add_directory(mingit_commands(&tools));
         }
     }
     if let Some(manual) = manual_directory().filter(|manual| manual.is_dir()) {
@@ -529,7 +544,7 @@ fn probe_failure(said: &str) -> String {
         return "The compiler needs the internet the first time, to fetch packages. Connect and try again.".to_string();
     }
     if lower.contains("cannot be opened") || lower.contains("operation not permitted") || lower.contains("killed") {
-        return "macOS did not let the compiler run. Install it again with the button.".to_string();
+        return if cfg!(windows) { "Windows did not let the compiler run. Install it again with the button." } else { "macOS did not let the compiler run. Install it again with the button." }.to_string();
     }
     let last = said.lines().map(str::trim).rfind(|line| !line.is_empty()).unwrap_or("It ended without a PDF.");
     format!("The test document did not compile: {last}")
@@ -555,8 +570,12 @@ fn found_program(program: &str, tools: Option<&Path>) -> Found {
 
 pub fn find(tool: Tool) -> Found {
     match tool {
-        // MiKTeX or TeX Live, wherever its installer put it.
-        Tool::MacTex if cfg!(windows) => found_program("pdflatex", tools_directory().as_deref()),
+        // TeX Live, wherever its installer put it: `tlmgr` next to `pdflatex`
+        // tells it from MiKTeX, which latexmk and the log reading do not suit.
+        Tool::MacTex if cfg!(windows) => match found_program("pdflatex", tools_directory().as_deref()) {
+            Found::Own(path) if !path.with_file_name("tlmgr.bat").is_file() => Found::Missing,
+            found => found,
+        },
         Tool::MacTex => {
             let pdflatex = Path::new(MACTEX_TEXBIN).join("pdflatex");
             if pdflatex.is_file() && !build::pretend_fresh() { Found::Own(pdflatex) } else { Found::Missing }
@@ -581,6 +600,9 @@ pub fn latex() -> Found {
 /// Whether a complete TeX distribution is there, such as MacTeX or TeX Live
 /// from Homebrew, rather than only Tectonic.
 pub fn complete_latex() -> bool {
+    if cfg!(windows) {
+        return find(Tool::MacTex) != Found::Missing;
+    }
     let tools = tools_directory();
     find(Tool::MacTex) != Found::Missing || ["latexmk", "pdflatex"].iter().any(|program| matches!(found_program(program, tools.as_deref()), Found::Own(_)))
 }
@@ -760,9 +782,6 @@ fn install_package(tool: Tool, package: &Package, tools: &Path, received: &Atomi
     if cancel.load(Ordering::Relaxed) {
         return Err("Stopped.".to_string());
     }
-    if cfg!(windows) {
-        return install_miktex(&file, &set_stage);
-    }
     // Said before the dialog comes up, so that it does not come out of nowhere.
     let place = if tool == Tool::MacTex { "/Library/TeX" } else { "a folder for the whole Mac" };
     set_stage(&format!("macOS asks for your password next, since {name} goes into {place}. Editor never sees it."));
@@ -790,19 +809,165 @@ fn install_package(tool: Tool, package: &Package, tools: &Path, received: &Atomi
     Ok(())
 }
 
-/// Runs MiKTeX's own installer for this user, without questions and without
-/// an administrator, and lets it fetch missing packages without asking. Blocks.
-fn install_miktex(installer: &Path, set_stage: &dyn Fn(&str)) -> Result<(), String> {
-    set_stage("Installing MiKTeX. This takes a few minutes.");
-    let output = crate::platform::command(installer)
-        .args(["--unattended", "--private", "--auto-install=yes"])
-        .stdin(Stdio::null())
+/// Where the app installs TeX Live on Windows: for this user, so without an
+/// administrator, as MacTeX's place is for the Mac.
+pub fn texlive_directory() -> Option<PathBuf> {
+    Some(PathBuf::from(std::env::var_os("LOCALAPPDATA").filter(|local| !local.is_empty())?).join("Programs\\TeXLive"))
+}
+
+/// What TeX Live's installer is told, so that it asks nothing. Everything
+/// LaTeX has, as with MacTeX, without the manuals and sources, which no
+/// document needs and which would double the download.
+fn texlive_profile(root: &str) -> String {
+    [
+        "selected_scheme scheme-full".to_string(),
+        format!("TEXDIR {root}"),
+        format!("TEXMFLOCAL {root}/texmf-local"),
+        format!("TEXMFSYSCONFIG {root}/texmf-config"),
+        format!("TEXMFSYSVAR {root}/texmf-var"),
+        "instopt_adjustpath 1".to_string(),
+        "instopt_adjustrepo 1".to_string(),
+        "instopt_letter 0".to_string(),
+        "instopt_portable 0".to_string(),
+        "instopt_write18_restricted 1".to_string(),
+        "tlpdbopt_autobackup 0".to_string(),
+        "tlpdbopt_desktop_integration 0".to_string(),
+        "tlpdbopt_file_assocs 0".to_string(),
+        "tlpdbopt_install_docfiles 0".to_string(),
+        "tlpdbopt_install_srcfiles 0".to_string(),
+        "tlpdbopt_w32_multi_user 0".to_string(),
+    ]
+    .join("\n")
+        + "\n"
+}
+
+/// "Installing [1234/5281, time/total: 10:31/38:02]: pgf [4.6M]" as 1234 of 5281.
+fn texlive_progress(line: &str) -> Option<(u64, u64)> {
+    let (done, rest) = line.strip_prefix("Installing [")?.split_once('/')?;
+    let total = rest.split(|ch: char| !ch.is_ascii_digit()).next()?;
+    Some((done.parse().ok()?, total.parse().ok()?))
+}
+
+/// Installs TeX Live for this user with its official installer, without
+/// questions. `received` follows the packages, so that the row shows how far
+/// it is and how long it takes. Blocks.
+fn install_texlive(package: &Package, received: &Arc<AtomicU64>, line: &Arc<Mutex<String>>, cancel: &AtomicBool) -> Result<(), String> {
+    let say = |text: &str| {
+        if let Ok(mut line) = line.lock() {
+            *line = text.to_string();
+        }
+    };
+    let root = texlive_directory().ok_or("Cannot find the folder for programs.")?;
+    let downloads = crate::storage::downloads_dir().ok_or("Cannot find the folder for downloads.")?;
+    std::fs::create_dir_all(&downloads).map_err(|error| format!("Cannot make the folder for the download: {error}"))?;
+    // One mirror for everything: CTAN's address sends each request to another
+    // one, and two mirrors can be a day apart.
+    say("Finding a TeX Live server near you…");
+    let output = marketplace::curl("60")
+        .args(["--head", "--output", "NUL", "--write-out", "%{url_effective}"])
+        .arg(package.url)
         .output()
-        .map_err(|error| format!("Cannot start the MiKTeX installer: {error}"))?;
-    if !output.status.success() {
-        return Err(format!("Cannot install MiKTeX: {}", marketplace::failure(&output)));
+        .map_err(|error| format!("Cannot run curl: {error}"))?;
+    let effective = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let mirror = effective.strip_suffix("/install-tl.zip").filter(|_| output.status.success()).ok_or("Check the internet connection and try again.")?.to_string();
+    say("Downloading the TeX Live installer…");
+    let zip = downloads.join("install-tl.zip");
+    download(&format!("{mirror}/install-tl.zip"), &zip, false, PACKAGE_SECONDS, &AtomicU64::new(0), cancel)
+        .map_err(|error| if error == "Stopped." { error } else { format!("Cannot download TeX Live. {error}") })?;
+    let listed = marketplace::curl("60").arg(format!("{mirror}/install-tl.zip.sha512")).output().map_err(|error| format!("Cannot run curl: {error}"))?;
+    let expected = String::from_utf8_lossy(&listed.stdout)
+        .split_whitespace()
+        .next()
+        .filter(|_| listed.status.success())
+        .map(str::to_ascii_lowercase)
+        .ok_or("Cannot fetch the checksum of TeX Live's installer.")?;
+    if file_digest::<sha2::Sha512>(&zip)? != expected {
+        std::fs::remove_file(&zip).ok();
+        return Err("The download of TeX Live is not the expected file, so it was not installed.".to_string());
     }
-    std::fs::remove_file(installer).ok();
+    say("Unpacking the TeX Live installer…");
+    let work = downloads.join("install-tl");
+    std::fs::remove_dir_all(&work).ok();
+    std::fs::create_dir_all(&work).map_err(|error| format!("Cannot unpack TeX Live's installer: {error}"))?;
+    marketplace::run_tar(crate::platform::command(crate::platform::system_program("tar")).arg("-xf").arg(&zip).arg("-C").arg(&work))?;
+    let installer = std::fs::read_dir(&work)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.file_name().is_some_and(|name| name.to_string_lossy().starts_with("install-tl-")))
+        .ok_or("TeX Live's installer is not in its download.")?;
+    // A stopped install leaves half a TeX Live, which the installer refuses to continue.
+    if !root.join("bin\\windows\\pdflatex.exe").is_file() {
+        std::fs::remove_dir_all(&root).ok();
+    }
+    let profile = work.join("editor.profile");
+    std::fs::write(&profile, texlive_profile(&root.display().to_string().replace('\\', "/"))).map_err(|error| format!("Cannot prepare TeX Live's installer: {error}"))?;
+    let mut command = crate::platform::command(installer.join("install-tl-windows.bat"));
+    command
+        .args(["-no-gui", "-non-admin", "-profile"])
+        .arg(&profile)
+        .arg("-repository")
+        .arg(&mirror)
+        .current_dir(&installer)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // From here the row counts packages, as it counts bytes of a download.
+    received.store(0, Ordering::Relaxed);
+    say("");
+    let total = package.bytes;
+    // The last lines that are not progress: install-tl says why before it stops.
+    let last = Arc::new(Mutex::new(Vec::<String>::new()));
+    let (mut child, group) = build::spawn_group(&mut command).map_err(|error| format!("Cannot start TeX Live's installer: {error}"))?;
+    let readers: Vec<_> = [child.stdout.take().map(|out| Box::new(out) as Box<dyn std::io::Read + Send>), child.stderr.take().map(|err| Box::new(err) as Box<dyn std::io::Read + Send>)]
+        .into_iter()
+        .flatten()
+        .map(|stream| {
+            let (received, last) = (received.clone(), last.clone());
+            std::thread::spawn(move || {
+                for text in BufReader::new(stream).lines().map_while(Result::ok) {
+                    let text = text.trim().to_string();
+                    if let Some((done, of)) = texlive_progress(&text).filter(|(_, of)| *of > 0) {
+                        received.store(total * done / of, Ordering::Relaxed);
+                    } else if !text.is_empty()
+                        && let Ok(mut last) = last.lock()
+                    {
+                        last.push(text);
+                        let extra = last.len().saturating_sub(3);
+                        last.drain(..extra);
+                    }
+                }
+            })
+        })
+        .collect();
+    let status = loop {
+        if cancel.load(Ordering::Relaxed) {
+            match &group {
+                Some(group) => group.terminate(),
+                None => drop(child.kill()),
+            }
+            let _ = child.wait();
+            return Err("Stopped.".to_string());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(POLL),
+            Err(error) => return Err(format!("TeX Live's installer stopped: {error}")),
+        }
+    };
+    for reader in readers {
+        let _ = reader.join();
+    }
+    let bin = root.join("bin\\windows");
+    if !status.success() || !bin.join("pdflatex.exe").is_file() {
+        let said = last.lock().map(|last| last.iter().filter(|line| *line != "Stopping here.").cloned().collect::<Vec<_>>().join(" ")).unwrap_or_default();
+        return Err(format!("TeX Live could not be installed. {said}"));
+    }
+    build::add_directory(bin);
+    std::fs::remove_dir_all(&work).ok();
+    std::fs::remove_file(&zip).ok();
     Ok(())
 }
 
@@ -929,6 +1094,10 @@ fn remove_versions_except(tools: &Path, pinned: &[(&str, &str)]) {
 /// of output, to show what it is doing, and `cancel` stops it.
 pub fn install_with_homebrew(brew: &Path, tool: Tool, line: &Arc<Mutex<String>>, cancel: &AtomicBool) -> Result<(), String> {
     let formula = tool.formula().ok_or_else(|| format!("{} does not install {} here.", Tool::Homebrew.name(), tool.name()))?;
+    install_formula(brew, formula, line, cancel)
+}
+
+fn install_formula(brew: &Path, formula: &str, line: &Arc<Mutex<String>>, cancel: &AtomicBool) -> Result<(), String> {
     let mut command = crate::platform::command(brew);
     if cfg!(windows) {
         // For this user, so without an administrator, and without questions.
@@ -942,8 +1111,21 @@ pub fn install_with_homebrew(brew: &Path, tool: Tool, line: &Arc<Mutex<String>>,
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    let status = run_showing_progress(&mut command, Tool::Homebrew.name(), line, cancel)?;
+    // winget ends with 0x8A15002B when the package is there already.
+    if status.success() || (cfg!(windows) && status.code().is_some_and(|code| code as u32 == 0x8A15_002B)) {
+        Ok(())
+    } else {
+        let last = line.lock().map(|line| line.clone()).unwrap_or_default();
+        Err(format!("{} could not install {formula}: {last}", Tool::Homebrew.name()))
+    }
+}
+
+/// Runs `command` until it ends, with its last line of output in `line`.
+/// `cancel` stops it and what it started. Blocks.
+fn run_showing_progress(command: &mut std::process::Command, name: &str, line: &Arc<Mutex<String>>, cancel: &AtomicBool) -> Result<std::process::ExitStatus, String> {
     // Its own group, so that stopping also stops the downloads it started.
-    let (mut child, group) = build::spawn_group(&mut command).map_err(|error| format!("Cannot start {}: {error}", Tool::Homebrew.name()))?;
+    let (mut child, group) = build::spawn_group(command).map_err(|error| format!("Cannot start {name}: {error}"))?;
     let readers: Vec<_> = [child.stdout.take().map(|out| Box::new(out) as Box<dyn std::io::Read + Send>), child.stderr.take().map(|err| Box::new(err) as Box<dyn std::io::Read + Send>)]
         .into_iter()
         .flatten()
@@ -951,7 +1133,8 @@ pub fn install_with_homebrew(brew: &Path, tool: Tool, line: &Arc<Mutex<String>>,
             let line = line.clone();
             std::thread::spawn(move || {
                 for text in BufReader::new(stream).lines().map_while(Result::ok) {
-                    let text = text.trim().to_string();
+                    // winget redraws its progress bar with `\r`: the last drawing counts.
+                    let text = text.rsplit('\r').find(|part| !part.trim().is_empty()).unwrap_or_default().trim().to_string();
                     if !text.is_empty()
                         && let Ok(mut last) = line.lock() {
                             *last = text;
@@ -973,18 +1156,13 @@ pub fn install_with_homebrew(brew: &Path, tool: Tool, line: &Arc<Mutex<String>>,
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => std::thread::sleep(POLL),
-            Err(error) => return Err(format!("Homebrew stopped: {error}")),
+            Err(error) => return Err(format!("{name} stopped: {error}")),
         }
     };
     for reader in readers {
         let _ = reader.join();
     }
-    if status.success() {
-        Ok(())
-    } else {
-        let last = line.lock().map(|line| line.clone()).unwrap_or_default();
-        Err(format!("Homebrew could not install {formula}: {last}"))
-    }
+    Ok(status)
 }
 
 /// How a tool gets installed.
@@ -1128,9 +1306,11 @@ impl Toolchain {
 
     fn method(&self, tool: Tool) -> Method {
         match tool {
-            // winget installs MiKTeX for this user, as the app's own way does.
-            Tool::MacTex if cfg!(windows) && self.use_homebrew && homebrew().is_some() => Method::Homebrew,
             Tool::MacTex | Tool::Homebrew => Method::Package,
+            // On Windows the app's own download is quicker and works at once:
+            // winget puts single programs such as Typst on a PATH the running
+            // app does not see.
+            _ if cfg!(windows) => Method::Release,
             _ if self.use_homebrew && tool.formula().is_some() => Method::Homebrew,
             _ => Method::Release,
         }
@@ -1204,14 +1384,10 @@ impl Toolchain {
             Method::Package if tool == Tool::Homebrew => install_homebrew(&tools, job),
             Method::Package => {
                 let package = tool.package().ok_or("Nothing to install.")?;
-                let installed = install_package(tool, &package, &tools, &job.received, &job.line, &job.cancel);
-                // A newer MiKTeX may have replaced the pinned installer on CTAN:
-                // winget always knows the current one.
-                match (installed, homebrew()) {
-                    (Err(error), Some(winget)) if cfg!(windows) && tool == Tool::MacTex && error != "Stopped." => {
-                        install_with_homebrew(&winget, tool, &job.line, &job.cancel).map_err(|_| error)
-                    }
-                    (installed, _) => installed,
+                if cfg!(windows) {
+                    install_texlive(&package, &job.received, &job.line, &job.cancel)
+                } else {
+                    install_package(tool, &package, &tools, &job.received, &job.line, &job.cancel)
                 }
             }
             Method::Homebrew => unreachable!(),
@@ -1224,7 +1400,7 @@ impl Toolchain {
             if !self.jobs.contains_key(&Tool::Homebrew) && !self.waiting.is_empty() {
                 // Homebrew failed or was stopped, so its formulas cannot follow.
                 for tool in std::mem::take(&mut self.waiting) {
-                    self.errors.insert(tool, "Needs Homebrew, which is not installed.".to_string());
+                    self.errors.insert(tool, format!("Needs {}, which is not installed.", Tool::Homebrew.name()));
                 }
             }
             return cx.notify();
@@ -1350,6 +1526,61 @@ pub fn install_developer_tools(cancel: &AtomicBool) -> Result<(), String> {
     Ok(())
 }
 
+/// MinGit, the smallest official Git for Windows, for PCs without winget.
+#[cfg(windows)]
+const MINGIT: Release = Release {
+    version: "2.56.1",
+    url: "https://github.com/git-for-windows/git/releases/download/v2.56.1.windows.1/MinGit-2.56.1-64-bit.zip",
+    sha256: "4a92850b6e917da4fd010669b614b55dccf5b0ec333a534cc4be4700dfefdafd",
+    bytes: 39_849_768,
+    program: "cmd\\git.exe",
+};
+
+/// Where MinGit's `git.exe` is once the app installed it.
+#[cfg(windows)]
+fn mingit_commands(tools: &Path) -> PathBuf {
+    tools.join(format!("git-{}", MINGIT.version)).join("cmd")
+}
+
+/// Installs git for this user, without an administrator: through winget when
+/// it is there, otherwise MinGit into the app's folder. Blocks.
+#[cfg(windows)]
+pub fn install_git(line: &Arc<Mutex<String>>, cancel: &AtomicBool) -> Result<(), String> {
+    if let Some(winget) = homebrew() {
+        match install_formula(&winget, "Git.Git", line, cancel) {
+            Err(error) if error == "Stopped." => return Err(error),
+            Err(_) => {}
+            Ok(()) => return Ok(()),
+        }
+    }
+    if let Ok(mut line) = line.lock() {
+        *line = format!("Downloading git ({} MB)…", MINGIT.bytes.div_ceil(1_000_000));
+    }
+    let tools = tools_directory().ok_or("Cannot find the folder for programs.")?;
+    std::fs::create_dir_all(&tools).map_err(|error| format!("Cannot make the folder for git: {error}"))?;
+    let workspace = tempfile::Builder::new().prefix(".download-").tempdir_in(&tools).map_err(|error| format!("Cannot prepare the download: {error}"))?;
+    let archive = workspace.path().join("download");
+    download(MINGIT.url, &archive, false, DOWNLOAD_SECONDS, &AtomicU64::new(0), cancel).map_err(|error| if error == "Stopped." { error } else { format!("Cannot download git. {error}") })?;
+    if file_digest::<sha2::Sha256>(&archive)? != MINGIT.sha256 {
+        return Err("The download of git is not the expected file, so it was not installed.".to_string());
+    }
+    // MinGit is a whole folder, unlike the single programs of the others.
+    let unpacked = workspace.path().join("unpacked");
+    std::fs::create_dir(&unpacked).map_err(|error| format!("Cannot unpack git: {error}"))?;
+    marketplace::run_tar(crate::platform::command(crate::platform::system_program("tar")).arg("-xf").arg(&archive).arg("-C").arg(&unpacked))?;
+    if !unpacked.join(MINGIT.program).is_file() {
+        return Err("The download of git has no program.".to_string());
+    }
+    let commands = mingit_commands(&tools);
+    let destination = commands.parent().ok_or("Cannot install git.")?;
+    if destination.exists() {
+        std::fs::remove_dir_all(destination).map_err(|error| format!("Cannot replace the old git: {error}"))?;
+    }
+    std::fs::rename(&unpacked, destination).map_err(|error| format!("Cannot install git: {error}"))?;
+    build::add_directory(commands);
+    Ok(())
+}
+
 /// Apple's tools first, then Homebrew's own installer. Blocks.
 fn install_homebrew(tools: &Path, job: &JobHandle) -> Result<(), String> {
     if let Ok(mut line) = job.line.lock() {
@@ -1395,7 +1626,7 @@ pub fn tool_rows(toolchain: &Entity<Toolchain>, tools: &[Tool], manage: bool, cx
             let error = state.errors.get(&tool).cloned();
             let method = state.method(tool);
             let status: SharedString = match job {
-                _ if waiting => "Waiting for Homebrew…".into(),
+                _ if waiting => format!("Waiting for {}…", Tool::Homebrew.name()).into(),
                 Some(job) if job.downloading() => {
                     let total = tool.megabytes().unwrap_or(0);
                     let done = (job.progress() * total as f32).round() as u64;
@@ -1404,7 +1635,7 @@ pub fn tool_rows(toolchain: &Entity<Toolchain>, tools: &[Tool], manage: bool, cx
                         None => format!("Downloading… {done} of {total} MB").into(),
                     }
                 }
-                Some(_) if method == Method::Homebrew => "Installing with Homebrew…".into(),
+                Some(_) if method == Method::Homebrew => format!("Installing with {}…", Tool::Homebrew.name()).into(),
                 Some(job) => job.line().into(),
                 None => describe(&found).into(),
             };
@@ -1425,6 +1656,7 @@ pub fn tool_rows(toolchain: &Entity<Toolchain>, tools: &[Tool], manage: bool, cx
                 div().into_any_element()
             };
             let details = (found == Found::Missing && !busy).then(|| match (method, tool.formula(), tool.megabytes()) {
+                (Method::Homebrew, Some(formula), _) if cfg!(windows) => format!("Runs winget install {formula} for you."),
                 (Method::Homebrew, Some(formula), _) if state.found(Tool::Homebrew) != Found::Missing => format!("Runs brew install {formula} for you."),
                 (Method::Homebrew, Some(formula), _) => format!("Installs Homebrew first, then runs brew install {formula}."),
                 (Method::Package, _, Some(megabytes)) => {
@@ -1500,7 +1732,9 @@ pub fn size(megabytes: u64) -> String {
 
 /// Said once under the rows, so that nobody wonders what the app does to the computer.
 pub fn promise(toolchain: &Entity<Toolchain>, cx: &App) -> &'static str {
-    if toolchain.read(cx).use_homebrew {
+    if cfg!(windows) {
+        "The compilers stay in the app's own folder, and you can remove them any time. TeX Live installs for you alone, without an administrator."
+    } else if toolchain.read(cx).use_homebrew {
         "Homebrew installs these like any other formula. brew uninstall removes them. MacTeX goes to /Library/TeX, as with its own installer."
     } else {
         "The compilers stay in the app's own folder, and you can remove them any time. Only MacTeX goes to /Library/TeX and asks for your password."
@@ -1635,7 +1869,7 @@ mod tests {
 
         let good = release(url, sha256, bytes);
         let program = install_release(Tool::Typst, &good, &tools, &received, &cancel).unwrap();
-        assert_eq!(program, tools.join("typst-9/typst"));
+        assert_eq!(program, tools.join("typst-9").join(executable("typst")));
         assert_eq!(received.load(Ordering::Relaxed), bytes);
         let leftovers: Vec<_> = fs::read_dir(&tools).unwrap().map(|entry| entry.unwrap().file_name()).collect();
         assert_eq!(leftovers, ["typst-9"]);
@@ -1691,12 +1925,22 @@ mod tests {
         assert_eq!(program_in(directory.path(), "typst"), None);
         let nested = directory.path().join("typst-aarch64-apple-darwin");
         fs::create_dir_all(&nested).unwrap();
-        fs::write(nested.join("typst"), "").unwrap();
-        assert_eq!(program_in(directory.path(), "typst"), Some(nested.join("typst")));
+        fs::write(nested.join(executable("typst")), "").unwrap();
+        assert_eq!(program_in(directory.path(), "typst"), Some(nested.join(executable("typst"))));
         let pandoc = directory.path().join("pandoc-3.14-arm64/bin");
         fs::create_dir_all(&pandoc).unwrap();
-        fs::write(pandoc.join("pandoc"), "").unwrap();
-        assert_eq!(program_in(directory.path(), "pandoc"), Some(pandoc.join("pandoc")));
+        fs::write(pandoc.join(executable("pandoc")), "").unwrap();
+        assert_eq!(program_in(directory.path(), "pandoc"), Some(pandoc.join(executable("pandoc"))));
+    }
+
+    #[test]
+    fn texlive_says_how_far_it_is() {
+        assert_eq!(texlive_progress("Installing [1234/5281, time/total: 10:31/38:02]: pgf [4.6M]"), Some((1234, 5281)));
+        assert_eq!(texlive_progress("Installing [0001/5281, time/total: ??:??/??:??]: 12many [3k]"), Some((1, 5281)));
+        assert_eq!(texlive_progress("Installing to: C:/Users/x/TeXLive"), None);
+        let profile = texlive_profile("C:/Users/Ada Lovelace/AppData/Local/Programs/TeXLive");
+        assert!(profile.contains("TEXDIR C:/Users/Ada Lovelace/AppData/Local/Programs/TeXLive\n"));
+        assert!(profile.contains("tlpdbopt_install_docfiles 0\n"));
     }
 
     #[test]
@@ -1712,9 +1956,16 @@ mod tests {
         assert_eq!(Tool::for_language("Typst"), Some(Tool::Typst));
         assert_eq!(Tool::for_language("Pandoc"), Some(Tool::Pandoc));
         assert_eq!(Tool::MacTex.language(), Tool::Tectonic.language());
-        assert_eq!(Tool::MacTex.formula(), None);
-        assert!(Tool::MacTex.package().is_some_and(|package| package.signer.is_some() && package.sha512_url.is_some()));
-        assert!(Tool::Homebrew.package().is_some_and(|package| package.sha256.is_some_and(|sha256| sha256.len() == 64)));
+        if cfg!(windows) {
+            // TeX Live, checked against the fingerprint on its server.
+            assert_eq!(Tool::MacTex.formula(), None);
+            assert!(Tool::MacTex.package().is_some_and(|package| package.sha512_url.is_some()));
+            assert!(Tool::Homebrew.package().is_none());
+        } else {
+            assert_eq!(Tool::MacTex.formula(), None);
+            assert!(Tool::MacTex.package().is_some_and(|package| package.signer.is_some() && package.sha512_url.is_some()));
+            assert!(Tool::Homebrew.package().is_some_and(|package| package.sha256.is_some_and(|sha256| sha256.len() == 64)));
+        }
     }
 
     #[test]
@@ -1758,7 +2009,9 @@ mod live {
             }
             println!("{name}: {:?} each", start.elapsed() / 100);
         };
-        time("developer_tools", &|| assert!(developer_tools()));
+        if cfg!(target_os = "macos") {
+            time("developer_tools", &|| assert!(developer_tools()));
+        }
         time("find(Typst)", &|| drop(find(Tool::Typst)));
         time("latex()", &|| drop(latex()));
         time("homebrew()", &|| drop(homebrew()));

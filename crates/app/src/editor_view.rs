@@ -1008,7 +1008,26 @@ impl EditorView {
                     this.accept_completion(cx);
                 }))
                 .child(entry.label.clone())
-                .child(div().text_color(theme::color(theme::palette().ui_muted)).child(entry.detail.clone()))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .text_color(theme::color(theme::palette().ui_muted))
+                        .child(entry.detail.clone())
+                        // The key that takes the suggestion, on the chosen row. The
+                        // others keep its room, so that the rows do not shift.
+                        .child(
+                            div()
+                                .px(px(4.))
+                                .rounded(px(3.))
+                                .border_1()
+                                .border_color(theme::color(theme::palette().divider))
+                                .text_size(px(theme::UI_FONT_SIZE - 2.))
+                                .when(index != completion.selected, |key| key.opacity(0.))
+                                .child("Tab"),
+                        ),
+                )
         });
         Some(
             div()

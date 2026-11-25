@@ -107,6 +107,12 @@ impl Repository {
         if let Some(askpass) = &self.program.askpass {
             command.env("GIT_ASKPASS", askpass).env(remote::ASKPASS_ENV, "1");
         }
+        // Git for Windows asks its Credential Manager first, which opens its
+        // own sign-in window when it has nothing stored, also for the fetch in
+        // the background. A login it has still works; without one, git falls
+        // through to the editor's.
+        #[cfg(windows)]
+        command.env("GCM_INTERACTIVE", "never");
         Self::finish(command.args(args)).map_err(|error| self.classify(error))
     }
 

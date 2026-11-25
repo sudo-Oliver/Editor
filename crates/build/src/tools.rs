@@ -11,6 +11,11 @@ const EXTRA_DIRECTORIES: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin", "/Li
 /// TeX distribution or a Typst the user installed wins.
 static ADDED_DIRECTORIES: RwLock<Vec<PathBuf>> = RwLock::new(Vec::new());
 
+/// Programs found before, on Windows, where a search looks into dozens of
+/// folders once for every ending. A program that is gone is searched again,
+/// and a missing one is never kept, so that a new install shows at once.
+static FOUND: RwLock<Vec<(String, PathBuf)>> = RwLock::new(Vec::new());
+
 /// Where the compilers the app starts keep what they download, with the
 /// variables that tell them.
 static CACHE_DIRECTORIES: RwLock<Vec<(&'static str, PathBuf)>> = RwLock::new(Vec::new());
@@ -23,11 +28,33 @@ fn search_path() -> Vec<PathBuf> {
         directories.extend(ADDED_DIRECTORIES.read().map(|added| added.clone()).unwrap_or_default());
         return directories;
     }
-    let mut directories: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).collect())
-        .unwrap_or_default();
+    let mut directories = preferred_directories();
+    directories.extend(std::env::var_os("PATH").map(|path| std::env::split_paths(&path).collect::<Vec<_>>()).unwrap_or_default());
     directories.extend(extra_directories());
     directories.extend(ADDED_DIRECTORIES.read().map(|added| added.clone()).unwrap_or_default());
+    directories
+}
+
+/// Searched before the `PATH`.
+#[cfg(not(windows))]
+fn preferred_directories() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+/// TeX Live before anything on the `PATH`: the editor is made for it, as for
+/// MacTeX on the Mac, and another LaTeX, such as a MiKTeX someone installed
+/// for another editor, stays where it is, unused. The app's own first, then
+/// the newest year of one installed for everyone.
+#[cfg(windows)]
+fn preferred_directories() -> Vec<PathBuf> {
+    let mut directories: Vec<PathBuf> = std::env::var_os("LOCALAPPDATA").map(|local| PathBuf::from(local).join("Programs\\TeXLive\\bin\\windows")).into_iter().collect();
+    // Read once, since every search for a program comes here.
+    static TEXLIVE: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
+    directories.extend(TEXLIVE.get_or_init(|| {
+        let mut years: Vec<PathBuf> = std::fs::read_dir("C:\\texlive").into_iter().flatten().flatten().map(|entry| entry.path()).filter(|path| path.join("bin\\windows").is_dir()).collect();
+        years.sort();
+        years.into_iter().rev().map(|year| year.join("bin\\windows")).collect()
+    }).iter().cloned());
     directories
 }
 
@@ -42,20 +69,12 @@ fn extra_directories() -> Vec<PathBuf> {
 }
 
 /// The usual install places on Windows, which installers do not always add
-/// to the `PATH` an app started from the Start menu sees: TeX Live, MiKTeX
-/// for everyone or for one user, and Git.
+/// to the `PATH` an app started from the Start menu sees: MiKTeX for
+/// everyone or for one user, and Git.
 #[cfg(windows)]
 fn extra_directories() -> Vec<PathBuf> {
     let variable = |name: &str| std::env::var_os(name).map(PathBuf::from);
     let mut directories = Vec::new();
-    // TeX Live puts each year in its own folder; the newest wins. Read once,
-    // since every search for a program comes here.
-    static TEXLIVE: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
-    directories.extend(TEXLIVE.get_or_init(|| {
-        let mut years: Vec<PathBuf> = std::fs::read_dir("C:\\texlive").into_iter().flatten().flatten().map(|entry| entry.path()).filter(|path| path.join("bin\\windows").is_dir()).collect();
-        years.sort();
-        years.into_iter().rev().map(|year| year.join("bin\\windows")).collect()
-    }).iter().cloned());
     for base in [variable("ProgramFiles"), variable("LOCALAPPDATA").map(|local| local.join("Programs"))].into_iter().flatten() {
         directories.push(base.join("MiKTeX\\miktex\\bin\\x64"));
         directories.push(base.join("Git\\cmd"));
@@ -68,6 +87,37 @@ fn extra_directories() -> Vec<PathBuf> {
     }
     if let Some(profile) = variable("USERPROFILE") {
         directories.push(profile.join(".cargo\\bin"));
+    }
+    // What installers added to the PATH since the app started, such as winget,
+    // which puts a program's own folder there when it cannot make a link.
+    directories.extend(registry_path());
+    directories
+}
+
+/// The `PATH` of this user and of the system as the registry has it now, not
+/// as it was when the app started.
+#[cfg(windows)]
+fn registry_path() -> Vec<PathBuf> {
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegGetValueW};
+    let wide = |text: &str| text.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    let value = wide("Path");
+    let mut directories = Vec::new();
+    for (key, subkey) in [(HKEY_CURRENT_USER, "Environment"), (HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment")] {
+        let subkey = wide(subkey);
+        let mut buffer = vec![0u16; 16_384];
+        let mut bytes = (buffer.len() * 2) as u32;
+        // SAFETY: both names end in a zero, and `bytes` is the size of `buffer`.
+        // A REG_EXPAND_SZ value comes back with its %VARIABLES% expanded.
+        let status = unsafe {
+            RegGetValueW(key, subkey.as_ptr(), value.as_ptr(), RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ, std::ptr::null_mut(), buffer.as_mut_ptr().cast(), &mut bytes)
+        };
+        if status != 0 {
+            continue;
+        }
+        // An expanded value can be shorter than the size Windows reports.
+        let filled = &buffer[..(bytes as usize / 2).min(buffer.len())];
+        let text = String::from_utf16_lossy(&filled[..filled.iter().position(|&unit| unit == 0).unwrap_or(filled.len())]);
+        directories.extend(text.split(';').map(str::trim).filter(|part| !part.is_empty()).map(PathBuf::from));
     }
     directories
 }
@@ -97,6 +147,7 @@ pub fn pretend_fresh() -> bool {
 
 /// Searches `directory` too, after everything else.
 pub fn add_directory(directory: PathBuf) {
+    forget_found();
     if let Ok(mut added) = ADDED_DIRECTORIES.write()
         && !added.contains(&directory) {
             added.push(directory);
@@ -105,16 +156,45 @@ pub fn add_directory(directory: PathBuf) {
 
 /// Stops searching `directory`, for example after its tool was removed.
 pub fn remove_directory(directory: &Path) {
+    forget_found();
     if let Ok(mut added) = ADDED_DIRECTORIES.write() {
         added.retain(|known| known != directory);
     }
 }
 
 /// Finds a program by its name. On Windows, `pdflatex` is `pdflatex.exe`, and
-/// some programs are batch files, as `PATHEXT` lists them.
+/// some programs are batch files, such as `tlmgr.bat`.
 pub fn find_tool(name: &str) -> Option<PathBuf> {
+    if cfg!(windows) {
+        let known = FOUND.read().ok().and_then(|found| found.iter().find(|(known, _)| known == name).map(|(_, path)| path.clone()));
+        if let Some(path) = known.filter(|path| path.is_file()) {
+            return Some(path);
+        }
+        let path = search_tool(name)?;
+        if let Ok(mut found) = FOUND.write() {
+            found.retain(|(known, _)| known != name);
+            found.push((name.to_string(), path.clone()));
+        }
+        return Some(path);
+    }
+    search_tool(name)
+}
+
+/// A new folder to search may hold a program that comes before a found one.
+fn forget_found() {
+    if let Ok(mut found) = FOUND.write() {
+        found.clear();
+    }
+}
+
+fn search_tool(name: &str) -> Option<PathBuf> {
     let names = program_names(name);
-    search_path().into_iter().find_map(|directory| names.iter().map(|name| directory.join(name)).find(|path| path.is_file()))
+    search_path()
+        .into_iter()
+        // On Windows each folder costs one look for every ending, and many
+        // usual places do not exist: one look settles those.
+        .filter(|directory| !cfg!(windows) || directory.is_dir())
+        .find_map(|directory| names.iter().map(|name| directory.join(name)).find(|path| path.is_file()))
 }
 
 #[cfg(not(windows))]
@@ -127,8 +207,10 @@ fn program_names(name: &str) -> Vec<String> {
     if Path::new(name).extension().is_some() {
         return vec![name.to_string()];
     }
-    let extensions = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
-    extensions.split(';').filter(|extension| !extension.is_empty()).map(|extension| format!("{name}{}", extension.to_ascii_lowercase())).collect()
+    // Only what a program can start directly. `PATHEXT` also lists script
+    // types, such as .vbs and .js, which cost a look in every folder and
+    // which no tool here comes as.
+    [".exe", ".bat", ".cmd", ".com"].iter().map(|extension| format!("{name}{extension}")).collect()
 }
 
 /// `PATH` for child processes, so that for example Pandoc finds Typst.

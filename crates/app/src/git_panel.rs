@@ -492,7 +492,8 @@ impl GitPanel {
     }
 
     /// Opens Apple's dialog for its developer tools, which bring git, and
-    /// reads the repository once they are there.
+    /// reads the repository once they are there. On Windows it installs Git
+    /// for Windows itself.
     fn install_git(&mut self, cx: &mut Context<Self>) {
         if self.installing_git {
             return;
@@ -501,6 +502,9 @@ impl GitPanel {
         self.error = None;
         cx.notify();
         self.action_task = Some(cx.spawn(async move |this, cx| {
+            #[cfg(windows)]
+            let result = cx.background_spawn(async move { crate::toolchain::install_git(&Default::default(), &std::sync::atomic::AtomicBool::new(false)) }).await;
+            #[cfg(not(windows))]
             let result = cx.background_spawn(async move { crate::toolchain::install_developer_tools(&std::sync::atomic::AtomicBool::new(false)) }).await;
             this.update(cx, |this, cx| {
                 this.installing_git = false;
@@ -1146,10 +1150,11 @@ impl Render for GitPanel {
                 .into_any_element(),
             RepoState::NoProject => panel.child(self.render_message("Open a folder to start.", None)).into_any_element(),
             RepoState::GitMissing => {
-                let message = if self.installing_git {
-                    "Click Install in the dialog from Apple. Its developer tools bring git and take a few minutes. This panel continues on its own."
-                } else {
-                    "Git keeps the history of your project and puts it on GitHub. On a Mac it comes with Apple's developer tools (about 2 GB)."
+                let message = match (self.installing_git, cfg!(windows)) {
+                    (true, true) => "Installing git for you alone, without an administrator. Takes a minute. This panel continues on its own.",
+                    (true, false) => "Click Install in the dialog from Apple. Its developer tools bring git and take a few minutes. This panel continues on its own.",
+                    (false, true) => "Git keeps the history of your project and puts it on GitHub. Set up installs the official Git for Windows (about 40 MB).",
+                    (false, false) => "Git keeps the history of your project and puts it on GitHub. On a Mac it comes with Apple's developer tools (about 2 GB).",
                 };
                 let button = (!self.installing_git).then(|| ("Set up git", self.primary_button("git-install", cx, |this, cx| this.install_git(cx))));
                 panel.child(self.render_message(message, button)).children(error).into_any_element()

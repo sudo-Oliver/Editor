@@ -15,11 +15,22 @@ The `addons` cargo feature of `crates/app` is off by default, which hides the
 Add-ons panel, the "Cite from a DOI" command and starts no installed add-on.
 `cargo run -p app --features addons` brings it all back for development.
 
-Known Windows problems, to fix first:
+Windows work (branch `fix/windows-parity`, 2026-11-25): saving, the VC++
+runtime, git setup, Typst, title bar clicks, Ctrl shortcuts in vim and the
+wording are fixed. The complete LaTeX on Windows is TeX Live, installed by
+the setup for the user alone (`%LOCALAPPDATA%\Programs\TeXLive`), as MacTeX
+is TeX Live on the Mac. MiKTeX was tried and dropped: no Perl for latexmk,
+other logs, package dialogs, a package database that broke under two writers.
 
-- "Set up git" in the git panel calls `xcode-select --install`
-  (`toolchain::install_developer_tools`), which does not exist on Windows. It
-  should install Git for Windows (winget `Git.Git`) or say where to get it.
+Open for the next session on the Mac:
+
+- **Only a complete TeX counts on the Mac too.** Windows counts only TeX Live
+  as complete LaTeX (`tlmgr` next to `pdflatex`) and searches it before the
+  `PATH`, so a MiKTeX for another editor stays unused and the setup offers
+  TeX Live beside it. On the Mac, `toolchain::complete_latex` still counts
+  any `pdflatex`, so BasicTeX or MacPorts leftovers skip the MacTeX offer.
+  Count only MacTeX or a full TeX Live, and search `/Library/TeX/texbin`
+  first. Test with BasicTeX installed.
 
 ## Rules for the project
 
