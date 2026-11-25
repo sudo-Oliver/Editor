@@ -206,6 +206,11 @@ impl Mapper {
     pub fn feed(&mut self, mappings: &Mappings, mode: Mode, key: Key, now: Instant) -> Step {
         let Some(map_mode) = MapMode::of(mode).filter(|_| !mappings.is_empty()) else {
             let mut keys = self.flush(mappings);
+            // While inserting, a key types itself, as it does with mappings:
+            // the editor's own typing brings suggestions and the input method.
+            if keys.is_empty() && mode == Mode::Insert {
+                return Step::Type;
+            }
             keys.push(key);
             return Step::Run(keys);
         };
@@ -465,6 +470,14 @@ mod tests {
         let mut mapper = Mapper::default();
         assert_eq!(feed_all(&mut mapper, &mappings, Mode::Normal, "a", Instant::now()), Vec::new());
         assert_eq!(feed_all(&mut mapper, &mappings, Mode::Normal, "j", Instant::now()), Vec::new());
+    }
+
+    #[test]
+    fn without_mappings_inserting_types_as_usual() {
+        let mut mapper = Mapper::default();
+        let now = Instant::now();
+        assert_eq!(mapper.feed(&Mappings::default(), Mode::Insert, Key::Char('\\'), now), Step::Type);
+        assert_eq!(mapper.feed(&Mappings::default(), Mode::Normal, Key::Char('j'), now), Step::Run(vec![Key::Char('j')]));
     }
 
     #[test]
