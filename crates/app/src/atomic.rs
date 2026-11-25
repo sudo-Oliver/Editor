@@ -45,8 +45,33 @@ pub fn finish(temp: NamedTempFile, target: &Path) -> io::Result<()> {
         fs::set_permissions(temp.path(), permissions)?;
     }
     // Other programs write by path, so the file is opened again for the sync.
+    // Windows flushes only through a handle that may write.
+    #[cfg(windows)]
+    fs::OpenOptions::new().write(true).open(temp.path())?.sync_all()?;
+    #[cfg(not(windows))]
     File::open(temp.path())?.sync_all()?;
+    // On Windows a virus scanner, OneDrive or the search index may hold the
+    // file for a moment, and the rename fails until they let go.
+    #[cfg(windows)]
+    let temp = {
+        let mut temp = temp;
+        for _ in 0..10 {
+            match temp.persist(target) {
+                Ok(_) => return sync_folder(target),
+                Err(error) if error.error.kind() == io::ErrorKind::PermissionDenied => {
+                    temp = error.file;
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => return Err(error.error),
+            }
+        }
+        temp
+    };
     temp.persist(target).map_err(|error| error.error)?;
+    sync_folder(target)
+}
+
+fn sync_folder(target: &Path) -> io::Result<()> {
     if let Some(folder) = target.parent()
         && let Ok(folder) = File::open(folder)
     {
